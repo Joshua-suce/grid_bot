@@ -1,0 +1,955 @@
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, asdict
+
+import numpy as np
+import pandas as pd
+from loguru import logger
+
+from exchange import Exchange
+
+
+@dataclass
+class GridLevel:
+    price: float
+    side: str  # "buy" or "sell"
+    order_id: str | None = None
+    status: str = "pending"  # pending, replaced
+    fill_count: int = 0
+    total_pnl: float = 0.0
+    quantity: float = 0.0
+    entry_price: float = 0.0
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "GridLevel":
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in d.items() if k in known})
+
+
+TIMEFRAME_CANDLES_PER_DAY = {
+    "1m": 1440, "5m": 288, "15m": 96, "30m": 48,
+    "1h": 24, "4h": 6, "1d": 1,
+}
+
+
+def calculate_grid_range(
+    ohlcv: pd.DataFrame,
+    current_price: float,
+    lookback_days: int = 14,
+    atr_multiplier: float = 1.5,
+    timeframe: str = "1h",
+) -> tuple[float, float]:
+    candles_per_day = TIMEFRAME_CANDLES_PER_DAY.get(timeframe, 24)
+    recent = ohlcv.tail(lookback_days * candles_per_day)
+    if len(recent) < 20:
+        price_range = current_price * 0.05
+        return current_price - price_range, current_price + price_range
+
+    from trend_filter import atr as calc_atr
+    atr_series = calc_atr(recent["high"], recent["low"], recent["close"], period=14)
+    current_atr = float(atr_series.iloc[-1]) if not np.isnan(atr_series.iloc[-1]) else current_price * 0.02
+
+    lower = current_price - (current_atr * atr_multiplier)
+    upper = current_price + (current_atr * atr_multiplier)
+
+    logger.info(
+        "GRID RANGE CALCULATED | lower={} upper={} ATR={} current={}",
+        round(lower, 8), round(upper, 8), round(current_atr, 8), round(current_price, 8),
+    )
+    return lower, upper
+
+
+def calculate_dynamic_grid_count(atr_pct: float, base_count: int) -> int:
+    if atr_pct < 0.015:
+        return base_count
+    elif atr_pct < 0.025:
+        return max(base_count - 2, 3)
+    else:
+        return max(base_count - 4, 3)
+
+
+def validate_grid_spacing(lower: float, upper: float, count: int, min_spacing_pct: float, price: float) -> bool:
+    if count < 2:
+        return False
+    spacing = (upper - lower) / max(1, count - 1)
+    spacing_pct = spacing / price
+    if spacing_pct < min_spacing_pct * 0.99:
+        logger.warning(
+            "GRID SPACING TOO TIGHT | spacing={} ({:.4f}%) < min ({:.4f}%)",
+            round(spacing, 8), spacing_pct * 100, min_spacing_pct * 100,
+        )
+        return False
+    return True
+
+
+class GridEngine:
+    def __init__(
+        self,
+        exchange: Exchange,
+        symbol: str,
+        grid_lower: float,
+        grid_upper: float,
+        grid_count: int,
+        capital_per_grid_pct: float,
+        stop_loss_pct: float,
+        maker_fee_pct: float = 0.0002,
+        taker_fee_pct: float = 0.0004,
+        recenter_cooldown: int = 300,
+        replacement_cooldown: int = 60,
+        capital_per_grid_usdt: float = 0.0,
+        leverage: int = 1,
+        trailing_sl_trigger_pct: float = 0.05,
+        max_exposure_pct: float = 0.50,
+        use_market_close_on_replace: bool = True,
+        event_journal: object | None = None,
+        notifier: object | None = None,
+    ):
+        self.exchange = exchange
+        self.symbol = symbol
+        self.grid_lower = grid_lower
+        self.grid_upper = grid_upper
+        self.grid_count = grid_count
+        self.capital_per_grid_pct = capital_per_grid_pct
+        self.capital_per_grid_usdt = capital_per_grid_usdt
+        self.leverage = leverage
+        self.stop_loss_pct = stop_loss_pct
+        self.maker_fee_pct = maker_fee_pct
+        self.taker_fee_pct = taker_fee_pct
+        self.recenter_cooldown = recenter_cooldown
+        self.replacement_cooldown = replacement_cooldown
+        self.max_exposure_pct = max_exposure_pct
+        self.use_market_close_on_replace = use_market_close_on_replace
+        self.grid_spacing = (grid_upper - grid_lower) / max(1, grid_count - 1)
+        self.levels: list[GridLevel] = []
+        self.active = False
+        self.total_pnl = 0.0
+        self.total_fees = 0.0
+        self.total_fills = 0
+        self.total_completed_cycles = 0
+        self._last_recenter_time = 0.0
+        self._volatility_mult = 1.0
+        self._trailing_sl_price: float | None = None
+        self._trailing_sl_trigger: float = trailing_sl_trigger_pct
+        self._peak_price = 0.0
+        self._last_orderbook: dict = {}
+        self._event_journal = event_journal
+        self._notifier = notifier
+        self._block_buys = False
+        self._last_replacement_time: float = 0.0
+        self.state_corrupted: bool = False
+        self._buy_scale: float = 1.0
+        self._min_profit_multiplier: float = 1.0
+
+    def _round_price(self, price: float) -> float:
+        """Round price to exchange tick size."""
+        return float(self.exchange.exchange.price_to_precision(self.symbol, price))
+
+    def update_volatility(self, atr_pct: float) -> None:
+        if atr_pct < 0.01:
+            self._volatility_mult = min(1.5, 1.0 + (0.01 - atr_pct) * 50)
+        elif atr_pct > 0.03:
+            self._volatility_mult = max(0.5, 1.0 - (atr_pct - 0.03) * 25)
+        else:
+            self._volatility_mult = 1.0
+
+    def set_position_limit(self, current_position: float, max_position_qty: float) -> None:
+        """Block new buys if position would exceed the limit. Scales down buys gradually."""
+        old = self._block_buys
+        old_scale = self._buy_scale
+        self._block_buys = current_position >= max_position_qty
+        if max_position_qty <= 0:
+            self._buy_scale = 0.0
+        elif current_position >= max_position_qty:
+            self._buy_scale = 0.0
+        else:
+            ratio = current_position / max_position_qty
+            if ratio < 0.5:
+                self._buy_scale = 1.0
+            else:
+                self._buy_scale = 1.0 - (ratio - 0.5) / 0.5
+        if self._block_buys and not old:
+            logger.warning(
+                "POSITION LIMIT | {} >= {} — buy orders blocked",
+                round(current_position, 2), round(max_position_qty, 2),
+            )
+        elif self._buy_scale != old_scale and self._buy_scale < 1.0:
+            logger.info("BUY SCALE | position={:.1f}/{:.1f} | scale={:.2f}", current_position, max_position_qty, self._buy_scale)
+
+    def update_orderbook(self) -> None:
+        self._last_orderbook = self.exchange.get_orderbook_depth(self.symbol)
+
+    def get_tracked_order_ids(self) -> set[str]:
+        """Return set of order IDs currently tracked by grid levels."""
+        return {l.order_id for l in self.levels if l.order_id is not None}
+
+    def get_exposure_pct(self, balance: float) -> float:
+        if balance <= 0:
+            return 0.0
+        exposure_usdt = 0.0
+        try:
+            positions = self.exchange.get_positions(self.symbol)
+            for pos in positions:
+                if pos.get("side") == "long":
+                    qty = float(pos.get("contracts", 0) or 0)
+                    entry = float(pos.get("entryPrice", 0) or 0)
+                    if qty > 0 and entry > 0:
+                        exposure_usdt += qty * entry
+        except Exception:
+            for level in self.levels:
+                if level.quantity <= 0:
+                    continue
+                if level.side == "sell":
+                    notional = level.quantity * (level.entry_price if level.entry_price else level.price)
+                    exposure_usdt += notional
+        return exposure_usdt / balance
+
+    def _cycle_pnl(self, quantity: float, entry_price: float, exit_price: float) -> float:
+        if quantity <= 0 or entry_price <= 0 or exit_price <= 0:
+            return 0.0
+        buy_cost = entry_price * quantity
+        sell_revenue = exit_price * quantity
+        return sell_revenue - buy_cost
+
+    def _cycle_fee(self, quantity: float, buy_price: float, sell_price: float, is_taker: bool = False) -> float:
+        fee_rate = self.taker_fee_pct if is_taker else self.maker_fee_pct
+        return (buy_price + sell_price) * quantity * fee_rate
+
+    def initialize(self, current_price: float, balance: float, dynamic_spacing: bool = True) -> None:
+        if dynamic_spacing:
+            self._initialize_dynamic(current_price)
+        else:
+            self._initialize_uniform(current_price)
+
+        logger.info(
+            "GRID INITIALIZED | {} levels | avg_spacing={} | range=[{}-{}]",
+            len(self.levels), round(self.grid_spacing, 8),
+            round(self.grid_lower, 8), round(self.grid_upper, 8),
+        )
+
+    def _initialize_uniform(self, current_price: float) -> None:
+        levels = []
+        for i in range(self.grid_count):
+            price = self._round_price(self.grid_lower + i * self.grid_spacing)
+            side = "buy" if price < current_price else "sell"
+            lvl = GridLevel(price=price, side=side)
+            if side == "buy":
+                lvl.entry_price = price
+            levels.append(lvl)
+        self.levels = levels
+
+    def _initialize_dynamic(self, current_price: float) -> None:
+        half_count = self.grid_count // 2
+
+        if current_price <= self.grid_lower + self.grid_spacing * 0.5:
+            self._initialize_uniform(current_price)
+            return
+        if current_price >= self.grid_upper - self.grid_spacing * 0.5:
+            self._initialize_uniform(current_price)
+            return
+
+        buy_prices = np.linspace(self.grid_lower, current_price, half_count, endpoint=False)
+        sell_prices = np.linspace(current_price, self.grid_upper, self.grid_count - half_count + 1)[1:]
+
+        raw_prices = [self._round_price(p) for p in np.concatenate([buy_prices, sell_prices])]
+
+        seen = {}
+        prices = []
+        for p in raw_prices:
+            if p not in seen:
+                seen[p] = True
+                prices.append(p)
+
+        if len(prices) != len(raw_prices):
+            logger.warning(
+                "GRID DEDUP | {} duplicate prices removed after tick rounding ({} -> {})",
+                len(raw_prices) - len(prices), len(raw_prices), len(prices),
+            )
+
+        levels = []
+        for price in prices:
+            side = "buy" if price < current_price else "sell"
+            lvl = GridLevel(price=price, side=side)
+            if side == "buy":
+                lvl.entry_price = price
+            levels.append(lvl)
+
+        if len(levels) < 2:
+            self._initialize_uniform(current_price)
+            return
+
+        if len(levels) != self.grid_count:
+            logger.warning(
+                "GRID COUNT MISMATCH | expected={} actual={} after tick dedup — adjusting",
+                self.grid_count, len(levels),
+            )
+            self.grid_count = len(levels)
+
+        spacings = [levels[i+1].price - levels[i].price for i in range(len(levels)-1)]
+        self.grid_spacing = sum(spacings) / len(spacings)
+
+        self.levels = levels
+
+        logger.info(
+            "DYNAMIC GRID | {} levels | price concentration near {}",
+            len(levels), round(current_price, 8),
+        )
+
+    def _calc_usdt_per_grid(self, balance: float) -> float:
+        """Return the USDT notional per grid level (margin * leverage)."""
+        if self.capital_per_grid_usdt > 0:
+            raw = self.capital_per_grid_usdt * self.leverage * self._volatility_mult
+            current_total = raw * self.grid_count
+            target_total = balance * self.max_exposure_pct
+            if current_total > target_total:
+                raw = target_total / self.grid_count
+            return raw
+        return balance * self.capital_per_grid_pct * self._volatility_mult
+
+    def _is_level_profitable(self, level_price: float) -> bool:
+        expected_profit = self.grid_spacing
+        worst_fees = 2 * self.maker_fee_pct * level_price
+        return expected_profit > worst_fees * self._min_profit_multiplier
+
+    def _place_order_for_level(self, level: GridLevel, balance: float) -> bool:
+        if level.side == "buy" and self._block_buys:
+            logger.debug("SKIP BUY ORDER | position limit reached")
+            return False
+        if not self._is_level_profitable(level.price):
+            logger.info(
+                "SKIP ORDER @ {} | spacing={:.8f} < min_profit={:.8f} ({}x fees)",
+                level.price, self.grid_spacing,
+                2 * self.maker_fee_pct * level.price * self._min_profit_multiplier,
+                self._min_profit_multiplier,
+            )
+            return False
+        if not self.exchange.can_place_order(self.symbol):
+            return False
+        usdt_per_grid = self._calc_usdt_per_grid(balance)
+        quantity = usdt_per_grid / level.price
+        if level.side == "buy":
+            quantity *= self._buy_scale
+        quantity = self.exchange.exchange.amount_to_precision(self.symbol, quantity)
+        if float(quantity) <= 0:
+            if self._event_journal:
+                self._event_journal.order_failed(self.symbol, level.side, level.price, 0.0, "quantity_zero")
+            if self._notifier:
+                self._notifier.on_order_failed(self.symbol, level.side, level.price, 0.0, "quantity_zero")
+            return False
+        try:
+            order = self.exchange.place_limit_order(self.symbol, level.side, level.price, float(quantity))
+            if "id" not in order:
+                raise ValueError("Order response missing 'id'")
+            level.order_id = order["id"]
+            level.status = "pending"
+            level.quantity = float(quantity)
+            if self._event_journal:
+                self._event_journal.order_placed(self.symbol, level.side, level.price, float(quantity), order["id"])
+            if self._notifier:
+                self._notifier.on_order_placed(self.symbol, level.side, level.price, float(quantity), order["id"])
+            return True
+        except Exception as e:
+            logger.error("Failed to place order at {}: {}", level.price, e)
+            if self._event_journal:
+                self._event_journal.order_failed(self.symbol, level.side, level.price, float(quantity), str(e))
+            if self._notifier:
+                self._notifier.on_order_failed(self.symbol, level.side, level.price, float(quantity), str(e))
+            return False
+
+    def place_initial_orders(self, balance: float) -> int:
+        placed = 0
+        failed = 0
+        for level in self.levels:
+            if level.order_id is not None:
+                continue
+            if self._place_order_for_level(level, balance):
+                placed += 1
+            else:
+                failed += 1
+
+        logger.info(
+            "PLACED {} initial grid orders ({} failed) | vol_mult={:.2f} | exposure={:.1%}",
+            placed, failed, self._volatility_mult, self.get_exposure_pct(balance),
+        )
+        return placed
+
+    def reconcile_state(self) -> None:
+        """Verify all pending/replaced orders exist on the exchange. Mark missing ones dead."""
+        balance = self.exchange.get_balance()
+        open_ids = self.exchange.get_open_order_ids(self.symbol)
+        reconciled = 0
+        for level in self.levels:
+            if level.order_id is None:
+                continue
+            if level.order_id in open_ids:
+                continue
+            order = self.exchange.fetch_order(level.order_id, self.symbol)
+            if order and order.get("status") == "closed":
+                logger.info("Reconcile: order {} was filled externally — processing as fill", level.order_id)
+                self._handle_fill(level, balance)
+                reconciled += 1
+                continue
+            if order and order.get("status") == "canceled":
+                logger.info("Reconcile: order {} was cancelled, marking for replacement", level.order_id)
+                if self._event_journal:
+                    self._event_journal.order_cancelled(self.symbol, level.side, level.price, level.order_id, "reconcile_cancelled")
+                level.order_id = None
+                level.status = "pending"
+                reconciled += 1
+                continue
+            logger.warning(
+                "Reconcile: order {} ({}) not found on exchange (status={}), marking dead",
+                level.order_id, level.side, order.get("status") if order else None,
+            )
+            if self._event_journal:
+                self._event_journal.order_cancelled(self.symbol, level.side, level.price, level.order_id, "reconcile_dead")
+            level.order_id = None
+            level.status = "pending"
+            reconciled += 1
+        if reconciled:
+            logger.warning("Reconciled {} dead orders from state", reconciled)
+        orphaned = [l for l in self.levels if l.order_id is None and l.status == "pending"]
+        if orphaned:
+            for level in orphaned:
+                if level.price < self.grid_lower or level.price > self.grid_upper:
+                    logger.debug(
+                        "RECONCILE SKIP ORPHAN | {} @ {} outside grid bounds [{}-{}]",
+                        level.side, level.price, self.grid_lower, self.grid_upper,
+                    )
+                    continue
+                if self._place_order_for_level(level, balance):
+                    logger.info("Reconcile: placed replacement order @ {} {}", level.price, level.side)
+
+    def reconcile_positions(self) -> None:
+        """Match open exchange positions to grid levels and place sell orders."""
+        positions = self.exchange.get_positions(self.symbol)
+        for pos in positions:
+            if pos.get("side") != "long":
+                continue
+            amt = float(pos.get("contracts", 0) or 0)
+            entry = float(pos.get("entryPrice", 0) or 0)
+            if amt <= 0 or entry <= 0:
+                continue
+
+            best_level = None
+            best_diff = float("inf")
+            for level in self.levels:
+                if level.side != "buy":
+                    continue
+                diff = abs(level.price - entry)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_level = level
+
+            if best_level is None:
+                logger.warning("RECONCILE | no buy level found for position @ {}", round(entry, 8))
+                continue
+
+            sell_price = self._round_price(best_level.price + self.grid_spacing)
+
+            if sell_price > self.grid_upper:
+                logger.warning("RECONCILE | sell price {} outside grid — position unprotected", sell_price)
+                continue
+
+            if best_level.order_id is not None:
+                self.exchange.cancel_order(best_level.order_id, self.symbol)
+
+            best_level.fill_count += 1
+            best_level.status = "replaced"
+            best_level.quantity = amt
+            best_level.entry_price = entry
+            best_level.side = "sell"
+            best_level.price = sell_price
+
+            qty = self.exchange.exchange.amount_to_precision(self.symbol, amt)
+            if float(qty) <= 0:
+                continue
+            try:
+                # Prefer an immediate market close for existing positions if configured — this
+                # avoids relying on post-only/limit fills to protect already-open positions.
+                if self.use_market_close_on_replace:
+                    try:
+                        order = self.exchange.close_position(self.symbol, pos.get("side"), abs(amt))
+                        if order and "id" in order:
+                            best_level.order_id = order["id"]
+                            best_level.status = "replaced"
+                            logger.info(
+                                "RECONCILE | position {} @ {} -> CLOSED MARKET (id={})",
+                                pos.get("side"), round(entry, 8), best_level.order_id,
+                            )
+                            # Move to next position
+                            continue
+                    except Exception as e:
+                        logger.warning("RECONCILE | market close failed, falling back to limit: {}", e)
+                params = {"reduceOnly": True, "postOnly": False}
+                order = self.exchange.place_limit_order(self.symbol, "sell", sell_price, float(qty), params=params)
+                if "id" not in order:
+                    raise ValueError("Order response missing 'id'")
+                best_level.order_id = order["id"]
+                logger.info(
+                    "RECONCILE | position {} @ {} -> sell order @ {} (qty={})",
+                    pos.get("side"), round(entry, 8), sell_price, qty,
+                )
+            except Exception as e:
+                logger.error("RECONCILE | failed to place sell order: {}", e)
+                best_level.order_id = None
+                best_level.status = "pending"
+
+        self.levels.sort(key=lambda l: l.price)
+
+        for level in self.levels:
+            if level.side != "sell" or level.order_id is not None:
+                continue
+            if level.quantity <= 0 or level.price <= 0:
+                continue
+            qty = self.exchange.exchange.amount_to_precision(self.symbol, level.quantity)
+            if float(qty) <= 0:
+                continue
+            try:
+                params = {"reduceOnly": True, "postOnly": False}
+                order = self.exchange.place_limit_order(self.symbol, "sell", level.price, float(qty), params=params)
+                if "id" not in order:
+                    raise ValueError("Order response missing 'id'")
+                level.order_id = order["id"]
+                level.status = "replaced"
+                logger.info(
+                    "RECONCILE | orphaned sell level @ {} — placed sell order (qty={})",
+                    level.price, qty,
+                )
+            except Exception as e:
+                logger.error("RECONCILE | failed to place orphaned sell order: {}", e)
+
+    def _is_on_cooldown(self) -> bool:
+        """Check if a replacement order is still within the global cooldown after a fill."""
+        if self.replacement_cooldown <= 0:
+            return False
+        return (time.time() - self._last_replacement_time) < self.replacement_cooldown
+
+    def check_fills(self, balance: float) -> list[dict]:
+        open_orders = self.exchange.get_open_orders(self.symbol)
+        open_ids = {o["id"] for o in open_orders}
+        fills = []
+
+        for level in self.levels:
+            if level.order_id is None:
+                continue
+            if level.order_id not in open_ids:
+                order = self.exchange.fetch_order(level.order_id, self.symbol)
+                if order is None:
+                    positions = self.exchange.get_positions(self.symbol)
+                    has_position = any(
+                        p.get("side") == "long" and float(p.get("contracts", 0) or 0) > 0
+                        for p in positions
+                    )
+                    if has_position and level.side == "buy":
+                        logger.warning(
+                            "Order {} gone and buy level + position exists — processing as fill",
+                            level.order_id,
+                        )
+                        fills.append(self._handle_fill(level, balance))
+                    elif has_position and level.side == "sell":
+                        logger.warning(
+                            "Order {} gone but sell level — position may be from another order, marking dead",
+                            level.order_id,
+                        )
+                        if self._event_journal:
+                            self._event_journal.order_cancelled(self.symbol, level.side, level.price, level.order_id, "order_dead_sell_orphan")
+                        level.order_id = None
+                        level.status = "pending"
+                    else:
+                        logger.warning(
+                            "Order {} gone and no position — marking level dead",
+                            level.order_id,
+                        )
+                        if self._event_journal:
+                            self._event_journal.order_cancelled(self.symbol, level.side, level.price, level.order_id, "order_dead_no_position")
+                        level.order_id = None
+                        level.status = "pending"
+                    continue
+                if order.get("status") == "canceled":
+                    logger.debug("Order {} was cancelled, placing replacement", level.order_id)
+                    if self._event_journal:
+                        self._event_journal.order_cancelled(self.symbol, level.side, level.price, level.order_id, "fill_check_cancelled")
+                    level.order_id = None
+                    level.status = "pending"
+                    if not self._is_on_cooldown():
+                        self._place_order_for_level(level, balance)
+                    else:
+                        logger.debug("SKIP REPLACEMENT (cooldown) | {} @ {}", level.side, level.price)
+                    continue
+                fills.append(self._handle_fill(level, balance))
+
+        orphaned = [l for l in self.levels if l.order_id is None and l.status == "pending" and l.quantity > 0]
+        if orphaned:
+            for level in orphaned:
+                if level.price < self.grid_lower or level.price > self.grid_upper:
+                    logger.debug(
+                        "SKIP ORPHAN | {} @ {} outside grid bounds [{}-{}]",
+                        level.side, level.price, self.grid_lower, self.grid_upper,
+                    )
+                    continue
+                if self._is_on_cooldown():
+                    logger.debug("SKIP ORPHAN (cooldown) | {} @ {}", level.side, level.price)
+                    continue
+                if self._place_order_for_level(level, balance):
+                    logger.info("Replaced orphaned level @ {} {}", level.price, level.side)
+
+        return fills
+
+    def _handle_fill(self, level: GridLevel, balance: float, is_taker: bool = False) -> dict:
+        completed_cycle = level.side == "sell" and level.fill_count > 0
+        self._last_replacement_time = time.time()
+
+        if completed_cycle:
+            entry_price = level.entry_price if level.entry_price else (level.price - self.grid_spacing)
+            exit_price = level.price
+            qty = level.quantity if level.quantity > 0 else (self._calc_usdt_per_grid(balance) / max(level.price, 1e-12))
+            profit = self._cycle_pnl(qty, entry_price, exit_price)
+            fee = self._cycle_fee(qty, entry_price, exit_price, is_taker=is_taker)
+        else:
+            profit = 0.0
+            fee = 0.0
+
+        fill_record = {
+            "price": level.price,
+            "side": level.side,
+            "timestamp": pd.Timestamp.now().isoformat(),
+            "profit": profit,
+            "fee": fee,
+            "quantity": level.quantity if level.quantity > 0 else 0.0,
+            "completed_cycle": completed_cycle,
+        }
+
+        level.fill_count += 1
+        self.total_fills += 1
+
+        if completed_cycle:
+            level.total_pnl += profit
+            self.total_pnl += profit
+            self.total_fees += fee
+            self.total_completed_cycles += 1
+
+        logger.info(
+            "FILL #{} | {} @ {} | qty={} profit={:.6f} fees={:.6f} net={:.6f} | cycle={}",
+            self.total_fills, level.side.upper(), level.price,
+            level.quantity, profit, fee, profit - fee, "complete" if completed_cycle else "open",
+        )
+
+        new_side = "sell" if level.side == "buy" else "buy"
+        fill_price = level.price
+
+        sorted_levels = sorted(self.levels, key=lambda l: l.price)
+        current_idx = None
+        for i, lv in enumerate(sorted_levels):
+            if lv is level:
+                current_idx = i
+                break
+
+        if current_idx is not None:
+            if new_side == "sell":
+                new_price = level.price + self.grid_spacing
+                for j in range(current_idx + 1, len(sorted_levels)):
+                    if sorted_levels[j].side == "sell":
+                        new_price = sorted_levels[j].price
+                        break
+            elif new_side == "buy":
+                new_price = level.price - self.grid_spacing
+                for j in range(current_idx - 1, -1, -1):
+                    if sorted_levels[j].side == "buy":
+                        new_price = sorted_levels[j].price
+                        break
+            else:
+                new_price = level.price + self.grid_spacing if new_side == "sell" else level.price - self.grid_spacing
+        else:
+            new_price = level.price + self.grid_spacing if new_side == "sell" else level.price - self.grid_spacing
+        new_price = self._round_price(new_price)
+
+        if new_price < self.grid_lower or new_price > self.grid_upper:
+            logger.warning("Replacement price {} outside grid bounds — level will not place order", new_price)
+            level.side = new_side
+            level.price = new_price
+            level.order_id = None
+            level.status = "pending"
+            return fill_record
+
+        occupied = any(
+            l is not level and l.price == new_price and l.order_id is not None and l.status in ("pending", "replaced")
+            for l in self.levels
+        )
+        if occupied:
+            logger.info(
+                "SKIP REPLACEMENT | level at {} already occupied by active order — will retry", new_price,
+            )
+            level.side = new_side
+            level.price = new_price
+            level.order_id = None
+            level.status = "pending"
+            return fill_record
+
+        qty = level.quantity if level.quantity > 0 else (self._calc_usdt_per_grid(balance) / max(new_price, 1e-12))
+        quantity = self.exchange.exchange.amount_to_precision(self.symbol, qty)
+
+        level.side = new_side
+        level.price = new_price
+        level.quantity = float(quantity)
+        if new_side == "buy":
+            level.entry_price = new_price
+        else:
+            level.entry_price = fill_price
+
+        try:
+            if new_side == "sell":
+                params = {"reduceOnly": True, "postOnly": False}
+            else:
+                params = None
+            order = self.exchange.place_limit_order(self.symbol, new_side, new_price, float(quantity), params=params)
+            if "id" not in order:
+                raise ValueError("Order response missing 'id'")
+            level.order_id = order["id"]
+            level.status = "replaced"
+        except Exception as e:
+            logger.error("Failed to place replacement order at {}: {} — will retry next cycle", new_price, e)
+            level.order_id = None
+            level.status = "pending"
+
+        self.levels.sort(key=lambda l: l.price)
+        return fill_record
+
+    def pause(self) -> None:
+        if not self.active:
+            return
+        cancelled = self.exchange.cancel_everything(self.symbol)
+        still_open = self.exchange.get_open_order_ids(self.symbol)
+        for level in self.levels:
+            if level.order_id is not None:
+                if level.order_id in still_open:
+                    logger.warning("PAUSE | order {} still open after cancel_everything — force cancelling", level.order_id)
+                    self.exchange.cancel_order(level.order_id, self.symbol)
+                if self._event_journal:
+                    self._event_journal.order_cancelled(self.symbol, level.side, level.price, level.order_id, "pause")
+                if self._notifier:
+                    self._notifier.on_order_cancelled(self.symbol, level.side, level.price, level.order_id, "pause")
+                level.order_id = None
+                level.status = "pending"
+        self.active = False
+        if self._event_journal:
+            self._event_journal.grid_paused(self.symbol, "manual/pause", cancelled)
+        logger.info("GRID PAUSED | {} orders cancelled via cancel_everything", cancelled)
+
+    def activate(self, balance: float) -> None:
+        if self.active:
+            return
+        placed = self.place_initial_orders(balance)
+        total_open = len(self.get_tracked_order_ids())
+        self.active = total_open > 0
+        if self._event_journal:
+            self._event_journal.grid_activated(self.symbol, self.grid_lower, self.grid_upper, self.grid_count, total_open)
+        if self.active:
+            logger.info("GRID ACTIVATED | {} orders active", total_open)
+        else:
+            logger.warning("GRID NOT ACTIVATED | no orders could be placed or restored")
+
+    def emergency_stop(self) -> None:
+        logger.error("EMERGENCY STOP | cancelling all orders")
+        cancelled = self.exchange.cancel_everything(self.symbol)
+        for level in self.levels:
+            if level.order_id is not None:
+                if self._event_journal:
+                    self._event_journal.order_cancelled(self.symbol, level.side, level.price, level.order_id, "emergency_stop")
+                if self._notifier:
+                    self._notifier.on_order_cancelled(self.symbol, level.side, level.price, level.order_id, "emergency_stop")
+                level.order_id = None
+                level.status = "pending"
+        self.active = False
+        if self._event_journal:
+            self._event_journal.grid_paused(self.symbol, "emergency_stop", cancelled)
+
+    def recenter(self, current_price: float, balance: float, margin_pct: float = 0.01) -> bool:
+        now = time.time()
+        if (now - self._last_recenter_time) < self.recenter_cooldown:
+            return False
+
+        lower_margin = self.grid_lower * (1 - margin_pct)
+        upper_margin = self.grid_upper * (1 + margin_pct)
+
+        if current_price >= lower_margin and current_price <= upper_margin:
+            return False
+
+        logger.info(
+            "RECENTERING GRID | price {} outside [{}-{}] (margin {:.1%})",
+            round(current_price, 8), round(self.grid_lower, 8), round(self.grid_upper, 8), margin_pct,
+        )
+
+        self.pause()
+
+        half_range = (self.grid_upper - self.grid_lower) / 2
+        self.grid_lower = current_price - half_range
+        self.grid_upper = current_price + half_range
+        self.grid_spacing = (self.grid_upper - self.grid_lower) / max(1, self.grid_count - 1)
+
+        self.levels = []
+        self.initialize(current_price, balance, dynamic_spacing=True)
+        self.place_initial_orders(balance)
+        self.reconcile_positions()
+        self.active = True
+        self._last_recenter_time = now
+        self._peak_price = current_price
+        self._trailing_sl_price = None
+
+        logger.info(
+            "GRID RECENTERED | new range [{}-{}] | spacing={}",
+            round(self.grid_lower, 8), round(self.grid_upper, 8), round(self.grid_spacing, 8),
+        )
+        return True
+
+    def update_trailing_sl(self, current_price: float) -> None:
+        if current_price > self._peak_price:
+            self._peak_price = current_price
+        static_sl = self.grid_lower * (1 - self.stop_loss_pct)
+        if self._peak_price > 0:
+            trailing_sl = self._peak_price * (1 - self._trailing_sl_trigger)
+            self._trailing_sl_price = max(static_sl, trailing_sl)
+        else:
+            self._trailing_sl_price = static_sl
+
+    def get_stop_loss_price(self) -> float:
+        if self._trailing_sl_price is not None:
+            return self._trailing_sl_price
+        return self.grid_lower * (1 - self.stop_loss_pct)
+
+    def log_sl_status(self) -> None:
+        logger.info(
+            "SL STATUS | trigger={}% | peak={} | sl={}",
+            round(self._trailing_sl_trigger * 100, 2),
+            round(self._peak_price, 8),
+            round(self.get_stop_loss_price(), 8),
+        )
+
+    def log_analytics(self, balance: float = 0.0) -> None:
+        net_pnl = self.total_pnl - self.total_fees
+        avg_pnl_per_cycle = net_pnl / max(1, self.total_completed_cycles)
+        total_range = self.grid_upper - self.grid_lower
+        mid_price = (self.grid_upper + self.grid_lower) / 2
+        range_pct = total_range / mid_price * 100 if mid_price > 0 else 0.0
+        filled_levels = sum(1 for l in self.levels if l.fill_count > 0)
+        pending_orders = sum(1 for l in self.levels if l.status == "pending")
+        replaced_orders = sum(1 for l in self.levels if l.status == "replaced")
+        buy_levels = sum(1 for l in self.levels if l.side == "buy" and l.status in ("pending", "replaced"))
+        sell_levels = sum(1 for l in self.levels if l.side == "sell" and l.status in ("pending", "replaced"))
+        exposure = self.get_exposure_pct(balance) if balance > 0 else 0.0
+
+        logger.info(
+            "GRID ANALYTICS | fills={} cycles={} | gross={:.6f} fees={:.6f} net={:.6f} | "
+            "avg_cycle={:.6f} | filled={}/{} | pending={} replaced={} | "
+            "buys={} sells={} | range={:.2f}% | vol_mult={:.2f} | "
+            "sl={} | exposure={:.1%} | spread={:.4f}%",
+            self.total_fills, self.total_completed_cycles, self.total_pnl, self.total_fees, net_pnl,
+            avg_pnl_per_cycle, filled_levels, len(self.levels),
+            pending_orders, replaced_orders,
+            buy_levels, sell_levels, range_pct,
+            self._volatility_mult, self.get_stop_loss_price(),
+            exposure, self._last_orderbook.get("spread_pct", 0) * 100,
+        )
+
+    def _rebuild_levels(self, current_price: float | None = None) -> None:
+        self.grid_spacing = (self.grid_upper - self.grid_lower) / max(1, self.grid_count - 1)
+        levels = []
+        for i in range(self.grid_count):
+            price = self._round_price(self.grid_lower + i * self.grid_spacing)
+            side = "buy" if current_price is not None and price < current_price else "sell"
+            lvl = GridLevel(price=price, side=side)
+            if side == "buy":
+                lvl.entry_price = price
+            levels.append(lvl)
+        self.levels = levels
+
+    def get_unrealized_pnl(self, current_price: float) -> float:
+        pnl = 0.0
+        for level in self.levels:
+            qty = level.quantity if level.quantity > 0 else 0.0
+            if qty <= 0:
+                continue
+            if level.side == "sell":
+                if level.status in ("replaced", "pending"):
+                    entry_price = level.entry_price if level.entry_price else level.price
+                    gross = (current_price - entry_price) * qty
+                    pnl += gross
+        return pnl
+
+    def to_dict(self) -> dict:
+        return {
+            "grid_lower": self.grid_lower,
+            "grid_upper": self.grid_upper,
+            "grid_count": self.grid_count,
+            "grid_spacing": self.grid_spacing,
+            "active": self.active,
+            "total_pnl": self.total_pnl,
+            "total_fees": self.total_fees,
+            "total_fills": self.total_fills,
+            "total_completed_cycles": self.total_completed_cycles,
+            "_last_recenter_time": self._last_recenter_time,
+            "_trailing_sl_price": self._trailing_sl_price,
+            "_trailing_sl_trigger": self._trailing_sl_trigger,
+            "_peak_price": self._peak_price,
+            "_volatility_mult": self._volatility_mult,
+            "_block_buys": self._block_buys,
+            "_last_replacement_time": self._last_replacement_time,
+            "_buy_scale": self._buy_scale,
+            "levels": [l.to_dict() for l in self.levels],
+        }
+
+    def load_from_dict(self, data: dict, current_price: float | None = None) -> None:
+        self.grid_lower = data["grid_lower"]
+        self.grid_upper = data["grid_upper"]
+        self.grid_count = data["grid_count"]
+        self.grid_spacing = data["grid_spacing"]
+        self.active = data["active"]
+        self.total_pnl = data.get("total_pnl", 0.0)
+        self.total_fees = data.get("total_fees", 0.0)
+        self.total_fills = data.get("total_fills", 0)
+        self.total_completed_cycles = data.get("total_completed_cycles", 0)
+        self._last_recenter_time = data.get("_last_recenter_time", 0.0)
+        self._trailing_sl_price = data.get("_trailing_sl_price", None)
+        self._trailing_sl_trigger = data.get("_trailing_sl_trigger", self._trailing_sl_trigger)
+        self._peak_price = data.get("_peak_price", 0.0)
+        self._volatility_mult = data.get("_volatility_mult", 1.0)
+        self._block_buys = data.get("_block_buys", False)
+        self._last_replacement_time = data.get("_last_replacement_time", 0.0)
+        self._buy_scale = data.get("_buy_scale", 1.0)
+        raw_levels = [GridLevel.from_dict(l) for l in data.get("levels", [])]
+        seen = {}
+        for l in raw_levels:
+            if l.price not in seen:
+                seen[l.price] = l
+            else:
+                existing = seen[l.price]
+                existing.fill_count = max(existing.fill_count, l.fill_count)
+                existing.total_pnl += l.total_pnl
+                if l.order_id is not None and existing.order_id is None:
+                    existing.order_id = l.order_id
+                    existing.side = l.side
+                    existing.status = l.status
+                    existing.entry_price = l.entry_price
+                    existing.quantity = l.quantity
+                elif l.status == "replaced" and existing.status != "replaced":
+                    existing.status = l.status
+                    existing.entry_price = l.entry_price
+                    existing.quantity = l.quantity
+        self.levels = sorted(seen.values(), key=lambda x: x.price)
+        if len(raw_levels) != len(self.levels):
+            logger.warning(
+                "DEDUPLICATED {} levels with duplicate prices ({} -> {})",
+                len(raw_levels) - len(self.levels), len(raw_levels), len(self.levels),
+            )
+
+        if len(self.levels) != self.grid_count:
+            self.state_corrupted = True
+            logger.warning(
+                "GRID STATE CORRUPT | expected {} levels but saved {} — "
+                "rebuilding levels from grid bounds",
+                self.grid_count, len(self.levels),
+            )
+            self._rebuild_levels(current_price)
