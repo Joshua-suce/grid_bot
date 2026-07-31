@@ -276,6 +276,88 @@ def test_grid_engine_stop_loss_price():
     assert sl == 78000 * 0.97
 
 
+def test_grid_engine_short_stop_loss_price_static():
+    class FakeExchange:
+        class exchange:
+            @staticmethod
+            def amount_to_precision(symbol, amount):
+                return f"{amount:.6f}"
+            @staticmethod
+            def price_to_precision(symbol, price):
+                return f"{price:.2f}"
+
+    grid = GridEngine(
+        exchange=FakeExchange(),
+        symbol="BTCUSDT",
+        grid_lower=78000,
+        grid_upper=82000,
+        grid_count=10,
+        capital_per_grid_pct=0.05,
+        stop_loss_pct=0.03,
+    )
+    sl = grid.get_short_stop_loss_price()
+    assert sl == 82000 * 1.03
+
+
+def test_grid_engine_short_trailing_sl_follows_trough():
+    class FakeExchange:
+        class exchange:
+            @staticmethod
+            def amount_to_precision(symbol, amount):
+                return f"{amount:.6f}"
+            @staticmethod
+            def price_to_precision(symbol, price):
+                return f"{price:.2f}"
+
+    grid = GridEngine(
+        exchange=FakeExchange(),
+        symbol="BTCUSDT",
+        grid_lower=78000,
+        grid_upper=82000,
+        grid_count=10,
+        capital_per_grid_pct=0.05,
+        stop_loss_pct=0.03,
+        trailing_sl_trigger_pct=0.05,
+    )
+    grid.update_trailing_sl_short(80000)
+    sl1 = grid.get_short_stop_loss_price()
+    assert sl1 == pytest.approx(80000 * 1.05)
+    assert sl1 <= 82000 * 1.03, "trailing short SL must not exceed the static ceiling"
+
+    grid.update_trailing_sl_short(78000)
+    sl2 = grid.get_short_stop_loss_price()
+    assert sl2 == pytest.approx(78000 * 1.05)
+    assert sl2 < sl1, "short SL must tighten as price falls (locking in profit)"
+
+
+def test_grid_engine_reset_trailing_clears_both_sides():
+    class FakeExchange:
+        class exchange:
+            @staticmethod
+            def amount_to_precision(symbol, amount):
+                return f"{amount:.6f}"
+            @staticmethod
+            def price_to_precision(symbol, price):
+                return f"{price:.2f}"
+
+    grid = GridEngine(
+        exchange=FakeExchange(),
+        symbol="BTCUSDT",
+        grid_lower=78000,
+        grid_upper=82000,
+        grid_count=10,
+        capital_per_grid_pct=0.05,
+        stop_loss_pct=0.03,
+    )
+    grid.update_trailing_sl(81000)
+    grid.update_trailing_sl_short(79000)
+    grid.reset_trailing()
+    assert grid._peak_price == 0.0
+    assert grid._trough_price == 0.0
+    assert grid._trailing_sl_price is None
+    assert grid._trailing_sl_price_short is None
+
+
 def test_grid_engine_to_dict():
     class FakeExchange:
         class exchange:

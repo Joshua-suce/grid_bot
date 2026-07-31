@@ -137,6 +137,8 @@ class GridEngine:
         self._trailing_sl_price: float | None = None
         self._trailing_sl_trigger: float = trailing_sl_trigger_pct
         self._peak_price = 0.0
+        self._trough_price = 0.0
+        self._trailing_sl_price_short: float | None = None
         self._last_orderbook: dict = {}
         self._event_journal = event_journal
         self._notifier = notifier
@@ -888,7 +890,9 @@ class GridEngine:
         self.active = True
         self._last_recenter_time = now
         self._peak_price = current_price
+        self._trough_price = current_price
         self._trailing_sl_price = None
+        self._trailing_sl_price_short = None
 
         logger.info(
             "GRID RECENTERED | new range [{}-{}] | spacing={}",
@@ -906,14 +910,44 @@ class GridEngine:
         else:
             self._trailing_sl_price = static_sl
 
+    def update_trailing_sl_short(self, current_price: float) -> None:
+        if self._trough_price == 0.0 or current_price < self._trough_price:
+            self._trough_price = current_price
+        static_sl = self.grid_upper * (1 + self.stop_loss_pct)
+        if self._trough_price > 0:
+            trailing_sl = self._trough_price * (1 + self._trailing_sl_trigger)
+            self._trailing_sl_price_short = min(static_sl, trailing_sl)
+        else:
+            self._trailing_sl_price_short = static_sl
+
     def get_stop_loss_price(self) -> float:
         if self._trailing_sl_price is not None:
             return self._trailing_sl_price
         return self.grid_lower * (1 - self.stop_loss_pct)
 
-    def log_sl_status(self) -> None:
+    def get_short_stop_loss_price(self) -> float:
+        if self._trailing_sl_price_short is not None:
+            return self._trailing_sl_price_short
+        return self.grid_upper * (1 + self.stop_loss_pct)
+
+    def reset_trailing(self) -> None:
+        """Reset trailing peak/trough tracking, e.g. when the position side flips."""
+        self._peak_price = 0.0
+        self._trough_price = 0.0
+        self._trailing_sl_price = None
+        self._trailing_sl_price_short = None
+
+    def log_sl_status(self, side: str = "long") -> None:
+        if side == "short":
+            logger.info(
+                "SL STATUS | side=short | trigger={}% | trough={} | sl={}",
+                round(self._trailing_sl_trigger * 100, 2),
+                round(self._trough_price, 8),
+                round(self.get_short_stop_loss_price(), 8),
+            )
+            return
         logger.info(
-            "SL STATUS | trigger={}% | peak={} | sl={}",
+            "SL STATUS | side=long | trigger={}% | peak={} | sl={}",
             round(self._trailing_sl_trigger * 100, 2),
             round(self._peak_price, 8),
             round(self.get_stop_loss_price(), 8),
@@ -985,6 +1019,8 @@ class GridEngine:
             "_trailing_sl_price": self._trailing_sl_price,
             "_trailing_sl_trigger": self._trailing_sl_trigger,
             "_peak_price": self._peak_price,
+            "_trough_price": self._trough_price,
+            "_trailing_sl_price_short": self._trailing_sl_price_short,
             "_volatility_mult": self._volatility_mult,
             "_block_buys": self._block_buys,
             "_last_replacement_time": self._last_replacement_time,
@@ -1006,6 +1042,8 @@ class GridEngine:
         self._trailing_sl_price = data.get("_trailing_sl_price", None)
         self._trailing_sl_trigger = data.get("_trailing_sl_trigger", self._trailing_sl_trigger)
         self._peak_price = data.get("_peak_price", 0.0)
+        self._trough_price = data.get("_trough_price", 0.0)
+        self._trailing_sl_price_short = data.get("_trailing_sl_price_short", None)
         self._volatility_mult = data.get("_volatility_mult", 1.0)
         self._block_buys = data.get("_block_buys", False)
         self._last_replacement_time = data.get("_last_replacement_time", 0.0)

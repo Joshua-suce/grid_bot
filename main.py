@@ -1,0 +1,830 @@
+from __future__ import annotations
+
+import signal
+import sys
+import time
+from datetime import datetime, timezone
+
+import numpy as np
+from loguru import logger
+
+from config import settings
+from logger import setup_logging
+from exchange import Exchange
+from grid import GridEngine, calculate_grid_range, calculate_dynamic_grid_count, validate_grid_spacing
+from trend_filter import TrendFilter, atr as calc_atr
+from risk import RiskManager
+from state import StateManager
+from telegram_notifier import TelegramNotifier
+from trade_journal import TradeJournal
+from event_journal import EventJournal
+
+
+TIMEFRAME_MULTIPLIER = {
+    "1m": 1440, "5m": 288, "15m": 96, "30m": 48,
+    "1h": 24, "4h": 6, "1d": 1,
+}
+
+def candles_for_lookback(timeframe: str, days: int) -> int:
+    mult = TIMEFRAME_MULTIPLIER.get(timeframe, 24)
+    return days * mult + 100
+
+
+def get_total_position(exchange: Exchange, symbol: str) -> float:
+    """Return total long position size (contracts) for the symbol."""
+    try:
+        positions = exchange.get_positions(symbol)
+        total = 0.0
+        for pos in positions:
+            if pos.get("side") == "long":
+                total += float(pos.get("contracts", 0) or 0)
+        return total
+    except Exception as e:
+        logger.debug("Failed to fetch positions: {}", e)
+        return 0.0
+
+
+def get_net_position(exchange: Exchange, symbol: str) -> tuple[str, float]:
+    """Return (side, qty) of the net open position: ('long', qty), ('short', qty),
+    or ('', 0.0) when flat. Handles both one-way (side='short') and
+    negative-contracts encodings of a short position.
+    """
+    try:
+        positions = exchange.get_positions(symbol)
+        long_qty = 0.0
+        short_qty = 0.0
+        for pos in positions:
+            side = pos.get("side", "")
+            qty = float(pos.get("contracts", 0) or 0)
+            if side == "long" and qty < 0:
+                side, qty = "short", abs(qty)
+            elif side == "short" and qty < 0:
+                side, qty = "long", abs(qty)
+            if side == "long":
+                long_qty += qty
+            elif side == "short":
+                short_qty += qty
+        if long_qty > short_qty:
+            return "long", long_qty - short_qty
+        if short_qty > long_qty:
+            return "short", short_qty - long_qty
+        return "", 0.0
+    except Exception as e:
+        logger.debug("Failed to fetch positions: {}", e)
+        return "", 0.0
+
+
+def get_position_details(exchange: Exchange, symbol: str) -> list[dict]:
+    """Return list of position dicts with entry_price, qty, side."""
+    try:
+        positions = exchange.get_positions(symbol)
+        result = []
+        for pos in positions:
+            amt = float(pos.get("contracts", 0) or 0)
+            entry = float(pos.get("entryPrice", 0) or 0)
+            if amt > 0 and entry > 0:
+                result.append({
+                    "side": pos.get("side", "long"),
+                    "entry_price": entry,
+                    "qty": amt,
+                })
+        return result
+    except Exception:
+        return []
+
+
+def _notify_status(notifier: TelegramNotifier, exchange: Exchange, symbol: str, price: float) -> None:
+    """Send position + balance to Telegram. Call only on significant events."""
+    pos_details = get_position_details(exchange, symbol)
+    for pos in pos_details:
+        if pos["side"] == "short":
+            unrealized = (pos["entry_price"] - price) * pos["qty"]
+        else:
+            unrealized = (price - pos["entry_price"]) * pos["qty"]
+        notifier.on_position_update(symbol, pos["side"], pos["entry_price"], pos["qty"], price, unrealized)
+    balance_info = exchange.get_balance_info()
+    equity = exchange.get_total_equity()
+    exposure_pct = 0.0
+    if equity > 0:
+        exposure_usdt = sum(p["qty"] * price for p in pos_details)
+        exposure_pct = exposure_usdt / equity
+    notifier.on_balance_update(balance_info["free"], balance_info["used"], equity, exposure_pct)
+
+
+def daily_reset_check(risk: RiskManager, notifier: TelegramNotifier, exchange: Exchange, symbol: str, events: EventJournal = None) -> None:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if risk.state.last_reset_date != today:
+        if risk.state.last_reset_date:
+            balance = exchange.get_balance()
+            notifier.on_daily_summary(
+                risk.state.daily_realized_pnl,
+                risk.state.trades_today,
+                balance,
+            )
+            if events:
+                events.daily_reset(risk.state.daily_realized_pnl, risk.state.trades_today, balance)
+        risk.reset_daily()
+
+
+def run_bot() -> None:
+    setup_logging(settings.log_dir, "INFO")
+    mode = "DEMO (testnet)" if settings.demo_mode else "LIVE"
+    logger.info("=" * 50)
+    logger.info("GRID BOT STARTING | mode={} | symbol={}", mode, settings.symbol)
+    logger.info("=" * 50)
+
+    try:
+        settings.validate()
+    except ValueError as e:
+        logger.error("Invalid configuration: {}", e)
+        return
+
+    notifier = TelegramNotifier(
+        settings.telegram_bot_token,
+        settings.telegram_chat_id,
+        settings.telegram_enabled,
+    )
+
+    events = EventJournal(settings.log_dir)
+
+    try:
+        config = settings.exchange_config
+        exchange = Exchange(config, demo=settings.demo_mode)
+    except Exception as e:
+        logger.error("Failed to connect to exchange: {}", e)
+        return
+
+    exchange.set_leverage(settings.symbol, settings.leverage)
+
+    logger.info("STARTUP CLEANUP | cancelling all orders and closing orphan positions...")
+    cancelled = exchange.cancel_everything(settings.symbol)
+    if cancelled:
+        logger.warning("Cancelled {} leftover orders (limits + stops) from previous sessions", cancelled)
+    closed = exchange.close_all_positions(settings.symbol)
+    if closed:
+        logger.warning("Closed {} orphan positions from previous sessions", closed)
+
+    try:
+        leftover = exchange.get_open_orders(settings.symbol)
+    except Exception as e:
+        logger.error("Cleanup verification failed ({}): cannot start on an uncertain book. Restart once the exchange write path recovers.", e)
+        return
+    if leftover:
+        logger.error(
+            "{} orders are still open after cleanup — the exchange write path is unreachable. "
+            "NOT starting on a dirty book (avoids duplicate grid levels). Restart the bot once the exchange recovers.",
+            len(leftover),
+        )
+        notifier.send(f"&#x1f6a8; <b>STARTUP ABORTED</b>\n{len(leftover)} stale orders could not be cancelled (exchange write path down). Book was left untouched.")
+        return
+
+    trend = TrendFilter(
+        ema_fast=settings.ema_fast,
+        ema_slow=settings.ema_slow,
+        adx_period=settings.adx_period,
+        trend_threshold=settings.adx_trend_threshold,
+        range_threshold=settings.adx_range_threshold,
+        check_interval=settings.trend_check_interval,
+        confirmation_seconds=settings.trend_confirmation_seconds,
+    )
+
+    risk = RiskManager(
+        stop_loss_pct=settings.stop_loss_pct,
+        daily_loss_limit_pct=settings.daily_loss_limit_pct,
+        max_drawdown_pct=settings.max_drawdown_pct,
+        cooldown_seconds=settings.cooldown_seconds,
+        max_exposure_pct=settings.max_exposure_pct,
+        max_recovery_count=settings.max_recovery_count,
+        event_journal=events,
+    )
+
+    grid = None
+    state_mgr = None
+
+    state_mgr = StateManager(settings.state_dir, settings.symbol)
+    journal = TradeJournal(settings.log_dir)
+    saved_state = state_mgr.load()
+
+    if saved_state and "grid" in saved_state:
+        logger.info("Restoring saved grid state")
+        balance = exchange.get_balance()
+        risk.initialize(balance)
+
+        grid = GridEngine(
+            exchange, settings.symbol,
+            grid_lower=saved_state["grid"]["grid_lower"],
+            grid_upper=saved_state["grid"]["grid_upper"],
+            grid_count=saved_state["grid"]["grid_count"],
+            capital_per_grid_pct=settings.capital_per_grid_pct,
+            stop_loss_pct=settings.stop_loss_pct,
+            maker_fee_pct=settings.maker_fee_pct / 100,
+            taker_fee_pct=settings.taker_fee_pct / 100,
+            recenter_cooldown=settings.recenter_cooldown,
+            replacement_cooldown=settings.replacement_cooldown,
+            order_pacing_seconds=settings.order_pacing_seconds,
+            capital_per_grid_usdt=settings.capital_per_grid_usdt,
+            leverage=settings.leverage,
+            trailing_sl_trigger_pct=settings.trailing_sl_trigger_pct,
+            max_exposure_pct=settings.max_exposure_pct,
+            event_journal=events,
+            notifier=notifier,
+        )
+        grid.load_from_dict(saved_state["grid"], current_price=exchange.get_price(settings.symbol))
+
+        if grid.state_corrupted:
+            logger.warning("Deleting corrupt state file so next startup recalculates fresh bounds")
+            state_mgr.delete()
+
+        has_exchange_positions = any(
+            p.get("side") == "long" and float(p.get("contracts", 0) or 0) > 0
+            for p in exchange.get_positions(settings.symbol)
+        )
+
+        if has_exchange_positions:
+            grid.reconcile_state()
+            grid.reconcile_positions()
+        else:
+            logger.info("No exchange positions — resetting stale grid levels to pending")
+            for level in grid.levels:
+                level.order_id = None
+                if level.side == "sell" and level.status == "replaced":
+                    level.side = "buy"
+                    level.price = level.entry_price if level.entry_price else level.price
+                    level.status = "pending"
+                elif level.status != "pending":
+                    level.status = "pending"
+            logger.info("Placing fresh grid orders after cleanup")
+            grid.place_initial_orders(exchange.get_balance())
+
+        risk.load_from_dict(saved_state.get("risk", {}))
+    else:
+        logger.info("Calculating grid range from recent price action")
+        ohlcv = exchange.get_ohlcv(settings.symbol, settings.grid_timeframe, limit=candles_for_lookback(settings.grid_timeframe, settings.range_lookback_days))
+        current_price = exchange.get_price(settings.symbol)
+
+        grid_lower, grid_upper = calculate_grid_range(
+            ohlcv, current_price,
+            lookback_days=settings.range_lookback_days,
+            atr_multiplier=settings.range_atr_multiplier,
+            timeframe=settings.grid_timeframe,
+        )
+
+        atr_series = calc_atr(ohlcv["high"], ohlcv["low"], ohlcv["close"], period=14)
+        current_atr = float(atr_series.iloc[-1]) if not np.isnan(atr_series.iloc[-1]) else current_price * 0.02
+        atr_pct = current_atr / current_price
+        dynamic_count = calculate_dynamic_grid_count(atr_pct, settings.grid_count)
+        if dynamic_count != settings.grid_count:
+            logger.info("DYNAMIC GRID COUNT | ATR%={:.3f} | {} -> {} levels", atr_pct * 100, settings.grid_count, dynamic_count)
+
+        dynamic_allocation = dynamic_count * settings.capital_per_grid_pct
+        if dynamic_allocation > 0.5:
+            logger.warning(
+                "Dynamic grid allocation {:.0%} exceeds 50% limit — clamping grid_count",
+                dynamic_allocation,
+            )
+            dynamic_count = min(int(0.5 / settings.capital_per_grid_pct), settings.grid_count)
+
+        min_total_range = current_price * settings.range_min_spacing_pct * dynamic_count
+        current_range = grid_upper - grid_lower
+        if current_range < min_total_range:
+            needed_half = min_total_range / 2 * 1.01
+            grid_lower = current_price - needed_half
+            grid_upper = current_price + needed_half
+            logger.info(
+                "GRID RANGE WIDENED for min spacing | new lower={} new upper={} (was {})",
+                round(grid_lower, 8), round(grid_upper, 8), round(current_range, 8),
+            )
+
+        if not validate_grid_spacing(grid_lower, grid_upper, dynamic_count, settings.range_min_spacing_pct, current_price):
+            logger.error("Grid spacing validation failed. Adjust grid_count or range parameters.")
+            return
+
+        balance = exchange.get_balance()
+        risk.initialize(balance)
+
+        grid = GridEngine(
+            exchange, settings.symbol,
+            grid_lower=grid_lower,
+            grid_upper=grid_upper,
+            grid_count=dynamic_count,
+            capital_per_grid_pct=settings.capital_per_grid_pct,
+            stop_loss_pct=settings.stop_loss_pct,
+            maker_fee_pct=settings.maker_fee_pct / 100,
+            taker_fee_pct=settings.taker_fee_pct / 100,
+            recenter_cooldown=settings.recenter_cooldown,
+            replacement_cooldown=settings.replacement_cooldown,
+            order_pacing_seconds=settings.order_pacing_seconds,
+            capital_per_grid_usdt=settings.capital_per_grid_usdt,
+            leverage=settings.leverage,
+            trailing_sl_trigger_pct=settings.trailing_sl_trigger_pct,
+            max_exposure_pct=settings.max_exposure_pct,
+            event_journal=events,
+            notifier=notifier,
+        )
+        grid.initialize(current_price, balance)
+
+    sl_order_id = None
+    _sl_price = 0.0
+    _sl_qty = 0.0
+
+    def _reset_sl():
+        nonlocal sl_order_id, _sl_price, _sl_qty
+        sl_order_id = None
+        _sl_price = 0.0
+        _sl_qty = 0.0
+
+    position_side, position_qty = get_net_position(exchange, settings.symbol)
+    _last_side = position_side
+    if position_side == "long":
+        try:
+            sl_price = grid.get_stop_loss_price()
+            order = exchange.place_stop_market(settings.symbol, "sell", position_qty, sl_price)
+            sl_order_id = order["id"]
+            _sl_price = sl_price
+            _sl_qty = position_qty
+            logger.info("STOP-LOSS ORDER PLACED on startup | side=long qty={} @ {}", position_qty, sl_price)
+        except Exception as e:
+            logger.error("Failed to place stop-loss on startup: {}", e)
+    elif position_side == "short":
+        try:
+            sl_price = grid.get_short_stop_loss_price()
+            order = exchange.place_stop_market(settings.symbol, "buy", position_qty, sl_price)
+            sl_order_id = order["id"]
+            _sl_price = sl_price
+            _sl_qty = position_qty
+            logger.info("STOP-LOSS ORDER PLACED on startup | side=short qty={} @ {}", position_qty, sl_price)
+        except Exception as e:
+            logger.error("Failed to place stop-loss on startup: {}", e)
+
+    price_now = exchange.get_price(settings.symbol)
+    balance_info = exchange.get_balance_info()
+    logger.info("Current price: {}", price_now)
+    logger.info(
+        "Balance: free={:.2f} USDT total={:.2f} USDT used={:.2f} USDT",
+        balance_info["free"], balance_info["total"], balance_info["used"],
+    )
+    logger.info("Grid range: [{} - {}] | levels: {}", round(grid.grid_lower, 8), round(grid.grid_upper, 8), grid.grid_count)
+
+    ohlcv_tf = exchange.get_ohlcv(settings.symbol, settings.trend_timeframe, limit=100)
+    trend.update(ohlcv_tf, settings.trend_timeframe)
+    try:
+        ohlcv_fast = exchange.get_ohlcv(settings.symbol, settings.trend_timeframe_fast, limit=100)
+        trend.add_timeframe(ohlcv_fast, settings.trend_timeframe_fast)
+    except Exception:
+        pass
+    try:
+        ohlcv_1d = exchange.get_ohlcv(settings.symbol, "1d", limit=100)
+        trend.add_timeframe(ohlcv_1d, "1d")
+    except Exception:
+        pass
+
+    if settings.force_trade_now or trend.is_ranging():
+        grid.activate(exchange.get_balance())
+        notifier.on_grid_start(settings.symbol, grid.grid_lower, grid.grid_upper, grid.grid_count)
+        if settings.force_trade_now:
+            logger.warning("Force trade mode enabled; bypassing trend gate and activating grid immediately.")
+    else:
+        if grid.active:
+            grid.pause()
+            _reset_sl()
+        logger.info("Market is trending ({}), grid will wait for ranging conditions", trend.regime.value)
+
+    logger.info("Bot running in {} mode. Press Ctrl+C to stop.", mode)
+    logger.info("Poll interval: {}s | Trend check: {}s", settings.poll_interval, settings.trend_check_interval)
+
+    notifier.on_startup_summary(
+        symbol=settings.symbol,
+        mode=mode,
+        price=price_now,
+        grid_lower=grid.grid_lower,
+        grid_upper=grid.grid_upper,
+        grid_count=grid.grid_count,
+        balance_free=balance_info["free"],
+        equity=exchange.get_total_equity(),
+        leverage=settings.leverage,
+        regime=trend.regime.value,
+        adx=trend.adx_value,
+        grid_active=grid.active,
+    )
+    _notify_status(notifier, exchange, settings.symbol, price_now)
+
+    loop_count = 0
+    consecutive_errors = 0
+    last_analytics_fill_count = 0
+    try:
+        while True:
+            try:
+                loop_count += 1
+                exchange.maybe_resync_time()
+                daily_reset_check(risk, notifier, exchange, settings.symbol, events)
+                price = exchange.get_price(settings.symbol)
+
+                if risk.is_in_recovery():
+                    remaining = risk.recovery_cooldown_remaining()
+                    if remaining > 0:
+                        if loop_count % 10 == 0:
+                            logger.info("RECOVERY COOLDOWN | {}s remaining", remaining)
+                            events.recovery_event("cooldown", risk.state.recovery_count, cooldown_remaining=remaining)
+                        time.sleep(settings.poll_interval)
+                        continue
+                    else:
+                        logger.info("RECOVERY READY | recalculating grid around current price {}", price)
+                        try:
+                            ohlcv = exchange.get_ohlcv(settings.symbol, settings.grid_timeframe, limit=candles_for_lookback(settings.grid_timeframe, settings.range_lookback_days))
+                            grid_lower, grid_upper = calculate_grid_range(
+                                ohlcv, price,
+                                lookback_days=settings.range_lookback_days,
+                                atr_multiplier=settings.range_atr_multiplier,
+                                timeframe=settings.grid_timeframe,
+                            )
+
+                            atr_series = calc_atr(ohlcv["high"], ohlcv["low"], ohlcv["close"], period=14)
+                            current_atr = float(atr_series.iloc[-1]) if not np.isnan(atr_series.iloc[-1]) else price * 0.02
+                            atr_pct = current_atr / price
+                            dynamic_count = calculate_dynamic_grid_count(atr_pct, settings.grid_count)
+
+                            min_total_range = price * settings.range_min_spacing_pct * dynamic_count
+                            current_range = grid_upper - grid_lower
+                            if current_range < min_total_range:
+                                needed_half = min_total_range / 2 * 1.01
+                                grid_lower = price - needed_half
+                                grid_upper = price + needed_half
+
+                            if not validate_grid_spacing(grid_lower, grid_upper, dynamic_count, settings.range_min_spacing_pct, price):
+                                logger.error("Grid spacing validation failed during recovery — retrying next cycle")
+                                time.sleep(settings.poll_interval)
+                                continue
+
+                            recovery_mult = risk.get_recovery_size_multiplier()
+                            if recovery_mult == 0.0:
+                                logger.error(
+                                    "MAX RECOVERY REACHED ({}) — shutting down bot",
+                                    risk.state.recovery_count,
+                                )
+                                notifier.on_kill_switch("Max recovery attempts reached — bot shutting down")
+                                state_data = {
+                                    "grid": grid.to_dict(),
+                                    "risk": risk.to_dict(),
+                                    "last_update": datetime.now().isoformat(),
+                                }
+                                state_mgr.save(state_data)
+                                return
+                            adjusted_capital_pct = settings.capital_per_grid_pct * recovery_mult
+                            logger.info(
+                                "RECOVERY GRID | range=[{}-{}] | levels={} | sizing={:.0%}",
+                                round(grid_lower, 8), round(grid_upper, 8), dynamic_count, recovery_mult,
+                            )
+
+                            old_fills = grid.total_fills
+                            old_pnl = grid.total_pnl
+                            old_fees = grid.total_fees
+                            old_cycles = grid.total_completed_cycles
+                            old_peak = grid._peak_price
+
+                            grid = GridEngine(
+                                exchange, settings.symbol,
+                                grid_lower=grid_lower,
+                                grid_upper=grid_upper,
+                                grid_count=dynamic_count,
+                                capital_per_grid_pct=adjusted_capital_pct,
+                                stop_loss_pct=settings.stop_loss_pct,
+                                maker_fee_pct=settings.maker_fee_pct / 100,
+                                taker_fee_pct=settings.taker_fee_pct / 100,
+                                recenter_cooldown=settings.recenter_cooldown,
+                                replacement_cooldown=settings.replacement_cooldown,
+                                order_pacing_seconds=settings.order_pacing_seconds,
+                                capital_per_grid_usdt=0,
+                                leverage=settings.leverage,
+                                trailing_sl_trigger_pct=settings.trailing_sl_trigger_pct,
+                                max_exposure_pct=settings.max_exposure_pct,
+                                event_journal=events,
+                                notifier=notifier,
+                            )
+                            grid.initialize(price, exchange.get_balance())
+                            grid.total_fills = old_fills
+                            grid.total_pnl = old_pnl
+                            grid.total_fees = old_fees
+                            grid.total_completed_cycles = old_cycles
+                            grid._peak_price = old_peak
+                            risk.exit_recovery()
+                            grid.activate(exchange.get_balance())
+                            notifier.on_grid_start(settings.symbol, grid.grid_lower, grid.grid_upper, grid.grid_count)
+                            notifier.on_recovery_resume(recovery_mult)
+                            notifier.on_grid_recalculated(settings.symbol, grid_lower, grid_upper, dynamic_count, "recovery")
+                            events.grid_recalculated(
+                                settings.symbol, 0, 0, grid_lower, grid_upper,
+                                dynamic_count, "recovery", current_atr,
+                            )
+                            events.recovery_event("resume", risk.state.recovery_count, sizing_pct=recovery_mult)
+                            _notify_status(notifier, exchange, settings.symbol, price)
+                            logger.info("Grid recovered and activated with {}% sizing", int(recovery_mult * 100))
+                        except Exception as e:
+                            logger.error("Recovery failed: {} — will retry next cycle", e)
+                            time.sleep(settings.poll_interval)
+                            continue
+
+                if trend.time_to_check():
+                    old_regime = trend.regime.value
+                    ohlcv_tf = exchange.get_ohlcv(settings.symbol, settings.trend_timeframe, limit=100)
+                    trend.update(ohlcv_tf, settings.trend_timeframe)
+                    try:
+                        ohlcv_fast = exchange.get_ohlcv(settings.symbol, settings.trend_timeframe_fast, limit=100)
+                        trend.add_timeframe(ohlcv_fast, settings.trend_timeframe_fast)
+                    except Exception:
+                        pass
+                    try:
+                        ohlcv_1d = exchange.get_ohlcv(settings.symbol, "1d", limit=100)
+                        trend.add_timeframe(ohlcv_1d, "1d")
+                    except Exception:
+                        pass
+
+                    if trend.regime.value != old_regime:
+                        events.trend_change(old_regime, trend.regime.value, trend.adx_value, settings.trend_timeframe)
+                        notifier.on_trend_change(old_regime, trend.regime.value, trend.adx_value)
+
+                    atr_series = calc_atr(ohlcv_tf["high"], ohlcv_tf["low"], ohlcv_tf["close"], period=14)
+                    current_atr = float(atr_series.iloc[-1]) if not np.isnan(atr_series.iloc[-1]) else price * 0.02
+                    grid.update_volatility(current_atr / price)
+
+                    if not settings.force_trade_now:
+                        if trend.is_trending() and grid.active:
+                            grid.pause()
+                            _reset_sl()
+                            notifier.on_trend_pause(trend.regime.value, trend.adx_value)
+                        elif trend.is_ranging() and not grid.active:
+                            grid.activate(exchange.get_balance())
+                            notifier.on_grid_start(settings.symbol, grid.grid_lower, grid.grid_upper, grid.grid_count)
+                            notifier.on_grid_resume()
+                            _notify_status(notifier, exchange, settings.symbol, price)
+                    else:
+                        logger.debug("Force trade mode active; grid remains enabled regardless of trend.")
+
+                if not grid.active and (settings.force_trade_now or trend.is_ranging()):
+                    grid.activate(exchange.get_balance())
+
+                if grid.active:
+                    grid.update_orderbook()
+
+                    if settings.recenter_enabled:
+                        old_lower, old_upper = grid.grid_lower, grid.grid_upper
+                        recentered = grid.recenter(price, exchange.get_balance(), settings.recenter_margin_pct)
+                        if recentered:
+                            logger.info("Grid recentered around current price")
+                            notifier.on_recenter(old_lower, old_upper, grid.grid_lower, grid.grid_upper)
+                            events.grid_recentered(settings.symbol, old_lower, old_upper, grid.grid_lower, grid.grid_upper)
+                            _notify_status(notifier, exchange, settings.symbol, price)
+
+                    if price < grid.grid_lower:
+                        total_pos = get_total_position(exchange, settings.symbol)
+                        has_sells = any(l.side == "sell" and l.order_id for l in grid.levels)
+                        if not has_sells and total_pos > 0:
+                            logger.warning("GRID EXIT: price {} below lowest grid {} with no sell orders — entering recovery", price, grid.grid_lower)
+                            events.grid_exit(settings.symbol, "price_below_grid", price, total_pos)
+                            notifier.on_grid_exit(settings.symbol, "price below grid", price, total_pos)
+                            grid.pause()
+                            _reset_sl()
+                            risk.trigger_kill_switch()
+
+                    if price > grid.grid_upper:
+                        total_pos = get_total_position(exchange, settings.symbol)
+                        has_buys = any(l.side == "buy" and l.order_id for l in grid.levels)
+                        if not has_buys and total_pos == 0:
+                            logger.info("GRID EXIT: price {} above grid {} with no buy orders and no position — recentering", price, grid.grid_upper)
+                            events.grid_exit(settings.symbol, "price_above_grid_no_position", price, total_pos)
+
+                    balance = exchange.get_balance_cached()
+                    equity = exchange.get_total_equity_cached()
+                    exposure = grid.get_exposure_pct(equity)
+                    unrealized = grid.get_unrealized_pnl(price)
+                    exchange.enforce_order_limit(settings.symbol, keep_count=grid.grid_count + 2, tracked_ids=grid.get_tracked_order_ids())
+                    fills = grid.check_fills(balance)
+                    for fill in fills:
+                        profit = fill["profit"]
+                        fee = fill["fee"]
+                        if fill["completed_cycle"]:
+                            risk.record_trade(profit)
+                        notifier.on_fill(fill["side"], fill["price"], profit, grid.total_fills, risk.state.daily_realized_pnl)
+                        events.fill(
+                            symbol=settings.symbol,
+                            side=fill["side"],
+                            price=fill["price"],
+                            qty=fill["quantity"],
+                            fee=fee,
+                            cycle_pnl=profit,
+                            completed_cycle=fill["completed_cycle"],
+                            fill_number=grid.total_fills,
+                            balance=balance,
+                            equity=equity,
+                            exposure_pct=exposure,
+                            daily_pnl=risk.state.daily_realized_pnl,
+                            regime=trend.regime.value,
+                        )
+                        journal.record(
+                            symbol=settings.symbol,
+                            side=fill["side"],
+                            price=fill["price"],
+                            quantity=fill["quantity"],
+                            grid_spacing=grid.grid_spacing,
+                            fill_number=grid.total_fills,
+                            cumulative_pnl=grid.total_pnl,
+                            daily_pnl=risk.state.daily_realized_pnl,
+                            trades_today=risk.state.trades_today,
+                            regime=trend.regime.value,
+                            fee=fee,
+                            completed_cycle=fill["completed_cycle"],
+                            cycle_pnl=profit,
+                            regime_adx=trend.adx_value,
+                            balance=balance,
+                            equity=equity,
+                            exposure_pct=exposure,
+                            unrealized_pnl=unrealized,
+                        )
+                    if fills:
+                        _notify_status(notifier, exchange, settings.symbol, price)
+
+                    risk.update_unrealized(unrealized)
+
+                    pos_details = get_position_details(exchange, settings.symbol)
+                    for pos in pos_details:
+                        pos_unrealized = (price - pos["entry_price"]) * pos["qty"]
+                        events.position_snapshot(
+                            symbol=settings.symbol, side=pos["side"],
+                            entry_price=pos["entry_price"], qty=pos["qty"],
+                            current_price=price, unrealized_pnl=pos_unrealized,
+                        )
+
+                    balance_info = exchange.get_balance_info_cached()
+                    events.balance_snapshot(
+                        free=balance_info["free"], used=balance_info["used"],
+                        total_equity=equity, exposure_pct=exposure,
+                    )
+
+                    events.exposure_update(exposure_pct=exposure, equity=equity)
+
+                    position_side, position_qty = get_net_position(exchange, settings.symbol)
+                    total_pos = position_qty if position_side else 0.0
+                    max_pos_qty = equity * settings.max_position_pct / price if price > 0 else 0
+                    grid.set_position_limit(total_pos, max_pos_qty)
+
+                    if position_side != _last_side:
+                        _last_side = position_side
+                        grid.reset_trailing()
+
+                    if position_side == "long":
+                        grid.update_trailing_sl(price)
+                        current_sl = grid.get_stop_loss_price()
+                        sl_needs_update = (
+                            abs(current_sl - _sl_price) > price * 0.001
+                            or abs(position_qty - _sl_qty) > max(1e-8, position_qty * 1e-6)
+                        )
+                        if sl_needs_update:
+                            exchange.cancel_all_stop_orders(settings.symbol)
+                            try:
+                                order = exchange.place_stop_market(settings.symbol, "sell", position_qty, current_sl)
+                                sl_order_id = order["id"]
+                                _sl_price = current_sl
+                                _sl_qty = position_qty
+                                grid.log_sl_status("long")
+                            except Exception as e:
+                                logger.error("Failed to place/update stop-loss: {}", e)
+                    elif position_side == "short":
+                        grid.update_trailing_sl_short(price)
+                        current_sl = grid.get_short_stop_loss_price()
+                        sl_needs_update = (
+                            abs(current_sl - _sl_price) > price * 0.001
+                            or abs(position_qty - _sl_qty) > max(1e-8, position_qty * 1e-6)
+                        )
+                        if sl_needs_update:
+                            exchange.cancel_all_stop_orders(settings.symbol)
+                            try:
+                                order = exchange.place_stop_market(settings.symbol, "buy", position_qty, current_sl)
+                                sl_order_id = order["id"]
+                                _sl_price = current_sl
+                                _sl_qty = position_qty
+                                grid.log_sl_status("short")
+                            except Exception as e:
+                                logger.error("Failed to place/update stop-loss: {}", e)
+                    else:
+                        if _sl_qty > 0:
+                            exchange.cancel_all_stop_orders(settings.symbol)
+                            sl_order_id = None
+                            _sl_price = 0.0
+                            _sl_qty = 0.0
+
+                    was_in_recovery = risk.is_in_recovery()
+                    is_safe, is_fatal = risk.check_all(equity, grid.get_stop_loss_price(), price, exposure)
+                    if not is_safe and is_fatal:
+                        if not was_in_recovery:
+                            grid.emergency_stop()
+                            _reset_sl()
+                            notifier.on_kill_switch("Risk limit breached")
+                            events.recovery_event("start", risk.state.recovery_count)
+                            logger.warning("Entering recovery mode — will wait {}s then recalculate grid", settings.cooldown_seconds)
+                            notifier.on_recovery_start(settings.cooldown_seconds, risk.state.recovery_count)
+                            _notify_status(notifier, exchange, settings.symbol, price)
+                        state_data = {
+                            "grid": grid.to_dict(),
+                            "risk": risk.to_dict(),
+                            "last_update": datetime.now().isoformat(),
+                        }
+                        state_mgr.save(state_data)
+                        time.sleep(settings.poll_interval)
+                        continue
+                    elif not is_safe:
+                        logger.warning("EXPOSURE WARNING | grid continues but new orders blocked")
+
+                if not grid.active:
+                    equity = exchange.get_total_equity()
+                    balance = exchange.get_balance()
+
+                state_data = {
+                    "grid": grid.to_dict(),
+                    "risk": risk.to_dict(),
+                    "last_update": datetime.now().isoformat(),
+                }
+                state_mgr.save(state_data)
+
+                logger.info(
+                    "PRICE={} | fills={} | gross={:.2f} fees={:.2f} net={:.2f} | balance_free={:.2f} total_equity={:.2f} | grid={} | regime={} | spread={:.4f}%",
+                    price, grid.total_fills, grid.total_pnl, grid.total_fees,
+                    grid.total_pnl - grid.total_fees,
+                    balance, equity,
+                    "ON" if grid.active else "OFF", trend.regime.value,
+                    grid._last_orderbook.get("spread_pct", 0) * 100,
+                )
+
+                if grid.active and grid.total_fills > 0 and grid.total_fills % 10 == 0 and grid.total_fills != last_analytics_fill_count:
+                    grid.log_analytics(balance)
+                    last_analytics_fill_count = grid.total_fills
+
+                consecutive_errors = 0
+                time.sleep(settings.poll_interval)
+
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                consecutive_errors += 1
+                logger.error("Loop error (consecutive={}): {}", consecutive_errors, e)
+                if "-1021" in str(e):
+                    exchange._sync_time()
+                    time.sleep(2)
+                elif consecutive_errors >= 3:
+                    logger.warning("Multiple consecutive errors — attempting reconnection")
+                    if exchange.reconnect():
+                        consecutive_errors = 0
+                        try:
+                            grid.reconcile_state()
+                            grid.reconcile_positions()
+                            logger.info("State reconciled after reconnection")
+                        except Exception as reconcile_err:
+                            logger.error("Reconciliation failed after reconnect: {}", reconcile_err)
+                    else:
+                        logger.error("Reconnection failed — saving state and shutting down")
+                        try:
+                            state_data = {
+                                "grid": grid.to_dict() if grid is not None else {},
+                                "risk": risk.to_dict() if risk is not None else {},
+                                "last_update": datetime.now().isoformat(),
+                            }
+                            state_mgr.save(state_data)
+                        except Exception:
+                            pass
+                        return
+                else:
+                    time.sleep(10)
+
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+    finally:
+        try:
+            if grid is not None:
+                grid.emergency_stop()
+                _reset_sl()
+                if settings.close_on_exit:
+                    closed = exchange.close_all_positions(settings.symbol)
+                    if closed:
+                        logger.warning("Closed {} open positions on shutdown", closed)
+        except Exception as e:
+            logger.error("Error during shutdown cleanup: {}", e)
+        try:
+            state_data = {
+                "grid": grid.to_dict() if grid is not None else {},
+                "risk": risk.to_dict() if risk is not None else {},
+                "last_update": datetime.now().isoformat(),
+            }
+            if state_mgr is not None:
+                state_mgr.save(state_data)
+        except Exception as e:
+            logger.error("Failed to save state on shutdown: {}", e)
+        notifier.close()
+        logger.info("Bot stopped. State saved.")
+
+
+def _signal_handler(signum: int, frame) -> None:
+    logger.info("Received signal {} — shutting down...", signum)
+    raise KeyboardInterrupt()
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _signal_handler)
+    run_bot()
