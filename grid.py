@@ -149,6 +149,7 @@ class GridEngine:
         self._min_profit_multiplier: float = 1.0
         self._open_orders_fetch_time: float = 0.0
         self._open_orders_map: dict[tuple[float, str], dict] = {}
+        self._warned_small_fixed_allocation = False
 
     def _round_price(self, price: float) -> float:
         """Round price to exchange tick size."""
@@ -201,11 +202,10 @@ class GridEngine:
         try:
             positions = self.exchange.get_positions(self.symbol)
             for pos in positions:
-                if pos.get("side") == "long":
-                    qty = float(pos.get("contracts", 0) or 0)
-                    entry = float(pos.get("entryPrice", 0) or 0)
-                    if qty > 0 and entry > 0:
-                        exposure_usdt += qty * entry
+                qty = float(pos.get("contracts", 0) or 0)
+                entry = float(pos.get("entryPrice", 0) or 0)
+                if qty > 0 and entry > 0:
+                    exposure_usdt += qty * entry
         except Exception:
             for level in self.levels:
                 if level.quantity <= 0:
@@ -317,11 +317,13 @@ class GridEngine:
         if self.capital_per_grid_usdt > 0:
             fixed_allocation = self.capital_per_grid_usdt * self.leverage * self._volatility_mult
             if fixed_allocation < pct_allocation:
-                logger.warning(
-                    "CAPITAL_PER_GRID_USDT ({:.2f}) is smaller than percent-based allocation ({:.2f}); "
-                    "using the larger value for per-grid sizing.",
-                    fixed_allocation, pct_allocation,
-                )
+                if not self._warned_small_fixed_allocation:
+                    self._warned_small_fixed_allocation = True
+                    logger.warning(
+                        "CAPITAL_PER_GRID_USDT ({:.2f}) is smaller than percent-based allocation ({:.2f}); "
+                        "using the larger value for per-grid sizing.",
+                        fixed_allocation, pct_allocation,
+                    )
             raw = max(fixed_allocation, pct_allocation)
             current_total = raw * self.grid_count
             target_total = balance * self.max_exposure_pct

@@ -61,7 +61,7 @@ class Exchange:
         self._circuit_breaker = CircuitBreaker()
         self._last_spread: float = 0.0
         self._last_time_sync: float = 0.0
-        self._time_sync_interval: float = 300.0
+        self._time_sync_interval: float = 60.0
         self._open_order_count: int = 0
         self._last_order_count_time: float = 0.0
         self._balance_cache: dict[str, float] = {}
@@ -102,8 +102,10 @@ class Exchange:
             local_before = int(self.exchange.milliseconds())
             diff = self.exchange.load_time_difference()
             self._last_time_sync = time.time()
-            if abs(diff) > 100:
+            if abs(diff) > 500:
                 logger.info("TIME SYNC | diff={}ms (local_before={})", diff, local_before)
+            elif abs(diff) > 100:
+                logger.debug("TIME SYNC | diff={}ms (local_before={})", diff, local_before)
         except Exception as e:
             self._last_time_sync = time.time()
             logger.debug("Time sync failed: {}", e)

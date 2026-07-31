@@ -358,6 +358,34 @@ def test_grid_engine_reset_trailing_clears_both_sides():
     assert grid._trailing_sl_price_short is None
 
 
+def test_get_exposure_pct_counts_short_positions():
+    """Exposure must include short positions so risk gating does not see 0% exposure
+    while the grid holds a short."""
+    class FakeExchange:
+        class exchange:
+            @staticmethod
+            def amount_to_precision(symbol, amount):
+                return f"{amount:.6f}"
+            @staticmethod
+            def price_to_precision(symbol, price):
+                return f"{price:.2f}"
+
+        def get_positions(self, symbol):
+            return [{"side": "short", "contracts": 1000, "entryPrice": 0.07}]
+
+    grid = GridEngine(
+        exchange=FakeExchange(),
+        symbol="DOGEUSDT",
+        grid_lower=0.065,
+        grid_upper=0.075,
+        grid_count=10,
+        capital_per_grid_pct=0.1,
+        stop_loss_pct=0.03,
+    )
+    pct = grid.get_exposure_pct(balance=100.0)
+    assert pct == pytest.approx(1000 * 0.07 / 100.0)
+
+
 def test_grid_engine_to_dict():
     class FakeExchange:
         class exchange:
