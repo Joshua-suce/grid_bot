@@ -143,12 +143,13 @@ class Exchange:
         except Exception as e:
             logger.warning("Could not set leverage: {}", e)
 
-    def _retry(self, fn, *args, label: str = "API call", **kwargs) -> Any:
+    def _retry(self, fn, *args, label: str = "API call", max_attempts: int | None = None, **kwargs) -> Any:
         if not self._circuit_breaker.allow_request():
             logger.warning("{} skipped — circuit breaker open", label)
             raise ccxt.NetworkError("Circuit breaker open")
         last_err = None
-        for attempt in range(1, self.max_retries + 1):
+        attempts = max_attempts or self.max_retries
+        for attempt in range(1, attempts + 1):
             try:
                 result = fn(*args, **kwargs)
                 self._circuit_breaker.record_success()
@@ -158,14 +159,14 @@ class Exchange:
                 if not isinstance(e, ccxt.RateLimitExceeded):
                     self._circuit_breaker.record_failure()
                 delay = self.retry_delay * attempt
-                logger.warning("{} failed (attempt {}/{}): {} — retrying in {}s", label, attempt, self.max_retries, e, delay)
+                logger.warning("{} failed (attempt {}/{}): {} — retrying in {}s", label, attempt, attempts, e, delay)
                 time.sleep(delay)
             except ccxt.ExchangeError as e:
                 if "-1021" in str(e):
                     self._sync_time()
                     last_err = e
                     delay = self.retry_delay * attempt
-                    logger.warning("{} timestamp drift (attempt {}/{}): synced time, retrying in {}s", label, attempt, self.max_retries, delay)
+                    logger.warning("{} timestamp drift (attempt {}/{}): synced time, retrying in {}s", label, attempt, attempts, delay)
                     time.sleep(delay)
                     continue
                 logger.error("{} failed: {}", label, e)
@@ -175,7 +176,7 @@ class Exchange:
                 logger.error("{} failed: {}", label, e)
                 self._circuit_breaker.record_failure()
                 raise
-        logger.error("{} failed after {} retries", label, self.max_retries)
+        logger.error("{} failed after {} retries", label, attempts)
         raise last_err
 
     def get_ticker(self, symbol: str) -> dict:
@@ -373,16 +374,27 @@ class Exchange:
             except ccxt.InvalidOrder as e:
                 err_str = str(e)
                 if post_only and ("-2019" in err_str or "would trigger immediate match" in err_str.lower() or "post only" in err_str.lower()):
-                    logger.debug("Post-only order rejected (would cross spread) @ {} — retrying without postOnly", price)
-                    post_only = False
-                    continue
+                    logger.debug("Post-only order rejected (would cross spread) @ {} — placing without postOnly", price)
+                    order_params = dict(params or {})
+                    order_params["postOnly"] = False
+                    order = self.exchange.create_limit_order(symbol, side, amount, price, order_params)
+                    order_id = order.get("id", "unknown")
+                    logger.info(
+                        "ORDER PLACED | {} {} {} @ {} (id={}) | attempt={} | postOnly=False",
+                        side.upper(), amount, symbol, price, order_id, attempt,
+                    )
+                    return order
                 logger.error("Invalid order: {} {} {} @ {}: {}", side, amount, symbol, price, e)
                 raise
             except Exception as e:
                 last_err = e
                 if attempt < max_attempts:
                     delay = self.retry_delay * attempt
-                    logger.warning("Order placement failed (attempt {}/{}): {} — retrying in {}s", attempt, max_attempts, e, delay)
+                    if "-1008" in str(e):
+                        delay = max(delay, 10.0)
+                        logger.warning("Order placement throttled by exchange protection (-1008) — backing off {}s", delay)
+                    else:
+                        logger.warning("Order placement failed (attempt {}/{}): {} — retrying in {}s", attempt, max_attempts, e, delay)
                     time.sleep(delay)
                 else:
                     logger.error("Order placement failed after {} attempts: {}", max_attempts, e)
@@ -398,7 +410,14 @@ class Exchange:
             logger.info("ORDER CANCELLED | id={}", order_id)
             return True
         except ccxt.OrderNotFound:
-            pass
+            logger.debug("Cancel order {} — already gone", order_id)
+            return True
+        except ccxt.NetworkError as e:
+            logger.warning(
+                "Cancel order {} status UNKNOWN (network): {} — order may still be open, will re-verify",
+                order_id, e,
+            )
+            return False
         except ccxt.ExchangeError as e:
             if "-1021" in str(e):
                 self._sync_time()
@@ -406,6 +425,9 @@ class Exchange:
                     self.exchange.cancel_order(order_id, symbol)
                     logger.info("ORDER CANCELLED | id={}", order_id)
                     return True
+                except ccxt.NetworkError as e2:
+                    logger.warning("Cancel order {} status UNKNOWN after time sync: {}", order_id, e2)
+                    return False
                 except Exception:
                     pass
         # Regular cancel failed — try algo/conditional order cancel
@@ -472,7 +494,7 @@ class Exchange:
                 logger.debug("fetch_order {} failed: {}", order_id, e)
                 return None
 
-    def close_position(self, symbol: str, side: str, amount: float) -> dict:
+    def close_position(self, symbol: str, side: str, amount: float, max_attempts: int | None = None) -> dict:
         close_side = "sell" if side == "long" else "buy"
         if self.demo and not self.has_credentials:
             key = f"MOCK-CLOSE-{side[:1].upper()}-{int(time.time()*1000)}"
@@ -480,7 +502,7 @@ class Exchange:
             return {"id": key}
         order = self._retry(
             self.exchange.create_market_order, symbol, close_side, amount,
-            label="close_position",
+            label="close_position", max_attempts=max_attempts,
         )
         logger.info("POSITION CLOSED | {} {} {}", close_side.upper(), amount, symbol)
         return order
@@ -520,7 +542,7 @@ class Exchange:
             if not side:
                 continue
             try:
-                self.close_position(symbol, side, abs(amt))
+                self.close_position(symbol, side, abs(amt), max_attempts=1)
                 closed += 1
                 logger.warning("Closed existing {} position: {} {}", side, abs(amt), symbol)
             except Exception as e:
@@ -632,23 +654,42 @@ class Exchange:
         logger.info("Cancelled {} stop/conditional orders for {}", cancelled, symbol)
         return cancelled
 
-    def cancel_everything(self, symbol: str) -> int:
-        """Cancel ALL open orders: limit, stop, conditional — everything. Returns total cancelled."""
-        regular = self.get_open_orders(symbol)
-        stops = self.get_stop_orders(symbol)
+    def cancel_everything(self, symbol: str, timeout_seconds: float = 300.0) -> int:
+        """Cancel ALL open orders: limit, stop, conditional — everything.
 
-        seen_ids = set()
+        Blocks up to ``timeout_seconds`` re-verifying against the exchange and retrying,
+        so a flaky write path can never report success while orders are still open
+        (which is how duplicate grid levels historically piled up). Returns the number
+        of orders confirmed cancelled.
+        """
+        deadline = time.time() + timeout_seconds
+
+        def _fetch_regular() -> dict[str, dict] | None:
+            try:
+                return {o["id"]: o for o in self.get_open_orders(symbol) if o.get("id")}
+            except Exception as e:
+                logger.warning("Cleanup: failed to fetch open orders ({}), status unknown", e)
+                return None
+
+        pending = _fetch_regular()
+
         cancelled = 0
+        seen_ids: set[str] = set()
 
-        for order in regular:
-            order_id = order.get("id")
-            if not order_id or order_id in seen_ids:
-                continue
-            seen_ids.add(order_id)
-            if self.cancel_order(order_id, symbol):
-                cancelled += 1
+        # 1) Try one batch cancel for the regular (limit) orders.
+        if pending:
+            try:
+                self.exchange.cancel_all_orders(symbol)
+                cancelled += len(pending)
+                logger.info("BATCH CANCELLED {} orders for {}", len(pending), symbol)
+                pending = {}
+            except (ccxt.RequestTimeout, ccxt.NetworkError) as e:
+                logger.warning("Batch cancel timed out ({}); will retry individually", e)
+            except Exception as e:
+                logger.warning("Batch cancel failed ({}); will retry individually", e)
 
-        for order in stops:
+        # 2) Stop/conditional (algo) orders — attempt once each.
+        for order in self.get_stop_orders(symbol):
             algo_id = order.get("id")
             if not algo_id or algo_id in seen_ids:
                 continue
@@ -663,7 +704,33 @@ class Exchange:
                 if self.cancel_order(algo_id, symbol):
                     cancelled += 1
 
-        logger.info("CANCEL EVERYTHING | {} total orders cancelled for {}", cancelled, symbol)
+        # 3) Verify + retry loop: keep cancelling until the book is confirmed clean.
+        while time.time() < deadline:
+            still_open = _fetch_regular()
+            if still_open is None:
+                time.sleep(5.0)
+                continue
+            if not still_open:
+                break
+            ids = list(still_open)
+            for i, oid in enumerate(ids):
+                if time.time() >= deadline:
+                    break
+                if self.cancel_order(oid, symbol):
+                    cancelled += 1
+                if i < len(ids) - 1:
+                    time.sleep(1.0)
+            time.sleep(2.0)
+
+        remaining = _fetch_regular()
+        if remaining:
+            logger.warning(
+                "CLEANUP INCOMPLETE | {} orders still open for {} after {}s of retries "
+                "(backend unreachable for writes)", len(remaining), symbol, timeout_seconds,
+            )
+        else:
+            logger.info("CLEANUP VERIFIED | book clean for {}", symbol)
+        logger.info("CANCEL EVERYTHING | {} total orders confirmed cancelled for {}", cancelled, symbol)
         return cancelled
 
     def __enter__(self):

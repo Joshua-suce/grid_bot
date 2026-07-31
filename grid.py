@@ -64,12 +64,12 @@ def calculate_grid_range(
 
 
 def calculate_dynamic_grid_count(atr_pct: float, base_count: int) -> int:
-    if atr_pct < 0.015:
+    if atr_pct < 0.02:
         return base_count
-    elif atr_pct < 0.025:
-        return max(base_count - 2, 3)
+    elif atr_pct < 0.03:
+        return max(base_count - 1, 3)
     else:
-        return max(base_count - 4, 3)
+        return max(base_count - 2, 3)
 
 
 def validate_grid_spacing(lower: float, upper: float, count: int, min_spacing_pct: float, price: float) -> bool:
@@ -100,6 +100,7 @@ class GridEngine:
         taker_fee_pct: float = 0.0004,
         recenter_cooldown: int = 300,
         replacement_cooldown: int = 60,
+        order_pacing_seconds: float = 0.6,
         capital_per_grid_usdt: float = 0.0,
         leverage: int = 1,
         trailing_sl_trigger_pct: float = 0.05,
@@ -121,6 +122,7 @@ class GridEngine:
         self.taker_fee_pct = taker_fee_pct
         self.recenter_cooldown = recenter_cooldown
         self.replacement_cooldown = replacement_cooldown
+        self.order_pacing_seconds = order_pacing_seconds
         self.max_exposure_pct = max_exposure_pct
         self.use_market_close_on_replace = use_market_close_on_replace
         self.grid_spacing = (grid_upper - grid_lower) / max(1, grid_count - 1)
@@ -143,6 +145,8 @@ class GridEngine:
         self.state_corrupted: bool = False
         self._buy_scale: float = 1.0
         self._min_profit_multiplier: float = 1.0
+        self._open_orders_fetch_time: float = 0.0
+        self._open_orders_map: dict[tuple[float, str], dict] = {}
 
     def _round_price(self, price: float) -> float:
         """Round price to exchange tick size."""
@@ -150,9 +154,11 @@ class GridEngine:
 
     def update_volatility(self, atr_pct: float) -> None:
         if atr_pct < 0.01:
-            self._volatility_mult = min(1.5, 1.0 + (0.01 - atr_pct) * 50)
+            # In calmer markets, increase grid sizing aggressively to keep the bot active.
+            self._volatility_mult = min(2.5, 1.0 + (0.01 - atr_pct) * 150)
         elif atr_pct > 0.03:
-            self._volatility_mult = max(0.5, 1.0 - (atr_pct - 0.03) * 25)
+            # Reduce sizing gently even in very high volatility so the bot keeps trading.
+            self._volatility_mult = max(0.8, 1.0 - (atr_pct - 0.03) * 5)
         else:
             self._volatility_mult = 1.0
 
@@ -299,20 +305,58 @@ class GridEngine:
         )
 
     def _calc_usdt_per_grid(self, balance: float) -> float:
-        """Return the USDT notional per grid level (margin * leverage)."""
+        """Return the USDT notional per grid level.
+
+        If both a fixed USDT allocation and a percentage-based allocation are configured,
+        use the larger of the two so a small fixed override does not undercut the
+        chosen percentage allocation.
+        """
+        pct_allocation = balance * self.capital_per_grid_pct * self._volatility_mult
         if self.capital_per_grid_usdt > 0:
-            raw = self.capital_per_grid_usdt * self.leverage * self._volatility_mult
+            fixed_allocation = self.capital_per_grid_usdt * self.leverage * self._volatility_mult
+            if fixed_allocation < pct_allocation:
+                logger.warning(
+                    "CAPITAL_PER_GRID_USDT ({:.2f}) is smaller than percent-based allocation ({:.2f}); "
+                    "using the larger value for per-grid sizing.",
+                    fixed_allocation, pct_allocation,
+                )
+            raw = max(fixed_allocation, pct_allocation)
             current_total = raw * self.grid_count
             target_total = balance * self.max_exposure_pct
             if current_total > target_total:
                 raw = target_total / self.grid_count
             return raw
-        return balance * self.capital_per_grid_pct * self._volatility_mult
+        return pct_allocation
 
     def _is_level_profitable(self, level_price: float) -> bool:
         expected_profit = self.grid_spacing
         worst_fees = 2 * self.maker_fee_pct * level_price
         return expected_profit > worst_fees * self._min_profit_multiplier
+
+    def _existing_open_order(self, price: float, side: str) -> dict | None:
+        """Return an open exchange order already resting at the same price+side, if any.
+
+        Prevents duplicate grid levels when a placement actually succeeded on the
+        exchange but the response was lost (e.g. network timeout): the level is then
+        retried without an order_id, and without this check a second order would be
+        stacked on top of the first.
+        """
+        now = time.time()
+        if (now - self._open_orders_fetch_time) >= 2.0 or not self._open_orders_map:
+            try:
+                orders = self.exchange.get_open_orders(self.symbol)
+            except Exception:
+                self._open_orders_fetch_time = 0.0
+                return None
+            mapping: dict[tuple[float, str], dict] = {}
+            for order in orders:
+                o_price = order.get("price")
+                o_side = order.get("side")
+                if o_price is not None and o_side is not None:
+                    mapping[(float(o_price), o_side)] = order
+            self._open_orders_map = mapping
+            self._open_orders_fetch_time = now
+        return self._open_orders_map.get((float(price), side))
 
     def _place_order_for_level(self, level: GridLevel, balance: float) -> bool:
         if level.side == "buy" and self._block_buys:
@@ -326,6 +370,24 @@ class GridEngine:
                 self._min_profit_multiplier,
             )
             return False
+        existing = self._existing_open_order(level.price, level.side)
+        if existing and existing.get("id"):
+            if any(l is not level and l.order_id == existing["id"] for l in self.levels):
+                logger.warning(
+                    "SKIP ADOPT | order {} @ {} {} already tracked by another level",
+                    existing["id"], level.price, level.side,
+                )
+                return False
+            logger.warning(
+                "ADOPTED existing open order {} @ {} {} — avoiding duplicate placement",
+                existing["id"], level.price, level.side,
+            )
+            level.order_id = existing["id"]
+            level.status = "pending"
+            amount = existing.get("amount")
+            if amount is not None:
+                level.quantity = float(amount)
+            return True
         if not self.exchange.can_place_order(self.symbol):
             return False
         usdt_per_grid = self._calc_usdt_per_grid(balance)
@@ -340,7 +402,7 @@ class GridEngine:
                 self._notifier.on_order_failed(self.symbol, level.side, level.price, 0.0, "quantity_zero")
             return False
         try:
-            order = self.exchange.place_limit_order(self.symbol, level.side, level.price, float(quantity))
+            order = self.exchange.place_limit_order(self.symbol, level.side, level.price, float(quantity), max_attempts=1)
             if "id" not in order:
                 raise ValueError("Order response missing 'id'")
             level.order_id = order["id"]
@@ -358,13 +420,19 @@ class GridEngine:
             if self._notifier:
                 self._notifier.on_order_failed(self.symbol, level.side, level.price, float(quantity), str(e))
             return False
+        finally:
+            self._open_orders_fetch_time = 0.0
 
     def place_initial_orders(self, balance: float) -> int:
         placed = 0
         failed = 0
+        first = True
         for level in self.levels:
             if level.order_id is not None:
                 continue
+            if self.order_pacing_seconds > 0 and not first:
+                time.sleep(self.order_pacing_seconds)
+            first = False
             if self._place_order_for_level(level, balance):
                 placed += 1
             else:
@@ -455,7 +523,13 @@ class GridEngine:
                 continue
 
             if best_level.order_id is not None:
-                self.exchange.cancel_order(best_level.order_id, self.symbol)
+                if not self.exchange.cancel_order(best_level.order_id, self.symbol):
+                    logger.warning(
+                        "RECONCILE | could not cancel order {} for level @ {} — skipping repurpose "
+                        "(order may still be open; will retry next reconcile)",
+                        best_level.order_id, best_level.price,
+                    )
+                    continue
 
             best_level.fill_count += 1
             best_level.status = "replaced"
@@ -582,8 +656,9 @@ class GridEngine:
                     continue
                 fills.append(self._handle_fill(level, balance))
 
-        orphaned = [l for l in self.levels if l.order_id is None and l.status == "pending" and l.quantity > 0]
+        orphaned = [l for l in self.levels if l.order_id is None and l.status == "pending" and (l.quantity > 0 or l.fill_count == 0)]
         if orphaned:
+            first = True
             for level in orphaned:
                 if level.price < self.grid_lower or level.price > self.grid_upper:
                     logger.debug(
@@ -594,6 +669,9 @@ class GridEngine:
                 if self._is_on_cooldown():
                     logger.debug("SKIP ORPHAN (cooldown) | {} @ {}", level.side, level.price)
                     continue
+                if self.order_pacing_seconds > 0 and not first:
+                    time.sleep(self.order_pacing_seconds)
+                first = False
                 if self._place_order_for_level(level, balance):
                     logger.info("Replaced orphaned level @ {} {}", level.price, level.side)
 
@@ -721,7 +799,7 @@ class GridEngine:
     def pause(self) -> None:
         if not self.active:
             return
-        cancelled = self.exchange.cancel_everything(self.symbol)
+        cancelled = self.exchange.cancel_everything(self.symbol, timeout_seconds=30)
         still_open = self.exchange.get_open_order_ids(self.symbol)
         for level in self.levels:
             if level.order_id is not None:
@@ -784,6 +862,19 @@ class GridEngine:
         )
 
         self.pause()
+
+        try:
+            still_open = self.exchange.get_open_order_ids(self.symbol)
+        except Exception as e:
+            logger.error("RECENTER ABORTED | could not verify clean book: {}", e)
+            return False
+        if still_open:
+            logger.error(
+                "RECENTER ABORTED | {} orders still open after pause (write path down) — "
+                "not rebuilding on a dirty book",
+                len(still_open),
+            )
+            return False
 
         half_range = (self.grid_upper - self.grid_lower) / 2
         self.grid_lower = current_price - half_range
