@@ -143,9 +143,11 @@ class GridEngine:
         self._event_journal = event_journal
         self._notifier = notifier
         self._block_buys = False
+        self._block_sells = False
         self._last_replacement_time: float = 0.0
         self.state_corrupted: bool = False
         self._buy_scale: float = 1.0
+        self._sell_scale: float = 1.0
         self._min_profit_multiplier: float = 1.0
         self._open_orders_fetch_time: float = 0.0
         self._open_orders_map: dict[tuple[float, str], dict] = {}
@@ -165,28 +167,44 @@ class GridEngine:
         else:
             self._volatility_mult = 1.0
 
-    def set_position_limit(self, current_position: float, max_position_qty: float) -> None:
-        """Block new buys if position would exceed the limit. Scales down buys gradually."""
-        old = self._block_buys
-        old_scale = self._buy_scale
-        self._block_buys = current_position >= max_position_qty
-        if max_position_qty <= 0:
-            self._buy_scale = 0.0
-        elif current_position >= max_position_qty:
-            self._buy_scale = 0.0
-        else:
-            ratio = current_position / max_position_qty
-            if ratio < 0.5:
-                self._buy_scale = 1.0
-            else:
-                self._buy_scale = 1.0 - (ratio - 0.5) / 0.5
-        if self._block_buys and not old:
+    def set_position_limit(self, long_position: float, short_position: float, max_position_qty: float) -> None:
+        """Block new buys when the long position would exceed the limit and new sells
+        when the short position would exceed it; scale order sizes down near the cap."""
+        old_block_buys = self._block_buys
+        old_buy_scale = self._buy_scale
+        old_block_sells = self._block_sells
+        old_sell_scale = self._sell_scale
+
+        self._block_buys, self._buy_scale = self._position_limit_state(long_position, max_position_qty)
+        self._block_sells, self._sell_scale = self._position_limit_state(short_position, max_position_qty)
+
+        if self._block_buys and not old_block_buys:
             logger.warning(
-                "POSITION LIMIT | {} >= {} — buy orders blocked",
-                round(current_position, 2), round(max_position_qty, 2),
+                "POSITION LIMIT | long {} >= {} — buy orders blocked",
+                round(long_position, 2), round(max_position_qty, 2),
             )
-        elif self._buy_scale != old_scale and self._buy_scale < 1.0:
-            logger.info("BUY SCALE | position={:.1f}/{:.1f} | scale={:.2f}", current_position, max_position_qty, self._buy_scale)
+        elif self._buy_scale != old_buy_scale and self._buy_scale < 1.0:
+            logger.info("BUY SCALE | long={:.1f}/{:.1f} | scale={:.2f}", long_position, max_position_qty, self._buy_scale)
+
+        if self._block_sells and not old_block_sells:
+            logger.warning(
+                "POSITION LIMIT | short {} >= {} — sell orders blocked",
+                round(short_position, 2), round(max_position_qty, 2),
+            )
+        elif self._sell_scale != old_sell_scale and self._sell_scale < 1.0:
+            logger.info("SELL SCALE | short={:.1f}/{:.1f} | scale={:.2f}", short_position, max_position_qty, self._sell_scale)
+
+    @staticmethod
+    def _position_limit_state(current_position: float, max_position_qty: float) -> tuple[bool, float]:
+        """Return (blocked, scale) for one side given the current open position."""
+        if max_position_qty <= 0:
+            return current_position >= max_position_qty, 0.0
+        if current_position >= max_position_qty:
+            return True, 0.0
+        ratio = current_position / max_position_qty
+        if ratio < 0.5:
+            return False, 1.0
+        return False, 1.0 - (ratio - 0.5) / 0.5
 
     def update_orderbook(self) -> None:
         self._last_orderbook = self.exchange.get_orderbook_depth(self.symbol)
@@ -366,6 +384,9 @@ class GridEngine:
         if level.side == "buy" and self._block_buys:
             logger.debug("SKIP BUY ORDER | position limit reached")
             return False
+        if level.side == "sell" and self._block_sells:
+            logger.debug("SKIP SELL ORDER | short position limit reached")
+            return False
         if not self._is_level_profitable(level.price):
             logger.info(
                 "SKIP ORDER @ {} | spacing={:.8f} < min_profit={:.8f} ({}x fees)",
@@ -398,6 +419,8 @@ class GridEngine:
         quantity = usdt_per_grid / level.price
         if level.side == "buy":
             quantity *= self._buy_scale
+        else:
+            quantity *= self._sell_scale
         quantity = self.exchange.exchange.amount_to_precision(self.symbol, quantity)
         if float(quantity) <= 0:
             if self._event_journal:
@@ -1025,8 +1048,10 @@ class GridEngine:
             "_trailing_sl_price_short": self._trailing_sl_price_short,
             "_volatility_mult": self._volatility_mult,
             "_block_buys": self._block_buys,
+            "_block_sells": self._block_sells,
             "_last_replacement_time": self._last_replacement_time,
             "_buy_scale": self._buy_scale,
+            "_sell_scale": self._sell_scale,
             "levels": [l.to_dict() for l in self.levels],
         }
 
@@ -1048,8 +1073,10 @@ class GridEngine:
         self._trailing_sl_price_short = data.get("_trailing_sl_price_short", None)
         self._volatility_mult = data.get("_volatility_mult", 1.0)
         self._block_buys = data.get("_block_buys", False)
+        self._block_sells = data.get("_block_sells", False)
         self._last_replacement_time = data.get("_last_replacement_time", 0.0)
         self._buy_scale = data.get("_buy_scale", 1.0)
+        self._sell_scale = data.get("_sell_scale", 1.0)
         raw_levels = [GridLevel.from_dict(l) for l in data.get("levels", [])]
         seen = {}
         for l in raw_levels:

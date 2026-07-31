@@ -386,6 +386,141 @@ def test_get_exposure_pct_counts_short_positions():
     assert pct == pytest.approx(1000 * 0.07 / 100.0)
 
 
+def test_set_position_limit_blocks_sells_on_short():
+    class FakeExchange:
+        class exchange:
+            @staticmethod
+            def amount_to_precision(symbol, amount):
+                return f"{amount:.6f}"
+            @staticmethod
+            def price_to_precision(symbol, price):
+                return f"{price:.2f}"
+
+    grid = GridEngine(
+        exchange=FakeExchange(),
+        symbol="TEST",
+        grid_lower=100.0,
+        grid_upper=120.0,
+        grid_count=5,
+        capital_per_grid_pct=0.1,
+        stop_loss_pct=0.03,
+    )
+    grid.set_position_limit(long_position=0.0, short_position=10.0, max_position_qty=10.0)
+    assert grid._block_buys is False
+    assert grid._block_sells is True
+    assert grid._sell_scale == 0.0
+    assert grid._buy_scale == 1.0
+
+
+def test_set_position_limit_scales_sells_near_short_cap():
+    class FakeExchange:
+        class exchange:
+            @staticmethod
+            def amount_to_precision(symbol, amount):
+                return f"{amount:.6f}"
+            @staticmethod
+            def price_to_precision(symbol, price):
+                return f"{price:.2f}"
+
+    grid = GridEngine(
+        exchange=FakeExchange(),
+        symbol="TEST",
+        grid_lower=100.0,
+        grid_upper=120.0,
+        grid_count=5,
+        capital_per_grid_pct=0.1,
+        stop_loss_pct=0.03,
+    )
+    grid.set_position_limit(long_position=0.0, short_position=7.5, max_position_qty=10.0)
+    assert grid._block_sells is False
+    assert grid._sell_scale == pytest.approx(0.5)
+    assert grid._buy_scale == 1.0
+
+
+def test_place_order_skips_sell_when_short_blocked():
+    class FakeExchange:
+        def __init__(self):
+            class _ex:
+                @staticmethod
+                def amount_to_precision(symbol, amount):
+                    return f"{amount:.6f}"
+                @staticmethod
+                def price_to_precision(symbol, price):
+                    return f"{price:.2f}"
+            self.exchange = _ex()
+
+        def get_open_orders(self, symbol):
+            return []
+
+        def can_place_order(self, symbol):
+            return True
+
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1):
+            return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
+
+    ex = FakeExchange()
+    grid = GridEngine(
+        exchange=ex,
+        symbol="TEST",
+        grid_lower=100.0,
+        grid_upper=120.0,
+        grid_count=5,
+        capital_per_grid_pct=0.1,
+        stop_loss_pct=0.03,
+    )
+    grid._block_sells = True
+    level = GridLevel(price=115.0, side="sell", quantity=1.0)
+
+    result = grid._place_order_for_level(level, balance=1000.0)
+
+    assert result is False
+    assert level.order_id is None
+
+
+def test_place_order_scales_sell_quantity_by_sell_scale():
+    class FakeExchange:
+        def __init__(self):
+            class _ex:
+                @staticmethod
+                def amount_to_precision(symbol, amount):
+                    return f"{amount:.6f}"
+                @staticmethod
+                def price_to_precision(symbol, price):
+                    return f"{price:.2f}"
+            self.exchange = _ex()
+            self.placed = []
+
+        def get_open_orders(self, symbol):
+            return []
+
+        def can_place_order(self, symbol):
+            return True
+
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1):
+            self.placed.append((side, price, amount))
+            return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
+
+    ex = FakeExchange()
+    grid = GridEngine(
+        exchange=ex,
+        symbol="TEST",
+        grid_lower=100.0,
+        grid_upper=120.0,
+        grid_count=5,
+        capital_per_grid_pct=0.1,
+        stop_loss_pct=0.03,
+    )
+    grid._sell_scale = 0.5
+    level = GridLevel(price=115.0, side="sell", quantity=1.0)
+
+    result = grid._place_order_for_level(level, balance=1000.0)
+
+    assert result is True
+    side, price, amount = ex.placed[-1]
+    assert side == "sell"
+    assert float(amount) == pytest.approx(100.0 / 115.0 * 0.5, rel=1e-3)
+
+
 def test_grid_engine_to_dict():
     class FakeExchange:
         class exchange:

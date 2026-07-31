@@ -44,11 +44,9 @@ def get_total_position(exchange: Exchange, symbol: str) -> float:
         return 0.0
 
 
-def get_net_position(exchange: Exchange, symbol: str) -> tuple[str, float]:
-    """Return (side, qty) of the net open position: ('long', qty), ('short', qty),
-    or ('', 0.0) when flat. Handles both one-way (side='short') and
-    negative-contracts encodings of a short position.
-    """
+def get_position_breakdown(exchange: Exchange, symbol: str) -> tuple[float, float]:
+    """Return (long_qty, short_qty) of open positions, normalizing the
+    negative-contracts encoding of a short in one-way mode."""
     try:
         positions = exchange.get_positions(symbol)
         long_qty = 0.0
@@ -64,14 +62,23 @@ def get_net_position(exchange: Exchange, symbol: str) -> tuple[str, float]:
                 long_qty += qty
             elif side == "short":
                 short_qty += qty
-        if long_qty > short_qty:
-            return "long", long_qty - short_qty
-        if short_qty > long_qty:
-            return "short", short_qty - long_qty
-        return "", 0.0
+        return long_qty, short_qty
     except Exception as e:
         logger.debug("Failed to fetch positions: {}", e)
-        return "", 0.0
+        return 0.0, 0.0
+
+
+def get_net_position(exchange: Exchange, symbol: str) -> tuple[str, float]:
+    """Return (side, qty) of the net open position: ('long', qty), ('short', qty),
+    or ('', 0.0) when flat. Handles both one-way (side='short') and
+    negative-contracts encodings of a short position.
+    """
+    long_qty, short_qty = get_position_breakdown(exchange, symbol)
+    if long_qty > short_qty:
+        return "long", long_qty - short_qty
+    if short_qty > long_qty:
+        return "short", short_qty - long_qty
+    return "", 0.0
 
 
 def get_position_details(exchange: Exchange, symbol: str) -> list[dict]:
@@ -661,10 +668,15 @@ def run_bot() -> None:
 
                     events.exposure_update(exposure_pct=exposure, equity=equity)
 
-                    position_side, position_qty = get_net_position(exchange, settings.symbol)
-                    total_pos = position_qty if position_side else 0.0
+                    long_pos, short_pos = get_position_breakdown(exchange, settings.symbol)
+                    if long_pos > short_pos:
+                        position_side, position_qty = "long", long_pos - short_pos
+                    elif short_pos > long_pos:
+                        position_side, position_qty = "short", short_pos - long_pos
+                    else:
+                        position_side, position_qty = "", 0.0
                     max_pos_qty = equity * settings.max_position_pct / price if price > 0 else 0
-                    grid.set_position_limit(total_pos, max_pos_qty)
+                    grid.set_position_limit(long_pos, short_pos, max_pos_qty)
 
                     if position_side != _last_side:
                         _last_side = position_side
