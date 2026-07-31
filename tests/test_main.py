@@ -1,7 +1,7 @@
 import pytest
 
 import main as main_module
-from main import get_net_position, get_position_details, get_total_position
+from main import get_net_position, get_position_details, get_short_position, get_total_position
 
 
 class FakeExchange:
@@ -46,6 +46,35 @@ def test_get_net_position_nets_long_and_short():
         {"side": "short", "contracts": 4},
     ])
     assert get_net_position(exchange, "DOGEUSDT") == ("long", 6.0)
+
+
+def test_get_short_position_returns_qty_and_entry():
+    exchange = FakeExchange([{"side": "short", "contracts": 5, "entryPrice": 0.07}])
+    assert get_short_position(exchange, "DOGEUSDT") == (5.0, 0.07)
+
+
+def test_get_short_position_negative_contracts_encoding():
+    exchange = FakeExchange([{"side": "long", "contracts": -5, "entryPrice": 0.07}])
+    assert get_short_position(exchange, "DOGEUSDT") == (5.0, 0.07)
+
+
+def test_get_short_position_ignores_longs_and_flat():
+    exchange = FakeExchange([
+        {"side": "long", "contracts": 10, "entryPrice": 0.06},
+        {"side": "long", "contracts": -5, "entryPrice": 0.07},
+    ])
+    assert get_short_position(exchange, "DOGEUSDT") == (5.0, 0.07)
+    assert get_short_position(FakeExchange([]), "DOGEUSDT") == (0.0, 0.0)
+
+
+def test_get_short_position_weighted_entry_across_legs():
+    exchange = FakeExchange([
+        {"side": "short", "contracts": 100, "entryPrice": 0.08},
+        {"side": "short", "contracts": 300, "entryPrice": 0.10},
+    ])
+    qty, entry = get_short_position(exchange, "DOGEUSDT")
+    assert qty == 400.0
+    assert entry == pytest.approx((100 * 0.08 + 300 * 0.10) / 400)
 
 
 def test_get_position_details_includes_short_positions():

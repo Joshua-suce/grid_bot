@@ -68,6 +68,30 @@ def get_position_breakdown(exchange: Exchange, symbol: str) -> tuple[float, floa
         return 0.0, 0.0
 
 
+def get_short_position(exchange: Exchange, symbol: str) -> tuple[float, float]:
+    """Return (short_qty, weighted_avg_entry_price) or (0.0, 0.0) when flat.
+    Handles both one-way (side='short', qty>0) and negative-contracts encodings."""
+    try:
+        positions = exchange.get_positions(symbol)
+        qty = 0.0
+        notional = 0.0
+        for pos in positions:
+            side = pos.get("side", "")
+            amt = float(pos.get("contracts", 0) or 0)
+            entry = float(pos.get("entryPrice", 0) or 0)
+            if side == "long" and amt < 0:
+                side, amt = "short", abs(amt)
+            if side == "short" and amt > 0:
+                qty += amt
+                notional += amt * entry
+        if qty > 0:
+            return qty, notional / qty
+        return 0.0, 0.0
+    except Exception as e:
+        logger.debug("Failed to fetch short position: {}", e)
+        return 0.0, 0.0
+
+
 def get_net_position(exchange: Exchange, symbol: str) -> tuple[str, float]:
     """Return (side, qty) of the net open position: ('long', qty), ('short', qty),
     or ('', 0.0) when flat. Handles both one-way (side='short') and
@@ -591,6 +615,19 @@ def run_bot() -> None:
                             grid.pause()
                             _reset_sl()
                             risk.trigger_kill_switch()
+                        elif not has_sells:
+                            short_qty, short_entry = get_short_position(exchange, settings.symbol)
+                            if short_qty > 0 and short_entry > 0 and (short_entry < grid.grid_lower or short_entry > grid.grid_upper):
+                                old_lower, old_upper = grid.grid_lower, grid.grid_upper
+                                rebuilt = grid.recenter(short_entry, exchange.get_balance(), settings.recenter_margin_pct)
+                                if rebuilt:
+                                    logger.info(
+                                        "GRID REBUILT (short): price {} below grid {} with short {} @ {} — grid recentered around short entry [{}-{}], SL stays active",
+                                        price, old_lower, short_qty, short_entry, grid.grid_lower, grid.grid_upper,
+                                    )
+                                    events.grid_recentered(settings.symbol, old_lower, old_upper, grid.grid_lower, grid.grid_upper)
+                                    notifier.on_recenter(old_lower, old_upper, grid.grid_lower, grid.grid_upper)
+                                    _notify_status(notifier, exchange, settings.symbol, price)
 
                     if price > grid.grid_upper:
                         total_pos = get_total_position(exchange, settings.symbol)
