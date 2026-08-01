@@ -899,3 +899,137 @@ def test_burst_of_fills_distributes_replacements_across_slots():
 
     assert len(grid.levels) == 5, "fills must not merge/drop grid levels"
     assert "BUY-100" in order_ids and "BUY-110" in order_ids
+
+
+def test_load_from_dict_recovers_duplicate_slots_without_rebuild():
+    """When a restart saves state while a fill replacement is parked on an occupied
+    slot, two levels share the same (price, side) and one grid line is left empty.
+    load_from_dict must recover by merging the duplicate and refilling the empty
+    grid line -- NOT rebuilding all levels (which lost fill bookkeeping in the live
+    demo run: 20 levels -> 16 -> GRID STATE CORRUPT -> rebuild on every restart).
+    """
+    class FakeExchange:
+        class exchange:
+            @staticmethod
+            def amount_to_precision(symbol, amount):
+                return f"{amount:.6f}"
+            @staticmethod
+            def price_to_precision(symbol, price):
+                return f"{price:.6f}"
+
+    grid = GridEngine(
+        exchange=FakeExchange(),
+        symbol="TEST",
+        grid_lower=100.0,
+        grid_upper=140.0,
+        grid_count=5,
+        capital_per_grid_pct=0.1,
+        stop_loss_pct=0.03,
+    )
+
+    state = {
+        "grid_lower": 100.0,
+        "grid_upper": 140.0,
+        "grid_count": 5,
+        "grid_spacing": 10.0,
+        "active": True,
+        "total_pnl": 3.5,
+        "total_fees": 0.5,
+        "total_fills": 12,
+        "total_completed_cycles": 4,
+        "_last_recenter_time": 0.0,
+        "_volatility_mult": 1.0,
+        "_trailing_sl_price": None,
+        "_trailing_sl_trigger": 0.05,
+        "_peak_price": 0.0,
+        "_trough_price": 0.0,
+        "_trailing_sl_price_short": None,
+        "_block_buys": False,
+        "_block_sells": False,
+        "_last_replacement_time": 0.0,
+        "_buy_scale": 1.0,
+        "_sell_scale": 1.0,
+        "levels": [
+            {"price": 100.0, "side": "buy", "order_id": None, "status": "pending", "fill_count": 1, "total_pnl": 0.0, "quantity": 0.0, "entry_price": 100.0},
+            {"price": 110.0, "side": "buy", "order_id": "BUY-110", "status": "replaced", "fill_count": 1, "total_pnl": 0.0, "quantity": 9.0, "entry_price": 110.0},
+            {"price": 120.0, "side": "sell", "order_id": "SELL-120", "status": "replaced", "fill_count": 1, "total_pnl": 1.2, "quantity": 9.0, "entry_price": 110.0},
+            {"price": 120.0, "side": "sell", "order_id": None, "status": "pending", "fill_count": 1, "total_pnl": 0.0, "quantity": 0.0, "entry_price": 110.0},
+            {"price": 140.0, "side": "sell", "order_id": "SELL-140", "status": "replaced", "fill_count": 1, "total_pnl": 0.8, "quantity": 9.0, "entry_price": 110.0},
+        ],
+    }
+
+    grid.load_from_dict(state, current_price=110.0)
+
+    assert not grid.state_corrupted, "recoverable duplicates must not trigger a full rebuild"
+    assert len(grid.levels) == 5, "grid must be refilled back to grid_count after merge"
+    prices = sorted(l.price for l in grid.levels)
+    assert prices == [100.0, 110.0, 120.0, 130.0, 140.0], f"empty line 130 must be refilled, got {prices}"
+    assert grid.total_fills == 12, "fill bookkeeping must survive the recovery"
+    assert grid.total_pnl == 3.5, "pnl bookkeeping must survive the recovery"
+
+    sell_120 = [l for l in grid.levels if l.price == 120.0 and l.side == "sell"]
+    assert len(sell_120) == 1, "duplicate (price, side) must be merged into one level"
+    assert sell_120[0].order_id == "SELL-120", "active order id must be preserved on merge"
+    assert sell_120[0].fill_count == 1, "fill_count must survive the merge"
+
+
+def test_load_from_dict_still_rebuilds_when_count_cannot_be_recovered():
+    """If levels are fundamentally broken (e.g. count mismatch that refilling cannot
+    fix), the grid must still fall back to a full rebuild instead of trading with a
+    wrong level count."""
+    class FakeExchange:
+        class exchange:
+            @staticmethod
+            def amount_to_precision(symbol, amount):
+                return f"{amount:.6f}"
+            @staticmethod
+            def price_to_precision(symbol, price):
+                return f"{price:.6f}"
+
+    grid = GridEngine(
+        exchange=FakeExchange(),
+        symbol="TEST",
+        grid_lower=100.0,
+        grid_upper=140.0,
+        grid_count=5,
+        capital_per_grid_pct=0.1,
+        stop_loss_pct=0.03,
+    )
+
+    state = {
+        "grid_lower": 100.0,
+        "grid_upper": 140.0,
+        "grid_count": 5,
+        "grid_spacing": 10.0,
+        "active": True,
+        "total_pnl": 0.0,
+        "total_fees": 0.0,
+        "total_fills": 0,
+        "total_completed_cycles": 0,
+        "_last_recenter_time": 0.0,
+        "_volatility_mult": 1.0,
+        "_trailing_sl_price": None,
+        "_trailing_sl_trigger": 0.05,
+        "_peak_price": 0.0,
+        "_trough_price": 0.0,
+        "_trailing_sl_price_short": None,
+        "_block_buys": False,
+        "_block_sells": False,
+        "_last_replacement_time": 0.0,
+        "_buy_scale": 1.0,
+        "_sell_scale": 1.0,
+        "levels": [
+            {"price": 100.0, "side": "buy", "order_id": None, "status": "pending", "fill_count": 0, "total_pnl": 0.0, "quantity": 0.0, "entry_price": 100.0},
+            {"price": 110.0, "side": "buy", "order_id": None, "status": "pending", "fill_count": 0, "total_pnl": 0.0, "quantity": 0.0, "entry_price": 110.0},
+            {"price": 120.0, "side": "sell", "order_id": None, "status": "pending", "fill_count": 0, "total_pnl": 0.0, "quantity": 0.0, "entry_price": 100.0},
+            {"price": 130.0, "side": "sell", "order_id": None, "status": "pending", "fill_count": 0, "total_pnl": 0.0, "quantity": 0.0, "entry_price": 100.0},
+            {"price": 140.0, "side": "sell", "order_id": None, "status": "pending", "fill_count": 0, "total_pnl": 0.0, "quantity": 0.0, "entry_price": 100.0},
+            {"price": 125.0, "side": "buy", "order_id": None, "status": "pending", "fill_count": 0, "total_pnl": 0.0, "quantity": 0.0, "entry_price": 125.0},
+        ],
+    }
+
+    grid.load_from_dict(state, current_price=110.0)
+
+    assert grid.state_corrupted, "more levels than grid_count must still trigger rebuild"
+    assert len(grid.levels) == 5, "rebuild must restore grid_count levels"
+    assert grid.state_corrupted

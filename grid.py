@@ -1110,15 +1110,15 @@ class GridEngine:
         raw_levels = [GridLevel.from_dict(l) for l in data.get("levels", [])]
         seen = {}
         for l in raw_levels:
-            if l.price not in seen:
-                seen[l.price] = l
+            key = (l.price, l.side)
+            if key not in seen:
+                seen[key] = l
             else:
-                existing = seen[l.price]
+                existing = seen[key]
                 existing.fill_count = max(existing.fill_count, l.fill_count)
                 existing.total_pnl += l.total_pnl
                 if l.order_id is not None and existing.order_id is None:
                     existing.order_id = l.order_id
-                    existing.side = l.side
                     existing.status = l.status
                     existing.entry_price = l.entry_price
                     existing.quantity = l.quantity
@@ -1129,15 +1129,45 @@ class GridEngine:
         self.levels = sorted(seen.values(), key=lambda x: x.price)
         if len(raw_levels) != len(self.levels):
             logger.warning(
-                "DEDUPLICATED {} levels with duplicate prices ({} -> {})",
+                "DEDUPLICATED {} levels with duplicate price+side ({} -> {})",
                 len(raw_levels) - len(self.levels), len(raw_levels), len(self.levels),
             )
+
+        self._refill_missing_grid_lines(current_price)
 
         if len(self.levels) != self.grid_count:
             self.state_corrupted = True
             logger.warning(
-                "GRID STATE CORRUPT | expected {} levels but saved {} — "
+                "GRID STATE CORRUPT | expected {} levels but restored {} — "
                 "rebuilding levels from grid bounds",
                 self.grid_count, len(self.levels),
             )
             self._rebuild_levels(current_price)
+
+    def _refill_missing_grid_lines(self, current_price: float | None = None) -> None:
+        """Re-add pending levels on empty grid lines after duplicate price+side
+        levels were merged. A fill whose replacement parked on an occupied slot
+        leaves a hole in the grid; refilling it preserves fill/cycle bookkeeping
+        instead of rebuilding every level from the grid bounds."""
+        occupied = {self._round_price(l.price) for l in self.levels}
+        missing = 0
+        for i in range(self.grid_count):
+            if len(self.levels) >= self.grid_count:
+                break
+            price = self._round_price(self.grid_lower + i * self.grid_spacing)
+            if price in occupied:
+                continue
+            side = "buy" if current_price is not None and price < current_price else "sell"
+            lvl = GridLevel(price=price, side=side)
+            if side == "buy":
+                lvl.entry_price = price
+            self.levels.append(lvl)
+            occupied.add(price)
+            missing += 1
+        self.levels.sort(key=lambda x: x.price)
+        if missing:
+            logger.warning(
+                "RECOVERED grid state | refilled {} empty grid line(s) after dedupe, "
+                "preserving {} existing levels' bookkeeping",
+                missing, len(self.levels) - missing,
+            )
