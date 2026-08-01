@@ -398,7 +398,7 @@ class GridEngine:
         existing = self._existing_open_order(level.price, level.side)
         if existing and existing.get("id"):
             if any(l is not level and l.order_id == existing["id"] for l in self.levels):
-                logger.warning(
+                logger.debug(
                     "SKIP ADOPT | order {} @ {} {} already tracked by another level",
                     existing["id"], level.price, level.side,
                 )
@@ -590,6 +590,7 @@ class GridEngine:
                 if "id" not in order:
                     raise ValueError("Order response missing 'id'")
                 best_level.order_id = order["id"]
+                self._open_orders_fetch_time = 0.0
                 logger.info(
                     "RECONCILE | position {} @ {} -> sell order @ {} (qty={})",
                     pos.get("side"), round(entry, 8), sell_price, qty,
@@ -615,6 +616,7 @@ class GridEngine:
                 if "id" not in order:
                     raise ValueError("Order response missing 'id'")
                 level.order_id = order["id"]
+                self._open_orders_fetch_time = 0.0
                 level.status = "replaced"
                 logger.info(
                     "RECONCILE | orphaned sell level @ {} — placed sell order (qty={})",
@@ -685,6 +687,7 @@ class GridEngine:
 
         orphaned = [l for l in self.levels if l.order_id is None and l.status == "pending" and (l.quantity > 0 or l.fill_count == 0)]
         if orphaned:
+            placed_slots: set[tuple[float, str]] = set()
             first = True
             for level in orphaned:
                 if level.price < self.grid_lower or level.price > self.grid_upper:
@@ -696,10 +699,18 @@ class GridEngine:
                 if self._is_on_cooldown():
                     logger.debug("SKIP ORPHAN (cooldown) | {} @ {}", level.side, level.price)
                     continue
+                slot = (level.price, level.side)
+                if slot in placed_slots:
+                    logger.debug(
+                        "SKIP ORPHAN | {} @ {} — slot already placed this cycle",
+                        level.side, level.price,
+                    )
+                    continue
                 if self.order_pacing_seconds > 0 and not first:
                     time.sleep(self.order_pacing_seconds)
                 first = False
                 if self._place_order_for_level(level, balance):
+                    placed_slots.add(slot)
                     logger.info("Replaced orphaned level @ {} {}", level.price, level.side)
 
         return fills
@@ -746,6 +757,14 @@ class GridEngine:
         new_side = "sell" if level.side == "buy" else "buy"
         fill_price = level.price
 
+        def _slot_pending(price: float) -> bool:
+            return any(
+                l is not level and l.price == price and l.side == new_side
+                and l.order_id is None and l.status == "pending"
+                and l.fill_count > 0 and l.quantity > 0
+                for l in self.levels
+            )
+
         sorted_levels = sorted(self.levels, key=lambda l: l.price)
         current_idx = None
         for i, lv in enumerate(sorted_levels):
@@ -753,17 +772,21 @@ class GridEngine:
                 current_idx = i
                 break
 
+        # Snap to the nearest existing level of the replacement side whose slot is not
+        # already claimed by another pending level. This keeps orders on grid lines
+        # while guaranteeing at most one pending level per price+side, so a burst of
+        # fills cannot pile several levels onto the same slot.
         if current_idx is not None:
             if new_side == "sell":
                 new_price = level.price + self.grid_spacing
                 for j in range(current_idx + 1, len(sorted_levels)):
-                    if sorted_levels[j].side == "sell":
+                    if sorted_levels[j].side == "sell" and not _slot_pending(sorted_levels[j].price):
                         new_price = sorted_levels[j].price
                         break
             elif new_side == "buy":
                 new_price = level.price - self.grid_spacing
                 for j in range(current_idx - 1, -1, -1):
-                    if sorted_levels[j].side == "buy":
+                    if sorted_levels[j].side == "buy" and not _slot_pending(sorted_levels[j].price):
                         new_price = sorted_levels[j].price
                         break
             else:
@@ -771,6 +794,12 @@ class GridEngine:
         else:
             new_price = level.price + self.grid_spacing if new_side == "sell" else level.price - self.grid_spacing
         new_price = self._round_price(new_price)
+
+        # If the snapped slot is still claimed by another pending level (rare, e.g. a
+        # burst of fills), step outward by grid spacing until a free slot is found.
+        step = self.grid_spacing if new_side == "sell" else -self.grid_spacing
+        while _slot_pending(new_price) and self.grid_lower <= new_price <= self.grid_upper:
+            new_price = self._round_price(new_price + step)
 
         if new_price < self.grid_lower or new_price > self.grid_upper:
             logger.warning("Replacement price {} outside grid bounds — level will not place order", new_price)
@@ -815,6 +844,7 @@ class GridEngine:
                 raise ValueError("Order response missing 'id'")
             level.order_id = order["id"]
             level.status = "replaced"
+            self._open_orders_fetch_time = 0.0
         except Exception as e:
             logger.error("Failed to place replacement order at {}: {} — will retry next cycle", new_price, e)
             level.order_id = None

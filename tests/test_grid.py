@@ -840,3 +840,62 @@ def test_reduceonly_sell_params_and_market_close():
     assert ex.closed is not None
     # ensure when market close used, no new limit params recorded
     assert ex.last_place_params is None
+
+
+def test_burst_of_fills_distributes_replacements_across_slots():
+    """A burst of fills on one side must NOT pile several pending levels onto the
+    same occupied (price, side). The live demo run collapsed this way: 6 sells filled
+    and each parked pending at the same occupied buy slot (0.07009), so when that
+    order finally filled every pending level placed a taker buy at once -> position
+    explosion. After a fill, the replacement must move to the next free slot instead
+    of stacking on the occupied one.
+    """
+    class FakeExchange:
+        class exchange:
+            @staticmethod
+            def amount_to_precision(symbol, amount):
+                return f"{amount:.6f}"
+            @staticmethod
+            def price_to_precision(symbol, price):
+                return f"{price:.6f}"
+
+        def place_limit_order(self, symbol, side, price, amount, params=None):
+            return {"id": f"ORDER-{side.upper()}-{price:.6f}"}
+
+    ex = FakeExchange()
+    grid = GridEngine(
+        exchange=ex,
+        symbol="TEST",
+        grid_lower=100.0,
+        grid_upper=140.0,
+        grid_count=5,
+        capital_per_grid_pct=0.1,
+        stop_loss_pct=0.03,
+        replacement_cooldown=0,
+    )
+
+    grid.levels = [
+        GridLevel(price=100.0, side="buy", order_id="BUY-100", quantity=10.0, entry_price=100.0),
+        GridLevel(price=110.0, side="buy", order_id="BUY-110", quantity=10.0, entry_price=110.0),
+        GridLevel(price=120.0, side="sell", order_id="SELL-120", quantity=10.0, entry_price=110.0),
+        GridLevel(price=130.0, side="sell", order_id="SELL-130", quantity=10.0, entry_price=110.0),
+        GridLevel(price=140.0, side="sell", order_id="SELL-140", quantity=10.0, entry_price=110.0),
+    ]
+
+    grid._handle_fill(grid.levels[2], balance=1000.0)  # sell @ 120 fills
+    grid._handle_fill(grid.levels[3], balance=1000.0)  # sell @ 130 fills
+    grid._handle_fill(grid.levels[4], balance=1000.0)  # sell @ 140 fills
+
+    order_ids = [l.order_id for l in grid.levels if l.order_id is not None]
+    assert len(order_ids) == len(set(order_ids)), "no two levels may track the same order"
+
+    pending = [l for l in grid.levels if l.order_id is None and l.status == "pending"]
+    by_slot: dict[tuple[float, str], int] = {}
+    for l in pending:
+        by_slot[(l.price, l.side)] = by_slot.get((l.price, l.side), 0) + 1
+    assert all(count == 1 for count in by_slot.values()), (
+        f"at most one pending level per (price, side), got {by_slot}"
+    )
+
+    assert len(grid.levels) == 5, "fills must not merge/drop grid levels"
+    assert "BUY-100" in order_ids and "BUY-110" in order_ids
