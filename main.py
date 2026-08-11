@@ -18,6 +18,7 @@ from state import StateManager
 from telegram_notifier import TelegramNotifier
 from trade_journal import TradeJournal
 from event_journal import EventJournal
+from pnl_tracker import PnLReconciler
 
 
 TIMEFRAME_MULTIPLIER = {
@@ -28,6 +29,51 @@ TIMEFRAME_MULTIPLIER = {
 def candles_for_lookback(timeframe: str, days: int) -> int:
     mult = TIMEFRAME_MULTIPLIER.get(timeframe, 24)
     return days * mult + 100
+
+
+def build_scale_out_orders(
+    side: str,
+    qty: float,
+    scale_out_pct: float,
+    trail_price: float,
+    hard_price: float,
+    rounder=None,
+    scale_out_done: bool = False,
+    startup_trail_price: float = None,
+) -> list[tuple[str, float, float]]:
+    """Compute the stop-market orders for scale-out stop-loss protection.
+
+    Returns a list of (kind, qty, price) tuples:
+      - ("trail", ...) covers `scale_out_pct` of the position at the trailing level
+      - ("hard", ...) covers the remainder at the static hard-stop level
+    When the trailing level equals the hard level (no trailing protection yet) or
+    the trailing leg has already fired (scale_out_done), a single full-position
+    ("hard", ...) stop is returned instead. If the trailing level has not armed
+    yet, `startup_trail_price` (an above-hard anchor, e.g. peak*(1-stop_loss_pct))
+    may be passed to arm the split immediately.
+    """
+    scale = min(max(scale_out_pct, 0.0), 0.95)
+    def _round(v: float) -> float:
+        return float(rounder(v)) if rounder else float(v)
+    qty = _round(qty)
+    if qty <= 0:
+        return []
+    same_level = abs(trail_price - hard_price) <= 1e-9
+    if same_level and startup_trail_price is not None and abs(startup_trail_price - hard_price) > 1e-9:
+        trail_price = startup_trail_price
+        same_level = False
+    if scale_out_done or same_level:
+        return [("hard", qty, hard_price)]
+    trail_qty = _round(qty * scale)
+    hard_qty = _round(qty - trail_qty)
+    orders = []
+    if trail_qty > 0:
+        orders.append(("trail", trail_qty, trail_price))
+    if hard_qty > 0:
+        orders.append(("hard", hard_qty, hard_price))
+    if not orders:
+        orders.append(("hard", qty, hard_price))
+    return orders
 
 
 def get_total_position(exchange: Exchange, symbol: str) -> float:
@@ -106,25 +152,43 @@ def get_net_position(exchange: Exchange, symbol: str) -> tuple[str, float]:
 
 
 def get_position_details(exchange: Exchange, symbol: str) -> list[dict]:
-    """Return list of position dicts with entry_price, qty, side."""
+    """Return list of position dicts with entry_price, qty, side.
+
+    Normalizes both standard one-way short encoding (side='short', qty>0) and
+    negative-contracts encoding (side='long', qty<0) so the bot can consistently
+    report and protect positions in either direction.
+    """
     try:
         positions = exchange.get_positions(symbol)
         result = []
         for pos in positions:
             amt = float(pos.get("contracts", 0) or 0)
             entry = float(pos.get("entryPrice", 0) or 0)
-            if amt > 0 and entry > 0:
-                result.append({
-                    "side": pos.get("side", "long"),
-                    "entry_price": entry,
-                    "qty": amt,
-                })
+            if amt == 0 or entry <= 0:
+                continue
+            side = pos.get("side", "")
+            if side == "long" and amt < 0:
+                side = "short"
+                amt = abs(amt)
+            elif side == "short" and amt < 0:
+                side = "long"
+                amt = abs(amt)
+            if side not in {"long", "short"}:
+                continue
+            result.append({
+                "side": side,
+                "entry_price": entry,
+                "qty": amt,
+            })
         return result
     except Exception:
         return []
 
 
-def _notify_status(notifier: TelegramNotifier, exchange: Exchange, symbol: str, price: float) -> None:
+def _notify_status(
+    notifier: TelegramNotifier, exchange: Exchange, symbol: str, price: float,
+    pnl_reconciler: PnLReconciler | None = None,
+) -> None:
     """Send position + balance to Telegram. Call only on significant events."""
     pos_details = get_position_details(exchange, symbol)
     for pos in pos_details:
@@ -139,21 +203,30 @@ def _notify_status(notifier: TelegramNotifier, exchange: Exchange, symbol: str, 
     if equity > 0:
         exposure_usdt = sum(p["qty"] * price for p in pos_details)
         exposure_pct = exposure_usdt / equity
-    notifier.on_balance_update(balance_info["free"], balance_info["used"], equity, exposure_pct)
+    total_pnl_verified = pnl_reconciler.net_realized_pnl if pnl_reconciler is not None else None
+    notifier.on_balance_update(balance_info["free"], balance_info["used"], equity, exposure_pct, total_pnl_verified)
 
 
-def daily_reset_check(risk: RiskManager, notifier: TelegramNotifier, exchange: Exchange, symbol: str, events: EventJournal = None) -> None:
+def daily_reset_check(
+    risk: RiskManager, notifier: TelegramNotifier, exchange: Exchange, symbol: str,
+    events: EventJournal = None, pnl_reconciler: PnLReconciler | None = None,
+) -> None:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Roll the reconciler's daily bucket over first (before risk.reset_daily()) so
+    # `completed_daily_pnl` below is yesterday's exchange-verified total, not the
+    # grid's own drifting estimate -- see AUDIT.md "Daily PnL is still unreconciled".
+    # Also a no-op-safe call on every non-rollover day.
+    completed_daily_pnl = pnl_reconciler.rollover_daily(today) if pnl_reconciler is not None else risk.state.daily_realized_pnl
     if risk.state.last_reset_date != today:
         if risk.state.last_reset_date:
             balance = exchange.get_balance()
             notifier.on_daily_summary(
-                risk.state.daily_realized_pnl,
+                completed_daily_pnl,
                 risk.state.trades_today,
                 balance,
             )
             if events:
-                events.daily_reset(risk.state.daily_realized_pnl, risk.state.trades_today, balance)
+                events.daily_reset(completed_daily_pnl, risk.state.trades_today, balance)
         risk.reset_daily()
 
 
@@ -217,6 +290,8 @@ def run_bot() -> None:
         range_threshold=settings.adx_range_threshold,
         check_interval=settings.trend_check_interval,
         confirmation_seconds=settings.trend_confirmation_seconds,
+        flat_range_window=settings.flat_range_window,
+        flat_range_pct=settings.flat_range_pct,
     )
 
     risk = RiskManager(
@@ -225,6 +300,7 @@ def run_bot() -> None:
         max_drawdown_pct=settings.max_drawdown_pct,
         cooldown_seconds=settings.cooldown_seconds,
         max_exposure_pct=settings.max_exposure_pct,
+        max_consecutive_losses=settings.max_consecutive_losses,
         max_recovery_count=settings.max_recovery_count,
         event_journal=events,
     )
@@ -235,6 +311,19 @@ def run_bot() -> None:
     state_mgr = StateManager(settings.state_dir, settings.symbol)
     journal = TradeJournal(settings.log_dir)
     saved_state = state_mgr.load()
+
+    # PnL reconciler: reports cumulative PnL sourced from Binance's own income
+    # ledger (realized PnL + commission + funding) rather than the grid engine's
+    # internal per-level bookkeeping, so the number shown to the user always
+    # agrees with the real account equity trajectory. Read-only — does not
+    # affect order placement or fill handling.
+    pnl_reconciler = PnLReconciler.from_dict(saved_state.get("pnl_reconciler") if saved_state else None)
+    pnl_reconciler.sync(exchange, settings.symbol)
+    logger.info(
+        "PNL RECONCILER READY | net_realized_pnl={:.4f} USDT (realized={:.4f} commission={:.4f} funding={:.4f})",
+        pnl_reconciler.net_realized_pnl, pnl_reconciler.realized_pnl,
+        pnl_reconciler.commission, pnl_reconciler.funding_fee,
+    )
 
     if saved_state and "grid" in saved_state:
         logger.info("Restoring saved grid state")
@@ -267,7 +356,7 @@ def run_bot() -> None:
             state_mgr.delete()
 
         has_exchange_positions = any(
-            p.get("side") == "long" and float(p.get("contracts", 0) or 0) > 0
+            float(p.get("contracts", 0) or 0) != 0
             for p in exchange.get_positions(settings.symbol)
         )
 
@@ -354,36 +443,92 @@ def run_bot() -> None:
         )
         grid.initialize(current_price, balance)
 
-    sl_order_id = None
-    _sl_price = 0.0
-    _sl_qty = 0.0
+    sl_orders: dict[str, dict] = {}
+    _scale_out_done = False
 
     def _reset_sl():
-        nonlocal sl_order_id, _sl_price, _sl_qty
-        sl_order_id = None
-        _sl_price = 0.0
-        _sl_qty = 0.0
+        nonlocal sl_orders, _scale_out_done
+        sl_orders = {}
+        _scale_out_done = False
+
+    def _desired_sl_orders(side: str, qty: float) -> list[tuple[str, float, float]]:
+        """Return list of (kind, qty, price) stop-market orders for the open position.
+
+        Scale-out design: the trailing stop covers sl_scale_out_pct of the position at the
+        trailing level; the remainder is covered by a hard stop at the static stop-loss level.
+        When the trailing level equals the hard level (no trailing protection yet), the
+        startup anchor (peak*(1-stop_loss_pct)) is used so the split arms immediately.
+        """
+        if side == "long":
+            trail_price = grid.get_stop_loss_price()
+            hard_price = grid.grid_lower * (1 - grid.stop_loss_pct)
+        else:
+            trail_price = grid.get_short_stop_loss_price()
+            hard_price = grid.grid_upper * (1 + grid.stop_loss_pct)
+        return build_scale_out_orders(
+            side, qty, settings.sl_scale_out_pct, trail_price, hard_price,
+            rounder=lambda q: float(exchange.exchange.amount_to_precision(settings.symbol, q)),
+            scale_out_done=_scale_out_done,
+            startup_trail_price=grid.get_scale_out_trail_price(side),
+        )
+
+    def _refresh_sl_stops(side: str, qty: float) -> None:
+        nonlocal sl_orders
+        exchange.cancel_all_stop_orders(settings.symbol)
+        sl_orders = {}
+        close_side = "sell" if side == "long" else "buy"
+        for kind, oqty, oprice in _desired_sl_orders(side, qty):
+            try:
+                order = exchange.place_stop_market(settings.symbol, close_side, oqty, oprice)
+                sl_orders[kind] = {"id": order["id"], "side": close_side, "qty": oqty, "price": oprice}
+                logger.info(
+                    "STOP-LOSS ORDER PLACED | kind={} side={} qty={} @ {}",
+                    kind, close_side, oqty, oprice,
+                )
+            except Exception as e:
+                logger.error("Failed to place {} stop-loss: {}", kind, e)
+
+    def _detect_trail_fill() -> None:
+        nonlocal _scale_out_done
+        if _scale_out_done or "trail" not in sl_orders:
+            return
+        if exchange.demo and not exchange.has_credentials:
+            return
+        open_ids = {o.get("id") for o in exchange.get_stop_orders(settings.symbol)}
+        if sl_orders["trail"]["id"] not in open_ids:
+            _scale_out_done = True
+            logger.warning(
+                "SCALE-OUT STOP FIRED | trailing leg closed at {} — remainder on hard stop only",
+                sl_orders["trail"]["price"],
+            )
+
+    def _sl_needs_update(side: str, qty: float) -> bool:
+        if not sl_orders:
+            return True
+        desired = _desired_sl_orders(side, qty)
+        if len(desired) != len(sl_orders):
+            return True
+        for kind, oqty, oprice in desired:
+            cur = sl_orders.get(kind)
+            if cur is None:
+                return True
+            if abs(cur["qty"] - oqty) > max(1e-8, oqty * 1e-6):
+                return True
+            if abs(cur["price"] - oprice) > max(oprice * 0.001, 1e-8):
+                return True
+        return False
 
     position_side, position_qty = get_net_position(exchange, settings.symbol)
     _last_side = position_side
-    if position_side == "long":
+    if position_side in ("long", "short"):
         try:
-            sl_price = grid.get_stop_loss_price()
-            order = exchange.place_stop_market(settings.symbol, "sell", position_qty, sl_price)
-            sl_order_id = order["id"]
-            _sl_price = sl_price
-            _sl_qty = position_qty
-            logger.info("STOP-LOSS ORDER PLACED on startup | side=long qty={} @ {}", position_qty, sl_price)
-        except Exception as e:
-            logger.error("Failed to place stop-loss on startup: {}", e)
-    elif position_side == "short":
-        try:
-            sl_price = grid.get_short_stop_loss_price()
-            order = exchange.place_stop_market(settings.symbol, "buy", position_qty, sl_price)
-            sl_order_id = order["id"]
-            _sl_price = sl_price
-            _sl_qty = position_qty
-            logger.info("STOP-LOSS ORDER PLACED on startup | side=short qty={} @ {}", position_qty, sl_price)
+            start_price = exchange.get_price(settings.symbol)
+            if position_side == "long":
+                grid.update_trailing_sl(start_price)
+            else:
+                grid.update_trailing_sl_short(start_price)
+            _refresh_sl_stops(position_side, position_qty)
+            grid.log_sl_status(position_side)
         except Exception as e:
             logger.error("Failed to place stop-loss on startup: {}", e)
 
@@ -436,8 +581,9 @@ def run_bot() -> None:
         regime=trend.regime.value,
         adx=trend.adx_value,
         grid_active=grid.active,
+        total_pnl_verified=pnl_reconciler.net_realized_pnl,
     )
-    _notify_status(notifier, exchange, settings.symbol, price_now)
+    _notify_status(notifier, exchange, settings.symbol, price_now, pnl_reconciler)
 
     loop_count = 0
     consecutive_errors = 0
@@ -447,7 +593,7 @@ def run_bot() -> None:
             try:
                 loop_count += 1
                 exchange.maybe_resync_time()
-                daily_reset_check(risk, notifier, exchange, settings.symbol, events)
+                daily_reset_check(risk, notifier, exchange, settings.symbol, events, pnl_reconciler)
                 price = exchange.get_price(settings.symbol)
 
                 if risk.is_in_recovery():
@@ -496,6 +642,7 @@ def run_bot() -> None:
                                 state_data = {
                                     "grid": grid.to_dict(),
                                     "risk": risk.to_dict(),
+                                    "pnl_reconciler": pnl_reconciler.to_dict(),
                                     "last_update": datetime.now().isoformat(),
                                 }
                                 state_mgr.save(state_data)
@@ -511,6 +658,7 @@ def run_bot() -> None:
                             old_fees = grid.total_fees
                             old_cycles = grid.total_completed_cycles
                             old_peak = grid._peak_price
+                            old_grid_lower, old_grid_upper = grid.grid_lower, grid.grid_upper
 
                             grid = GridEngine(
                                 exchange, settings.symbol,
@@ -543,11 +691,11 @@ def run_bot() -> None:
                             notifier.on_recovery_resume(recovery_mult)
                             notifier.on_grid_recalculated(settings.symbol, grid_lower, grid_upper, dynamic_count, "recovery")
                             events.grid_recalculated(
-                                settings.symbol, 0, 0, grid_lower, grid_upper,
+                                settings.symbol, old_grid_lower, old_grid_upper, grid_lower, grid_upper,
                                 dynamic_count, "recovery", current_atr,
                             )
                             events.recovery_event("resume", risk.state.recovery_count, sizing_pct=recovery_mult)
-                            _notify_status(notifier, exchange, settings.symbol, price)
+                            _notify_status(notifier, exchange, settings.symbol, price, pnl_reconciler)
                             logger.info("Grid recovered and activated with {}% sizing", int(recovery_mult * 100))
                         except Exception as e:
                             logger.error("Recovery failed: {} — will retry next cycle", e)
@@ -586,7 +734,7 @@ def run_bot() -> None:
                             grid.activate(exchange.get_balance())
                             notifier.on_grid_start(settings.symbol, grid.grid_lower, grid.grid_upper, grid.grid_count)
                             notifier.on_grid_resume()
-                            _notify_status(notifier, exchange, settings.symbol, price)
+                            _notify_status(notifier, exchange, settings.symbol, price, pnl_reconciler)
                     else:
                         logger.debug("Force trade mode active; grid remains enabled regardless of trend.")
 
@@ -603,7 +751,7 @@ def run_bot() -> None:
                             logger.info("Grid recentered around current price")
                             notifier.on_recenter(old_lower, old_upper, grid.grid_lower, grid.grid_upper)
                             events.grid_recentered(settings.symbol, old_lower, old_upper, grid.grid_lower, grid.grid_upper)
-                            _notify_status(notifier, exchange, settings.symbol, price)
+                            _notify_status(notifier, exchange, settings.symbol, price, pnl_reconciler)
 
                     if price < grid.grid_lower:
                         total_pos = get_total_position(exchange, settings.symbol)
@@ -627,7 +775,7 @@ def run_bot() -> None:
                                     )
                                     events.grid_recentered(settings.symbol, old_lower, old_upper, grid.grid_lower, grid.grid_upper)
                                     notifier.on_recenter(old_lower, old_upper, grid.grid_lower, grid.grid_upper)
-                                    _notify_status(notifier, exchange, settings.symbol, price)
+                                    _notify_status(notifier, exchange, settings.symbol, price, pnl_reconciler)
 
                     if price > grid.grid_upper:
                         total_pos = get_total_position(exchange, settings.symbol)
@@ -642,12 +790,20 @@ def run_bot() -> None:
                     unrealized = grid.get_unrealized_pnl(price)
                     exchange.enforce_order_limit(settings.symbol, keep_count=grid.grid_count + 2, tracked_ids=grid.get_tracked_order_ids())
                     fills = grid.check_fills(balance)
+                    if fills:
+                        # Pull Binance's actual income ledger once per batch of fills so the
+                        # PnL figures below reflect the exchange's own accounting rather than
+                        # the grid engine's internal per-level estimate.
+                        pnl_reconciler.sync(exchange, settings.symbol)
                     for fill in fills:
                         profit = fill["profit"]
                         fee = fill["fee"]
                         if fill["completed_cycle"]:
                             risk.record_trade(profit)
-                        notifier.on_fill(fill["side"], fill["price"], profit, grid.total_fills, risk.state.daily_realized_pnl)
+                        notifier.on_fill(
+                            fill["side"], fill["price"], profit, grid.total_fills, pnl_reconciler.daily_net_pnl,
+                            total_pnl_verified=pnl_reconciler.net_realized_pnl,
+                        )
                         events.fill(
                             symbol=settings.symbol,
                             side=fill["side"],
@@ -660,7 +816,7 @@ def run_bot() -> None:
                             balance=balance,
                             equity=equity,
                             exposure_pct=exposure,
-                            daily_pnl=risk.state.daily_realized_pnl,
+                            daily_pnl=pnl_reconciler.daily_net_pnl,
                             regime=trend.regime.value,
                         )
                         journal.record(
@@ -670,8 +826,8 @@ def run_bot() -> None:
                             quantity=fill["quantity"],
                             grid_spacing=grid.grid_spacing,
                             fill_number=grid.total_fills,
-                            cumulative_pnl=grid.total_pnl,
-                            daily_pnl=risk.state.daily_realized_pnl,
+                            cumulative_pnl=pnl_reconciler.net_realized_pnl,
+                            daily_pnl=pnl_reconciler.daily_net_pnl,
                             trades_today=risk.state.trades_today,
                             regime=trend.regime.value,
                             fee=fee,
@@ -684,7 +840,7 @@ def run_bot() -> None:
                             unrealized_pnl=unrealized,
                         )
                     if fills:
-                        _notify_status(notifier, exchange, settings.symbol, price)
+                        _notify_status(notifier, exchange, settings.symbol, price, pnl_reconciler)
 
                     risk.update_unrealized(unrealized)
 
@@ -718,50 +874,57 @@ def run_bot() -> None:
                     if position_side != _last_side:
                         _last_side = position_side
                         grid.reset_trailing()
+                        if _scale_out_done:
+                            _scale_out_done = False
+                            sl_orders = {}
 
                     if position_side == "long":
                         grid.update_trailing_sl(price)
-                        current_sl = grid.get_stop_loss_price()
-                        sl_needs_update = (
-                            abs(current_sl - _sl_price) > price * 0.001
-                            or abs(position_qty - _sl_qty) > max(1e-8, position_qty * 1e-6)
-                        )
-                        if sl_needs_update:
-                            exchange.cancel_all_stop_orders(settings.symbol)
+                        _detect_trail_fill()
+                        if _sl_needs_update("long", position_qty):
                             try:
-                                order = exchange.place_stop_market(settings.symbol, "sell", position_qty, current_sl)
-                                sl_order_id = order["id"]
-                                _sl_price = current_sl
-                                _sl_qty = position_qty
+                                _refresh_sl_stops("long", position_qty)
                                 grid.log_sl_status("long")
                             except Exception as e:
                                 logger.error("Failed to place/update stop-loss: {}", e)
                     elif position_side == "short":
                         grid.update_trailing_sl_short(price)
-                        current_sl = grid.get_short_stop_loss_price()
-                        sl_needs_update = (
-                            abs(current_sl - _sl_price) > price * 0.001
-                            or abs(position_qty - _sl_qty) > max(1e-8, position_qty * 1e-6)
-                        )
-                        if sl_needs_update:
-                            exchange.cancel_all_stop_orders(settings.symbol)
+                        _detect_trail_fill()
+                        if _sl_needs_update("short", position_qty):
                             try:
-                                order = exchange.place_stop_market(settings.symbol, "buy", position_qty, current_sl)
-                                sl_order_id = order["id"]
-                                _sl_price = current_sl
-                                _sl_qty = position_qty
+                                _refresh_sl_stops("short", position_qty)
                                 grid.log_sl_status("short")
                             except Exception as e:
                                 logger.error("Failed to place/update stop-loss: {}", e)
                     else:
-                        if _sl_qty > 0:
+                        if sl_orders:
                             exchange.cancel_all_stop_orders(settings.symbol)
-                            sl_order_id = None
-                            _sl_price = 0.0
-                            _sl_qty = 0.0
+                            _reset_sl()
 
                     was_in_recovery = risk.is_in_recovery()
-                    is_safe, is_fatal = risk.check_all(equity, grid.get_stop_loss_price(), price, exposure)
+                    # grid_stop_loss_price must match position_side: get_stop_loss_price()
+                    # is the long-side floor, get_short_stop_loss_price() the short-side
+                    # ceiling. Passing the long floor unconditionally meant this backstop
+                    # was silently blind whenever the grid held a short (price rising into
+                    # danger never breaches a floor computed for the opposite direction).
+                    # When flat there is no position to protect, so skip the check (0
+                    # short-circuits it in risk.py) rather than risk a false kill switch
+                    # off a stale/irrelevant long-side band.
+                    if position_side == "short":
+                        grid_sl_price = grid.get_short_stop_loss_price()
+                    elif position_side == "long":
+                        grid_sl_price = grid.get_stop_loss_price()
+                    else:
+                        grid_sl_price = 0.0
+                    # daily_realized_pnl uses the reconciler's exchange-verified figure so
+                    # the kill switch evaluates against the account's real daily P&L, not
+                    # the grid's per-level estimate (see AUDIT.md "Daily PnL is still
+                    # unreconciled" -- risk.state.daily_realized_pnl itself is left alone,
+                    # it still drives consecutive_losses via record_trade()).
+                    is_safe, is_fatal = risk.check_all(
+                        equity, grid_sl_price, price, exposure, side=position_side or "long",
+                        daily_realized_pnl=pnl_reconciler.daily_net_pnl,
+                    )
                     if not is_safe and is_fatal:
                         if not was_in_recovery:
                             grid.emergency_stop()
@@ -770,10 +933,11 @@ def run_bot() -> None:
                             events.recovery_event("start", risk.state.recovery_count)
                             logger.warning("Entering recovery mode — will wait {}s then recalculate grid", settings.cooldown_seconds)
                             notifier.on_recovery_start(settings.cooldown_seconds, risk.state.recovery_count)
-                            _notify_status(notifier, exchange, settings.symbol, price)
+                            _notify_status(notifier, exchange, settings.symbol, price, pnl_reconciler)
                         state_data = {
                             "grid": grid.to_dict(),
                             "risk": risk.to_dict(),
+                            "pnl_reconciler": pnl_reconciler.to_dict(),
                             "last_update": datetime.now().isoformat(),
                         }
                         state_mgr.save(state_data)
@@ -786,17 +950,24 @@ def run_bot() -> None:
                     equity = exchange.get_total_equity()
                     balance = exchange.get_balance()
 
+                # Periodic fallback sync so funding-fee settlements (which happen on a
+                # schedule, independent of any grid fill) still get picked up promptly.
+                if loop_count % 60 == 0:
+                    pnl_reconciler.sync(exchange, settings.symbol)
+
                 state_data = {
                     "grid": grid.to_dict(),
                     "risk": risk.to_dict(),
+                    "pnl_reconciler": pnl_reconciler.to_dict(),
                     "last_update": datetime.now().isoformat(),
                 }
                 state_mgr.save(state_data)
 
                 logger.info(
-                    "PRICE={} | fills={} | gross={:.2f} fees={:.2f} net={:.2f} | balance_free={:.2f} total_equity={:.2f} | grid={} | regime={} | spread={:.4f}%",
+                    "PRICE={} | fills={} | gross={:.2f} fees={:.2f} net={:.2f} | verified_net={:.2f} verified_daily={:.2f} | balance_free={:.2f} total_equity={:.2f} | grid={} | regime={} | spread={:.4f}%",
                     price, grid.total_fills, grid.total_pnl, grid.total_fees,
                     grid.total_pnl - grid.total_fees,
+                    pnl_reconciler.net_realized_pnl, pnl_reconciler.daily_net_pnl,
                     balance, equity,
                     "ON" if grid.active else "OFF", trend.regime.value,
                     grid._last_orderbook.get("spread_pct", 0) * 100,
@@ -833,6 +1004,7 @@ def run_bot() -> None:
                             state_data = {
                                 "grid": grid.to_dict() if grid is not None else {},
                                 "risk": risk.to_dict() if risk is not None else {},
+                                "pnl_reconciler": pnl_reconciler.to_dict(),
                                 "last_update": datetime.now().isoformat(),
                             }
                             state_mgr.save(state_data)
@@ -859,6 +1031,7 @@ def run_bot() -> None:
             state_data = {
                 "grid": grid.to_dict() if grid is not None else {},
                 "risk": risk.to_dict() if risk is not None else {},
+                "pnl_reconciler": pnl_reconciler.to_dict(),
                 "last_update": datetime.now().isoformat(),
             }
             if state_mgr is not None:

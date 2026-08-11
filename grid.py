@@ -35,6 +35,13 @@ TIMEFRAME_CANDLES_PER_DAY = {
     "1h": 24, "4h": 6, "1d": 1,
 }
 
+# Binance USDM futures minimum order notional for most pairs. When position-limit
+# scaling (_buy_scale/_sell_scale, see set_position_limit) shrinks an order below
+# this, the exchange guarantees a "-4164 notional must be no smaller than 5"
+# rejection -- skip cleanly instead of spending an API round-trip + error log +
+# Telegram alert on a placement that can never succeed.
+MIN_NOTIONAL_USDT = 5.0
+
 
 def calculate_grid_range(
     ohlcv: pd.DataFrame,
@@ -105,7 +112,7 @@ class GridEngine:
         leverage: int = 1,
         trailing_sl_trigger_pct: float = 0.05,
         max_exposure_pct: float = 0.50,
-        use_market_close_on_replace: bool = True,
+        use_market_close_on_replace: bool = False,
         event_journal: object | None = None,
         notifier: object | None = None,
     ):
@@ -145,6 +152,15 @@ class GridEngine:
         self._block_buys = False
         self._block_sells = False
         self._last_replacement_time: float = 0.0
+        # Per-level cooldown tracking (keyed by object id, not persisted): a fill on
+        # one level used to reset a single engine-wide timer that gated ALL orphan/
+        # cancelled-order replacement across the whole grid for `replacement_cooldown`
+        # seconds. During a burst of fills across several levels that meant the timer
+        # kept getting pushed back and unrelated levels sat unreplaced for the whole
+        # burst -- exactly when the grid should be trading the most. Tracking cooldown
+        # per level instead means a fill/replacement on level A no longer blocks level
+        # B from being replaced.
+        self._level_cooldowns: dict[int, float] = {}
         self.state_corrupted: bool = False
         self._buy_scale: float = 1.0
         self._sell_scale: float = 1.0
@@ -178,6 +194,14 @@ class GridEngine:
         self._block_buys, self._buy_scale = self._position_limit_state(long_position, max_position_qty)
         self._block_sells, self._sell_scale = self._position_limit_state(short_position, max_position_qty)
 
+        # The cap is enforced on new placements only; resting orders placed before the
+        # cap was hit keep filling and overshoot it. Once a side is blocked, cancel the
+        # resting orders on that side so the position cannot keep growing past the cap.
+        if self._block_buys:
+            self._cancel_resting_orders("buy", "position_limit")
+        if self._block_sells:
+            self._cancel_resting_orders("sell", "position_limit")
+
         if self._block_buys and not old_block_buys:
             logger.warning(
                 "POSITION LIMIT | long {} >= {} — buy orders blocked",
@@ -206,6 +230,37 @@ class GridEngine:
             return False, 1.0
         return False, 1.0 - (ratio - 0.5) / 0.5
 
+    def _cancel_resting_orders(self, side: str, reason: str) -> int:
+        """Cancel resting orders on one side so a position-capped grid stops growing."""
+        targets = [l for l in self.levels if l.side == side and l.order_id is not None]
+        if not targets:
+            return 0
+        try:
+            still_open = self.exchange.get_open_order_ids(self.symbol)
+        except Exception as e:
+            logger.error("POSITION LIMIT | could not fetch open orders to cancel {} orders: {}", side, e)
+            return 0
+        cancelled = 0
+        for level in targets:
+            if level.order_id in still_open:
+                try:
+                    self.exchange.cancel_order(level.order_id, self.symbol)
+                except Exception as e:
+                    logger.error(
+                        "POSITION LIMIT | failed to cancel {} @ {}: {}", level.side, level.price, e,
+                    )
+            if self._event_journal:
+                self._event_journal.order_cancelled(self.symbol, level.side, level.price, level.order_id, reason)
+            if self._notifier:
+                self._notifier.on_order_cancelled(self.symbol, level.side, level.price, level.order_id, reason)
+            level.order_id = None
+            level.status = "pending"
+            cancelled += 1
+        logger.warning(
+            "POSITION LIMIT | cancelled {} resting {} orders ({})", cancelled, side, reason,
+        )
+        return cancelled
+
     def update_orderbook(self) -> None:
         self._last_orderbook = self.exchange.get_orderbook_depth(self.symbol)
 
@@ -222,23 +277,26 @@ class GridEngine:
             for pos in positions:
                 qty = float(pos.get("contracts", 0) or 0)
                 entry = float(pos.get("entryPrice", 0) or 0)
-                if qty > 0 and entry > 0:
-                    exposure_usdt += qty * entry
+                if qty == 0 or entry <= 0:
+                    continue
+                if qty < 0:
+                    qty = abs(qty)
+                exposure_usdt += qty * entry
         except Exception:
             for level in self.levels:
                 if level.quantity <= 0:
                     continue
-                if level.side == "sell":
-                    notional = level.quantity * (level.entry_price if level.entry_price else level.price)
-                    exposure_usdt += notional
+                notional = level.quantity * (level.entry_price if level.entry_price else level.price)
+                exposure_usdt += notional
         return exposure_usdt / balance
 
-    def _cycle_pnl(self, quantity: float, entry_price: float, exit_price: float) -> float:
+    def _cycle_pnl(self, quantity: float, entry_price: float, exit_price: float, is_short: bool = False) -> float:
         if quantity <= 0 or entry_price <= 0 or exit_price <= 0:
             return 0.0
-        buy_cost = entry_price * quantity
-        sell_revenue = exit_price * quantity
-        return sell_revenue - buy_cost
+        delta = exit_price - entry_price
+        if is_short:
+            return -delta * quantity
+        return delta * quantity
 
     def _cycle_fee(self, quantity: float, buy_price: float, sell_price: float, is_taker: bool = False) -> float:
         fee_rate = self.taker_fee_pct if is_taker else self.maker_fee_pct
@@ -428,6 +486,15 @@ class GridEngine:
             if self._notifier:
                 self._notifier.on_order_failed(self.symbol, level.side, level.price, 0.0, "quantity_zero")
             return False
+        notional = float(quantity) * level.price
+        if notional < MIN_NOTIONAL_USDT:
+            scale = self._buy_scale if level.side == "buy" else self._sell_scale
+            logger.debug(
+                "SKIP ORDER @ {} | notional {:.2f} USDT < exchange minimum {:.2f} USDT "
+                "(scale={:.2f}) — would be guaranteed-rejected, not attempting",
+                level.price, notional, MIN_NOTIONAL_USDT, scale,
+            )
+            return False
         try:
             order = self.exchange.place_limit_order(self.symbol, level.side, level.price, float(quantity), max_attempts=1)
             if "id" not in order:
@@ -519,34 +586,62 @@ class GridEngine:
                     logger.info("Reconcile: placed replacement order @ {} {}", level.price, level.side)
 
     def reconcile_positions(self) -> None:
-        """Match open exchange positions to grid levels and place sell orders."""
+        """Match open exchange positions to grid levels and place the opposing hedge order.
+
+        This path now supports both long and short inventory so the grid can continue to
+        recover and defend positions in either direction without treating a short as flat.
+        """
         positions = self.exchange.get_positions(self.symbol)
         for pos in positions:
-            if pos.get("side") != "long":
-                continue
+            side = pos.get("side", "")
             amt = float(pos.get("contracts", 0) or 0)
             entry = float(pos.get("entryPrice", 0) or 0)
-            if amt <= 0 or entry <= 0:
+            if amt == 0 or entry <= 0:
                 continue
+
+            if side == "long" and amt < 0:
+                side = "short"
+                amt = abs(amt)
+            elif side == "short" and amt < 0:
+                side = "long"
+                amt = abs(amt)
+
+            if side not in {"long", "short"}:
+                continue
+
+            if side == "long":
+                target_side = "buy"
+                hedge_side = "sell"
+                base_price = entry
+            else:
+                target_side = "sell"
+                hedge_side = "buy"
+                base_price = entry
 
             best_level = None
             best_diff = float("inf")
             for level in self.levels:
-                if level.side != "buy":
+                if level.side != target_side:
                     continue
-                diff = abs(level.price - entry)
+                diff = abs(level.price - base_price)
                 if diff < best_diff:
                     best_diff = diff
                     best_level = level
 
             if best_level is None:
-                logger.warning("RECONCILE | no buy level found for position @ {}", round(entry, 8))
+                logger.warning("RECONCILE | no {} level found for {} position @ {}", target_side, side, round(entry, 8))
                 continue
 
-            sell_price = self._round_price(best_level.price + self.grid_spacing)
+            if side == "long":
+                hedge_price = self._round_price(best_level.price + self.grid_spacing)
+            else:
+                hedge_price = self._round_price(best_level.price - self.grid_spacing)
 
-            if sell_price > self.grid_upper:
-                logger.warning("RECONCILE | sell price {} outside grid — position unprotected", sell_price)
+            if hedge_price < self.grid_lower or hedge_price > self.grid_upper:
+                logger.warning(
+                    "RECONCILE | {} price {} outside grid — position unprotected",
+                    hedge_side, hedge_price,
+                )
                 continue
 
             if best_level.order_id is not None:
@@ -562,41 +657,43 @@ class GridEngine:
             best_level.status = "replaced"
             best_level.quantity = amt
             best_level.entry_price = entry
-            best_level.side = "sell"
-            best_level.price = sell_price
+            best_level.side = hedge_side
+            best_level.price = hedge_price
 
             qty = self.exchange.exchange.amount_to_precision(self.symbol, amt)
             if float(qty) <= 0:
                 continue
             try:
-                # Prefer an immediate market close for existing positions if configured — this
-                # avoids relying on post-only/limit fills to protect already-open positions.
+                # Market-closing the whole position on every reconcile realized large
+                # losses whenever the grid restarted or reconnected with an open bag
+                # (e.g. 08-01 -12.98, 08-03 -5.92, 08-05 -8.43). Default to a
+                # reduce-only limit hedge instead; opt into the market close only
+                # if explicitly configured.
                 if self.use_market_close_on_replace:
                     try:
-                        order = self.exchange.close_position(self.symbol, pos.get("side"), abs(amt))
+                        order = self.exchange.close_position(self.symbol, side, abs(amt))
                         if order and "id" in order:
                             best_level.order_id = order["id"]
                             best_level.status = "replaced"
                             logger.info(
                                 "RECONCILE | position {} @ {} -> CLOSED MARKET (id={})",
-                                pos.get("side"), round(entry, 8), best_level.order_id,
+                                side, round(entry, 8), best_level.order_id,
                             )
-                            # Move to next position
                             continue
                     except Exception as e:
                         logger.warning("RECONCILE | market close failed, falling back to limit: {}", e)
-                params = {"reduceOnly": True, "postOnly": False}
-                order = self.exchange.place_limit_order(self.symbol, "sell", sell_price, float(qty), params=params)
+                params = {"reduceOnly": True, "postOnly": False} if hedge_side == "sell" else None
+                order = self.exchange.place_limit_order(self.symbol, hedge_side, hedge_price, float(qty), params=params)
                 if "id" not in order:
                     raise ValueError("Order response missing 'id'")
                 best_level.order_id = order["id"]
                 self._open_orders_fetch_time = 0.0
                 logger.info(
-                    "RECONCILE | position {} @ {} -> sell order @ {} (qty={})",
-                    pos.get("side"), round(entry, 8), sell_price, qty,
+                    "RECONCILE | position {} @ {} -> {} order @ {} (qty={})",
+                    side, round(entry, 8), hedge_side, hedge_price, qty,
                 )
             except Exception as e:
-                logger.error("RECONCILE | failed to place sell order: {}", e)
+                logger.error("RECONCILE | failed to place {} order: {}", hedge_side, e)
                 best_level.order_id = None
                 best_level.status = "pending"
 
@@ -625,11 +722,87 @@ class GridEngine:
             except Exception as e:
                 logger.error("RECONCILE | failed to place orphaned sell order: {}", e)
 
-    def _is_on_cooldown(self) -> bool:
-        """Check if a replacement order is still within the global cooldown after a fill."""
+    def _unwind_position_through_grid(self, balance: float) -> None:
+        """Spread any open inventory across the new grid's exit-side levels as
+        reduce-only limit orders so recenter lets the position unwind through the
+        grid as price recovers instead of market-closing it (which realized large
+        losses on every downward breakout).
+        """
+        try:
+            positions = self.exchange.get_positions(self.symbol)
+        except Exception as e:
+            logger.error("UNWIND | could not fetch positions: {}", e)
+            return
+
+        for pos in positions:
+            side = pos.get("side", "")
+            amt = float(pos.get("contracts", 0) or 0)
+            entry = float(pos.get("entryPrice", 0) or 0)
+            if amt == 0 or entry <= 0:
+                continue
+            if side == "long" and amt < 0:
+                side = "short"
+                amt = abs(amt)
+            elif side == "short" and amt < 0:
+                side = "long"
+                amt = abs(amt)
+            if side not in {"long", "short"}:
+                continue
+
+            exit_side = "sell" if side == "long" else "buy"
+            levels = [l for l in self.levels if l.side == exit_side and l.order_id is None]
+            if not levels:
+                logger.warning(
+                    "UNWIND | no free {} levels to absorb {} {} position @ {} — position rides unhedged",
+                    exit_side, side, amt, round(entry, 8),
+                )
+                continue
+
+            placed = 0
+            for level in levels:
+                try:
+                    normal_qty = self._calc_usdt_per_grid(balance) / max(level.price, 1e-12)
+                    qty = self.exchange.exchange.amount_to_precision(self.symbol, normal_qty)
+                    if float(qty) <= 0:
+                        continue
+                    params = {"reduceOnly": True, "postOnly": False}
+                    order = self.exchange.place_limit_order(self.symbol, exit_side, level.price, float(qty), params=params)
+                    if "id" not in order:
+                        raise ValueError("Order response missing 'id'")
+                    level.order_id = order["id"]
+                    level.status = "replaced"
+                    level.quantity = float(qty)
+                    level.entry_price = entry
+                    level.fill_count = 1
+                    placed += 1
+                    logger.info(
+                        "UNWIND | {} {} reduce-only {} @ {} (qty={}, entry={})",
+                        side, amt, exit_side.upper(), level.price, qty, round(entry, 8),
+                    )
+                except Exception as e:
+                    logger.error("UNWIND | failed to place {} @ {}: {}", exit_side, level.price, e)
+            logger.info(
+                "UNWIND | {} {} position rides through {} {} levels (placed={})",
+                side, amt, len(levels), exit_side, placed,
+            )
+
+    def _is_on_cooldown(self, level: GridLevel) -> bool:
+        """Check if this specific level is still within its post-fill/cancel cooldown.
+
+        Cooldown is tracked per level (by object identity) so a fill on one level
+        cannot throttle replacement of other levels during a burst.
+        """
         if self.replacement_cooldown <= 0:
             return False
-        return (time.time() - self._last_replacement_time) < self.replacement_cooldown
+        last = self._level_cooldowns.get(id(level))
+        if last is None:
+            return False
+        return (time.time() - last) < self.replacement_cooldown
+
+    def _mark_cooldown(self, level: GridLevel) -> None:
+        now = time.time()
+        self._last_replacement_time = now  # kept for state-file/telemetry compatibility
+        self._level_cooldowns[id(level)] = now
 
     def check_fills(self, balance: float) -> list[dict]:
         open_orders = self.exchange.get_open_orders(self.symbol)
@@ -643,23 +816,39 @@ class GridEngine:
                 order = self.exchange.fetch_order(level.order_id, self.symbol)
                 if order is None:
                     positions = self.exchange.get_positions(self.symbol)
-                    has_position = any(
-                        p.get("side") == "long" and float(p.get("contracts", 0) or 0) > 0
-                        for p in positions
-                    )
-                    if has_position and level.side == "buy":
+                    has_long = False
+                    has_short = False
+                    for p in positions:
+                        side = p.get("side", "")
+                        contracts = float(p.get("contracts", 0) or 0)
+                        if side == "long" and contracts < 0:
+                            side, contracts = "short", abs(contracts)
+                        elif side == "short" and contracts < 0:
+                            side, contracts = "long", abs(contracts)
+                        if contracts > 0:
+                            if side == "long":
+                                has_long = True
+                            elif side == "short":
+                                has_short = True
+                    if level.side == "buy" and has_long:
                         logger.warning(
-                            "Order {} gone and buy level + position exists — processing as fill",
+                            "Order {} gone and buy level + long position exists — processing as fill",
                             level.order_id,
                         )
                         fills.append(self._handle_fill(level, balance))
-                    elif has_position and level.side == "sell":
+                    elif level.side == "sell" and has_short:
                         logger.warning(
-                            "Order {} gone but sell level — position may be from another order, marking dead",
+                            "Order {} gone and sell level + short position exists — processing as fill",
                             level.order_id,
                         )
+                        fills.append(self._handle_fill(level, balance))
+                    elif has_long or has_short:
+                        logger.warning(
+                            "Order {} gone but {} level — position may be from another order, marking dead",
+                            level.order_id, level.side,
+                        )
                         if self._event_journal:
-                            self._event_journal.order_cancelled(self.symbol, level.side, level.price, level.order_id, "order_dead_sell_orphan")
+                            self._event_journal.order_cancelled(self.symbol, level.side, level.price, level.order_id, "order_dead_orphan")
                         level.order_id = None
                         level.status = "pending"
                     else:
@@ -678,7 +867,7 @@ class GridEngine:
                         self._event_journal.order_cancelled(self.symbol, level.side, level.price, level.order_id, "fill_check_cancelled")
                     level.order_id = None
                     level.status = "pending"
-                    if not self._is_on_cooldown():
+                    if not self._is_on_cooldown(level):
                         self._place_order_for_level(level, balance)
                     else:
                         logger.debug("SKIP REPLACEMENT (cooldown) | {} @ {}", level.side, level.price)
@@ -696,7 +885,7 @@ class GridEngine:
                         level.side, level.price, self.grid_lower, self.grid_upper,
                     )
                     continue
-                if self._is_on_cooldown():
+                if self._is_on_cooldown(level):
                     logger.debug("SKIP ORPHAN (cooldown) | {} @ {}", level.side, level.price)
                     continue
                 slot = (level.price, level.side)
@@ -716,14 +905,21 @@ class GridEngine:
         return fills
 
     def _handle_fill(self, level: GridLevel, balance: float, is_taker: bool = False) -> dict:
-        completed_cycle = level.side == "sell" and level.fill_count > 0
-        self._last_replacement_time = time.time()
+        # Any fill on a level that has already filled once completes the position
+        # opened by the previous fill on the same level: a sell closes the long,
+        # a buy closes the short. fill_count == 0 means this fill merely opens a
+        # new position (long on a buy level, short on a sell level).
+        completed_cycle = level.fill_count > 0
+        self._mark_cooldown(level)
 
         if completed_cycle:
-            entry_price = level.entry_price if level.entry_price else (level.price - self.grid_spacing)
+            if level.side == "buy":
+                entry_price = level.entry_price if level.entry_price else (level.price + self.grid_spacing)
+            else:
+                entry_price = level.entry_price if level.entry_price else (level.price - self.grid_spacing)
             exit_price = level.price
             qty = level.quantity if level.quantity > 0 else (self._calc_usdt_per_grid(balance) / max(level.price, 1e-12))
-            profit = self._cycle_pnl(qty, entry_price, exit_price)
+            profit = self._cycle_pnl(qty, entry_price, exit_price, is_short=level.side == "buy")
             fee = self._cycle_fee(qty, entry_price, exit_price, is_taker=is_taker)
         else:
             profit = 0.0
@@ -797,9 +993,23 @@ class GridEngine:
 
         # If the snapped slot is still claimed by another pending level (rare, e.g. a
         # burst of fills), step outward by grid spacing until a free slot is found.
+        # Bounded by grid_count+2 iterations: if grid_spacing rounds to zero at the
+        # exchange's price precision (a very tight spacing on a low-tick-size symbol),
+        # new_price would never change and this would spin forever without a cap.
         step = self.grid_spacing if new_side == "sell" else -self.grid_spacing
+        _max_steps = self.grid_count + 2
+        _steps = 0
         while _slot_pending(new_price) and self.grid_lower <= new_price <= self.grid_upper:
             new_price = self._round_price(new_price + step)
+            _steps += 1
+            if _steps > _max_steps:
+                logger.warning(
+                    "REPLACEMENT SLOT SEARCH | gave up after {} steps @ {} (spacing {} may be below "
+                    "tick precision) — level will not place order",
+                    _max_steps, new_price, self.grid_spacing,
+                )
+                new_price = self.grid_upper + step if step > 0 else self.grid_lower + step
+                break
 
         if new_price < self.grid_lower or new_price > self.grid_upper:
             logger.warning("Replacement price {} outside grid bounds — level will not place order", new_price)
@@ -829,10 +1039,10 @@ class GridEngine:
         level.side = new_side
         level.price = new_price
         level.quantity = float(quantity)
-        if new_side == "buy":
-            level.entry_price = new_price
-        else:
-            level.entry_price = fill_price
+        # Track the price of the position this level now implies: after a buy fill
+        # the resting sell closes a long entered at fill_price, and after a sell
+        # fill the resting buy closes a short entered at fill_price.
+        level.entry_price = fill_price
 
         try:
             if new_side == "sell":
@@ -910,8 +1120,44 @@ class GridEngine:
         lower_margin = self.grid_lower * (1 - margin_pct)
         upper_margin = self.grid_upper * (1 + margin_pct)
 
-        if current_price >= lower_margin and current_price <= upper_margin:
+        in_margin_band = current_price >= lower_margin and current_price <= upper_margin
+
+        active_buys = [l for l in self.levels if l.side == "buy" and l.order_id is not None]
+        active_sells = [l for l in self.levels if l.side == "sell" and l.order_id is not None]
+
+        # A grid that has gone one-sided is dead even inside the margin band: if
+        # every sell level has been consumed and price sits above the grid, or every
+        # buy level consumed and price sits below, no order can ever fill. Recenter
+        # immediately instead of waiting for price to hit the margin edge.
+        stranded_above = current_price > self.grid_upper and not active_sells
+        stranded_below = current_price < self.grid_lower and not active_buys
+
+        # A one-sided grid is also dead INSIDE the band: with no active buys and
+        # price below every resting sell (or vice versa) no order on the book can
+        # ever fill until price crosses the whole grid. The live idle bug: price
+        # wedged at the bottom of the range with a maxed long and all sells above —
+        # zero fills for 10+ hours while recenter correctly refused. Recenter here
+        # re-anchors the sells close to price so the grid keeps trading.
+        dead_inside = (
+            (not active_buys and active_sells and current_price < min(l.price for l in active_sells))
+            or (not active_sells and active_buys and current_price > max(l.price for l in active_buys))
+        )
+
+        if in_margin_band and not stranded_above and not stranded_below and not dead_inside:
             return False
+
+        if stranded_above or stranded_below:
+            logger.warning(
+                "ONE-SIDED GRID | price {} outside [{}-{}] with no active {} orders — forcing recenter inside margin band",
+                round(current_price, 8), round(self.grid_lower, 8), round(self.grid_upper, 8),
+                "sell" if stranded_above else "buy",
+            )
+        elif dead_inside:
+            logger.warning(
+                "DEAD GRID INSIDE BAND | price {} with {} active buys and {} active sells all {} price — no fill possible, recentering",
+                round(current_price, 8), len(active_buys), len(active_sells),
+                "below" if not active_buys else "above",
+            )
 
         logger.info(
             "RECENTERING GRID | price {} outside [{}-{}] (margin {:.1%})",
@@ -940,8 +1186,8 @@ class GridEngine:
 
         self.levels = []
         self.initialize(current_price, balance, dynamic_spacing=True)
+        self._unwind_position_through_grid(balance)
         self.place_initial_orders(balance)
-        self.reconcile_positions()
         self.active = True
         self._last_recenter_time = now
         self._peak_price = current_price
@@ -984,6 +1230,26 @@ class GridEngine:
         if self._trailing_sl_price_short is not None:
             return self._trailing_sl_price_short
         return self.grid_upper * (1 + self.stop_loss_pct)
+
+    def get_scale_out_trail_price(self, side: str = "long") -> float:
+        """Trailing price for the scale-out leg.
+
+        Anchored at stop-loss distance from the running peak/trough so the scale-out
+        split arms immediately at fresh start. The trigger-distance trail
+        (peak*(1-trigger)) stays pinned to the static hard level while
+        TRAILING_SL_TRIGGER_PCT > STOP_LOSS_PCT, which collapses the split to a
+        single hard stop until price rises ~2%+ above the grid. Falls back to the
+        static hard level when no anchor has been observed yet.
+        """
+        if side == "short":
+            hard = self.grid_upper * (1 + self.stop_loss_pct)
+            if self._trough_price <= 0:
+                return hard
+            return min(hard, self._trough_price * (1 + self.stop_loss_pct))
+        hard = self.grid_lower * (1 - self.stop_loss_pct)
+        if self._peak_price <= 0:
+            return hard
+        return max(hard, self._peak_price * (1 - self.stop_loss_pct))
 
     def reset_trailing(self) -> None:
         """Reset trailing peak/trough tracking, e.g. when the position side flips."""
@@ -1085,6 +1351,41 @@ class GridEngine:
             "levels": [l.to_dict() for l in self.levels],
         }
 
+    def _dedupe_levels(self) -> None:
+        """Merge duplicate price+side slots while preserving active bookkeeping.
+
+        This stabilizes both restore-time and runtime state where a fill/replacement
+        path can leave the same grid price-side slot represented twice.
+        """
+        merged: dict[tuple[float, str], GridLevel] = {}
+        for level in self.levels:
+            key = (self._round_price(level.price), level.side)
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = level
+                continue
+
+            existing.fill_count = max(existing.fill_count, level.fill_count)
+            existing.total_pnl += level.total_pnl
+            if level.quantity > existing.quantity:
+                existing.quantity = level.quantity
+            if level.order_id is not None and existing.order_id is None:
+                existing.order_id = level.order_id
+                existing.status = level.status
+                existing.entry_price = level.entry_price
+                existing.quantity = level.quantity
+            elif existing.order_id is None and level.order_id is None and level.status == "replaced":
+                existing.status = level.status
+                existing.entry_price = level.entry_price
+                existing.quantity = level.quantity
+            elif level.status == "replaced" and existing.status != "replaced":
+                existing.status = level.status
+                existing.order_id = level.order_id or existing.order_id
+                existing.entry_price = level.entry_price or existing.entry_price
+                existing.quantity = level.quantity or existing.quantity
+
+        self.levels = sorted(merged.values(), key=lambda x: x.price)
+
     def load_from_dict(self, data: dict, current_price: float | None = None) -> None:
         self.grid_lower = data["grid_lower"]
         self.grid_upper = data["grid_upper"]
@@ -1127,6 +1428,7 @@ class GridEngine:
                     existing.entry_price = l.entry_price
                     existing.quantity = l.quantity
         self.levels = sorted(seen.values(), key=lambda x: x.price)
+        self._dedupe_levels()
         if len(raw_levels) != len(self.levels):
             logger.warning(
                 "DEDUPLICATED {} levels with duplicate price+side ({} -> {})",

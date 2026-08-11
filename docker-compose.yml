@@ -1,0 +1,9 @@
+services:
+  grid-bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./logs:/app/logs
+      - ./state:/app/state
+    stop_grace_period: 10s

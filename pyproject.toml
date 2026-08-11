@@ -1,0 +1,44 @@
+[project]
+name = "grid-bot"
+version = "0.1.0"
+description = "Grid trading bot for Binance USDM futures with a trend filter, layered risk management, and crash-safe state reconciliation."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "ccxt>=4.5.6",
+    "pandas>=2.2.0",
+    "numpy>=1.26.0",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.3.0",
+    "python-dotenv>=1.0.0",
+    "loguru>=0.7.0",
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = [
+    "main",
+    "grid",
+    "exchange",
+    "risk",
+    "trend_filter",
+    "config",
+    "logger",
+    "state",
+    "telegram_notifier",
+    "trade_journal",
+    "event_journal",
+    "cleanup",
+]

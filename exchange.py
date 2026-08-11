@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from typing import Any
 
 import ccxt
@@ -61,7 +62,7 @@ class Exchange:
         self._circuit_breaker = CircuitBreaker()
         self._last_spread: float = 0.0
         self._last_time_sync: float = 0.0
-        self._time_sync_interval: float = 60.0
+        self._time_sync_interval: float = 20.0
         self._open_order_count: int = 0
         self._last_order_count_time: float = 0.0
         self._balance_cache: dict[str, float] = {}
@@ -145,6 +146,16 @@ class Exchange:
         except Exception as e:
             logger.warning("Could not set leverage: {}", e)
 
+    @staticmethod
+    def _is_timestamp_error(e: Exception) -> bool:
+        """True if the error is a timestamp/drift rejection (Binance -1021).
+
+        In ccxt >= 4 the -1021 mapping resolves to InvalidNonce, which is a
+        NetworkError, not an ExchangeError, so plain ExchangeError handlers
+        never fire for it. Match on both to stay robust across ccxt versions.
+        """
+        return isinstance(e, ccxt.InvalidNonce) or "-1021" in str(e)
+
     def _retry(self, fn, *args, label: str = "API call", max_attempts: int | None = None, **kwargs) -> Any:
         if not self._circuit_breaker.allow_request():
             logger.warning("{} skipped — circuit breaker open", label)
@@ -156,28 +167,30 @@ class Exchange:
                 result = fn(*args, **kwargs)
                 self._circuit_breaker.record_success()
                 return result
-            except (ccxt.RequestTimeout, ccxt.NetworkError) as e:
+            except Exception as e:
                 last_err = e
-                if not isinstance(e, ccxt.RateLimitExceeded):
-                    self._circuit_breaker.record_failure()
-                delay = self.retry_delay * attempt
-                logger.warning("{} failed (attempt {}/{}): {} — retrying in {}s", label, attempt, attempts, e, delay)
-                time.sleep(delay)
-            except ccxt.ExchangeError as e:
-                if "-1021" in str(e):
+                if self._is_timestamp_error(e):
                     self._sync_time()
-                    last_err = e
                     delay = self.retry_delay * attempt
-                    logger.warning("{} timestamp drift (attempt {}/{}): synced time, retrying in {}s", label, attempt, attempts, delay)
+                    logger.warning(
+                        "{} timestamp drift (attempt {}/{}): synced time, retrying in {}s",
+                        label, attempt, attempts, delay,
+                    )
                     time.sleep(delay)
                     continue
-                logger.error("{} failed: {}", label, e)
-                self._circuit_breaker.record_failure()
-                raise
-            except Exception as e:
-                logger.error("{} failed: {}", label, e)
-                self._circuit_breaker.record_failure()
-                raise
+                if isinstance(e, (ccxt.RequestTimeout, ccxt.NetworkError)):
+                    if not isinstance(e, ccxt.RateLimitExceeded):
+                        self._circuit_breaker.record_failure()
+                    delay = self.retry_delay * attempt
+                    logger.warning(
+                        "{} failed (attempt {}/{}): {} — retrying in {}s",
+                        label, attempt, attempts, e, delay,
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error("{} failed: {}", label, e)
+                    self._circuit_breaker.record_failure()
+                    raise
         logger.error("{} failed after {} retries", label, attempts)
         raise last_err
 
@@ -233,8 +246,8 @@ class Exchange:
         try:
             balance = self.exchange.fetch_balance()
             return float(balance.get(asset, {}).get("free", 0))
-        except ccxt.ExchangeError as e:
-            if "-1021" in str(e):
+        except Exception as e:
+            if self._is_timestamp_error(e):
                 self._sync_time()
                 balance = self.exchange.fetch_balance()
                 return float(balance.get(asset, {}).get("free", 0))
@@ -261,8 +274,8 @@ class Exchange:
             if total > 0:
                 return total
             return float(balance.get(asset, {}).get("free", 0))
-        except ccxt.ExchangeError as e:
-            if "-1021" in str(e):
+        except Exception as e:
+            if self._is_timestamp_error(e):
                 self._sync_time()
                 balance = self.exchange.fetch_balance()
                 total = float(balance.get(asset, {}).get("total", 0))
@@ -299,8 +312,8 @@ class Exchange:
             self._balance_cache[f"used_{asset}"] = result["used"]
             self._balance_cache_time = time.time()
             return result
-        except ccxt.ExchangeError as e:
-            if "-1021" in str(e):
+        except Exception as e:
+            if self._is_timestamp_error(e):
                 self._sync_time()
                 balance = self.exchange.fetch_balance()
                 asset_bal = balance.get(asset, {})
@@ -322,6 +335,29 @@ class Exchange:
                     "used": self._balance_cache.get(f"used_{asset}", 0.0),
                 }
         return self.get_balance_info(asset)
+
+    def get_income_history(
+        self, symbol: str, since_ms: int | None = None, income_type: str | None = None, limit: int = 1000,
+    ) -> list[dict]:
+        """Fetch Binance's own income ledger (REALIZED_PNL, COMMISSION, FUNDING_FEE, ...).
+
+        This is the exchange's ground-truth accounting for a symbol, independent of any
+        bookkeeping the bot does locally. Returns raw entries as given by Binance, e.g.
+        {"symbol": "DOGEUSDT", "incomeType": "REALIZED_PNL", "income": "0.12345678",
+         "time": 1710000000000, "tranId": ..., "asset": "USDT", ...}.
+        """
+        if self.demo and not self.has_credentials:
+            return []
+        params: dict[str, Any] = {"limit": limit}
+        try:
+            params["symbol"] = self.exchange.market(symbol)["id"]
+        except Exception:
+            params["symbol"] = symbol.replace("/", "").split(":")[0]
+        if since_ms is not None:
+            params["startTime"] = int(since_ms)
+        if income_type is not None:
+            params["incomeType"] = income_type
+        return self._retry(self.exchange.fapiPrivateGetIncome, params, label="fetch_income")
 
     def place_limit_order(
         self, symbol: str, side: str, price: float, amount: float, max_attempts: int = 3, params: dict | None = None,
@@ -345,12 +381,18 @@ class Exchange:
             return {"id": fake_id}
 
         last_err = None
+        client_order_id = f"g{uuid.uuid4().hex[:31]}"
         for attempt in range(1, max_attempts + 1):
             try:
                 # Merge and normalize params: allow callers to pass post-only via either the post_only
                 # kwarg or inside params as 'postOnly' (or 'post_only'). The params dict is what
                 # will be forwarded to the exchange library (ccxt) which expects flags in 'params'.
                 order_params = dict(params or {})
+                # Reuse a single clientOrderId across retries so an ambiguous timeout retry is
+                # idempotent (Binance rejects the duplicate while the original order is open,
+                # instead of creating a second order at the same grid level).
+                if "newClientOrderId" not in order_params:
+                    order_params["newClientOrderId"] = client_order_id
                 # If params contains a postOnly/post_only key, let it override the post_only arg
                 if "postOnly" in order_params:
                     post_only = bool(order_params.pop("postOnly"))
@@ -379,7 +421,31 @@ class Exchange:
                     logger.debug("Post-only order rejected (would cross spread) @ {} — placing without postOnly", price)
                     order_params = dict(params or {})
                     order_params["postOnly"] = False
-                    order = self.exchange.create_limit_order(symbol, side, amount, price, order_params)
+                    # Use a fresh clientOrderId for the fallback: the postOnly attempt above
+                    # was REJECTED by the exchange (no order was ever created), but Binance's
+                    # testnet has been observed to reject a resubmission that reuses the same
+                    # clientOrderId as a phantom duplicate, and that failure was propagating
+                    # out of this function entirely (unhandled -- see except block below),
+                    # surfacing as a bare, unhelpful "exceptions must derive from BaseException"
+                    # from ccxt for unmapped error codes. Give the fallback its own id and its
+                    # own error handling so it participates in the normal retry loop instead.
+                    order_params["newClientOrderId"] = f"{client_order_id}f{attempt}"
+                    try:
+                        order = self.exchange.create_limit_order(symbol, side, amount, price, order_params)
+                    except Exception as fallback_err:
+                        last_err = fallback_err
+                        logger.warning(
+                            "Post-only fallback also failed @ {} (attempt {}/{}): {}",
+                            price, attempt, max_attempts, fallback_err,
+                        )
+                        if attempt < max_attempts:
+                            time.sleep(self.retry_delay * attempt)
+                            continue
+                        logger.error(
+                            "Order placement failed after {} attempts (post-only fallback): {}",
+                            max_attempts, fallback_err,
+                        )
+                        raise
                     order_id = order.get("id", "unknown")
                     logger.info(
                         "ORDER PLACED | {} {} {} @ {} (id={}) | attempt={} | postOnly=False",
@@ -414,14 +480,8 @@ class Exchange:
         except ccxt.OrderNotFound:
             logger.debug("Cancel order {} — already gone", order_id)
             return True
-        except ccxt.NetworkError as e:
-            logger.warning(
-                "Cancel order {} status UNKNOWN (network): {} — order may still be open, will re-verify",
-                order_id, e,
-            )
-            return False
-        except ccxt.ExchangeError as e:
-            if "-1021" in str(e):
+        except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+            if self._is_timestamp_error(e):
                 self._sync_time()
                 try:
                     self.exchange.cancel_order(order_id, symbol)
@@ -432,6 +492,12 @@ class Exchange:
                     return False
                 except Exception:
                     pass
+            elif isinstance(e, ccxt.NetworkError):
+                logger.warning(
+                    "Cancel order {} status UNKNOWN (network): {} — order may still be open, will re-verify",
+                    order_id, e,
+                )
+                return False
         # Regular cancel failed — try algo/conditional order cancel
         try:
             self.exchange.fapiPrivateDeleteAlgoOrder({

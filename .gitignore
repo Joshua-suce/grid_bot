@@ -1,0 +1,32 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# State (contains order IDs and session data)
+state/*.json
+state/*.json.old
+state/*.corrupt*
+
+# Logs (contains trade history and events)
+logs/*.csv
+logs/*.csv.*
+logs/*.jsonl
+logs/*.jsonl.*
+logs/*.log
+logs/*.log.*
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Docker
+.docker/

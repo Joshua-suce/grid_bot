@@ -1,0 +1,237 @@
+import os
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Optional tuning-profile overlay. .env always loads first (API keys, Telegram
+# secrets, whatever you already have). If GRID_BOT_ENV_FILE points at one of the
+# presets in configs/ (e.g. GRID_BOT_ENV_FILE=configs/high_frequency.env), its
+# values are layered on top and win on any key it defines -- so a profile only
+# needs to list the parameters it tunes, not your secrets. Unset, behavior is
+# identical to before (just .env).
+_PROFILE_FILE = os.environ.get("GRID_BOT_ENV_FILE")
+_ENV_FILES = (".env", _PROFILE_FILE) if _PROFILE_FILE else ".env"
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=_ENV_FILES,
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # --- Mode ---
+    demo_mode: bool = Field(default=True, description="Use Binance testnet")
+
+    # --- Exchange ---
+    api_key: str = Field(default="", description="Binance API key")
+    api_secret: str = Field(default="", description="Binance API secret")
+
+    # --- Grid ---
+    symbol: str = Field(default="BTCUSDT", description="Trading pair")
+    leverage: int = Field(default=2, ge=1, le=20)
+    grid_count: int = Field(default=15, ge=3, le=100, description="Number of grid levels")
+    capital_per_grid_pct: float = Field(
+        default=0.05, gt=0, le=0.25,
+        description="Fraction of balance allocated per grid level",
+    )
+    capital_per_grid_usdt: float = Field(
+        default=0.0, ge=0, le=10000,
+        description=(
+            "Fixed USDT margin per grid level. If > 0, the bot uses the larger of this "
+            "fixed allocation and the percentage-based allocation to avoid overly small "
+            "grid sizing."
+        ),
+    )
+    replacement_cooldown: int = Field(
+        default=20, ge=0, le=600,
+        description="Minimum seconds between replacement orders per grid level after a fill",
+    )
+    order_pacing_seconds: float = Field(
+        default=0.6, ge=0.0, le=30.0,
+        description="Delay between consecutive order placements (bursty placement trips exchange system-level protection)",
+    )
+    grid_timeframe: str = Field(
+        default="1h", description="Timeframe for grid range calculation (1m, 5m, 15m, 30m, 1h, 4h)",
+    )
+    trend_timeframe: str = Field(
+        default="1h", description="Medium timeframe for trend filter (15m, 30m, 1h, 4h, 1d)",
+    )
+    trend_timeframe_fast: str = Field(
+        default="30m", description="Fast timeframe for trend filter (1m, 5m, 15m, 30m)",
+    )
+
+    # --- Auto Range ---
+    range_lookback_days: int = Field(
+        default=14, ge=1, le=90,
+        description="Days of price history to calculate grid range",
+    )
+    range_atr_multiplier: float = Field(
+        default=1.5, ge=0.3, le=50.0,
+        description="Grid bounds = current_price +/- ATR * multiplier",
+    )
+    range_min_spacing_pct: float = Field(
+        default=0.01, ge=0.0005, le=0.05,
+        description="Minimum grid spacing as fraction of price (1.0% = 0.01)",
+    )
+
+    # --- Grid Recentering ---
+    recenter_enabled: bool = Field(
+        default=True, description="Recenter grid when price moves outside bounds",
+    )
+    recenter_margin_pct: float = Field(
+        default=0.008, ge=0.002, le=0.05,
+        description="Price must exceed grid bound by this fraction to trigger recenter",
+    )
+    recenter_cooldown: int = Field(
+        default=180, ge=30, le=3600,
+        description="Minimum seconds between recentering events",
+    )
+
+    # --- Fees ---
+    maker_fee_pct: float = Field(
+        default=0.02, ge=0.0, le=0.1,
+        description="Maker fee as percent (0.02% = 0.0002)",
+    )
+    taker_fee_pct: float = Field(
+        default=0.04, ge=0.0, le=0.1,
+        description="Taker fee as percent (0.04% = 0.0004)",
+    )
+
+    # --- Risk ---
+    stop_loss_pct: float = Field(
+        default=0.05, gt=0, le=0.15,
+        description="Kill switch: exit if loss exceeds this below lowest grid",
+    )
+    trailing_sl_trigger_pct: float = Field(
+        default=0.05, gt=0, le=0.20,
+        description="Trailing stop-loss trigger: activate SL when price drops this % from peak",
+    )
+    daily_loss_limit_pct: float = Field(
+        default=0.02, gt=0, le=0.20,
+        description="Stop trading if daily loss exceeds this fraction of balance",
+    )
+    max_drawdown_pct: float = Field(
+        default=0.08, gt=0, le=0.30,
+        description="Emergency stop if account drops below this fraction of starting balance",
+    )
+    cooldown_seconds: int = Field(
+        default=7200, ge=60, le=86400,
+        description="Wait time after kill switch before allowing restart",
+    )
+    max_exposure_pct: float = Field(
+        default=0.60, gt=0, le=1.0,
+        description="Max portfolio exposure as fraction of equity",
+    )
+    max_position_pct: float = Field(
+        default=0.12, gt=0, le=2.0,
+        description="Max position size as fraction of equity (stops unlimited accumulation)",
+    )
+    sl_scale_out_pct: float = Field(
+        default=0.50, gt=0, le=0.95,
+        description=(
+            "Fraction of the open position closed at the trailing stop-loss; the remainder "
+            "is kept until the hard stop-loss level. Reduces the impact of market-stop dumps."
+        ),
+    )
+    max_recovery_count: int = Field(
+        default=5, ge=1, le=20,
+        description="Maximum recovery attempts before bot shuts down entirely",
+    )
+    max_consecutive_losses: int = Field(
+        default=10, ge=1, le=100,
+        description=(
+            "Kill switch: stop trading after this many consecutive losing completed "
+            "cycles. Every other risk knob is configurable here except this one used "
+            "to be -- RiskManager silently used its hardcoded default (10) regardless "
+            "of .env."
+        ),
+    )
+
+    # --- Trend Filter ---
+    ema_fast: int = Field(default=20, ge=5, le=50)
+    ema_slow: int = Field(default=50, ge=20, le=200)
+    adx_period: int = Field(default=14, ge=5, le=50)
+    adx_trend_threshold: float = Field(default=30.0, ge=15, le=40)
+    adx_range_threshold: float = Field(default=20.0, ge=5, le=30)
+    trend_check_interval: int = Field(
+        default=300, ge=60, le=3600,
+        description="Seconds between trend filter checks",
+    )
+    trend_confirmation_seconds: int = Field(
+        default=300, ge=0, le=3600,
+        description="Seconds a new regime must persist before acting on it (0 = instant)",
+    )
+    flat_range_window: int = Field(
+        default=6, ge=2, le=48,
+        description="Candles used to measure the recent price range for the flat-market override",
+    )
+    flat_range_pct: float = Field(
+        default=0.01, gt=0.0, le=0.05,
+        description="Max recent (high-low)/close range below which a trending regime is overridden to RANGING",
+    )
+
+    # --- Telegram ---
+    telegram_enabled: bool = Field(default=False)
+    telegram_bot_token: str = Field(default="")
+    telegram_chat_id: str = Field(default="")
+
+    # --- Polling ---
+    poll_interval: int = Field(default=30, ge=5, le=300, description="Seconds between fill checks")
+    force_trade_now: bool = Field(default=False, description="If true, bypass trend gating and activate grid immediately.")
+    close_on_exit: bool = Field(default=False, description="If true, close all open positions when the bot shuts down.")
+
+    # --- Paths ---
+    state_dir: str = Field(default="state")
+    log_dir: str = Field(default="logs")
+
+    @property
+    def exchange_config(self) -> dict:
+        return {
+            "apiKey": self.api_key,
+            "secret": self.api_secret,
+            "enableRateLimit": True,
+            "timeout": 60000,
+            "options": {
+                "defaultType": "swap",
+                "adjustForTimeDifference": True,
+            },
+        }
+
+    def validate(self) -> None:
+        if not self.demo_mode and (not self.api_key or not self.api_secret):
+            raise ValueError("LIVE mode requires API_KEY and API_SECRET to be set in .env.")
+
+        valid_timeframes = {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
+        if self.grid_timeframe not in valid_timeframes:
+            raise ValueError(f"GRID_TIMEFRAME must be one of {valid_timeframes}, got '{self.grid_timeframe}'")
+        if self.trend_timeframe not in valid_timeframes:
+            raise ValueError(f"TREND_TIMEFRAME must be one of {valid_timeframes}, got '{self.trend_timeframe}'")
+        if self.trend_timeframe_fast not in valid_timeframes:
+            raise ValueError(f"TREND_TIMEFRAME_FAST must be one of {valid_timeframes}, got '{self.trend_timeframe_fast}'")
+
+        total_allocation = self.grid_count * self.capital_per_grid_pct
+        if total_allocation > 0.5:
+            raise ValueError(
+                f"Total grid allocation is too high: {total_allocation:.2f}. "
+                "Use fewer grid levels or reduce CAPITAL_PER_GRID_PCT to keep the total <= 0.50."
+            )
+
+        if self.range_min_spacing_pct < 0.0005:
+            raise ValueError(
+                "RANGE_MIN_SPACING_PCT is too low; use at least 0.0005 to avoid excessively tight grids."
+            )
+
+        if self.ema_fast >= self.ema_slow:
+            raise ValueError(
+                f"EMA_FAST ({self.ema_fast}) must be less than EMA_SLOW ({self.ema_slow})."
+            )
+
+        if self.adx_range_threshold >= self.adx_trend_threshold:
+            raise ValueError(
+                f"ADX_RANGE_THRESHOLD ({self.adx_range_threshold}) must be less than "
+                f"ADX_TREND_THRESHOLD ({self.adx_trend_threshold})."
+            )
+
+
+settings = Settings()
