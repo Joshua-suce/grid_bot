@@ -199,8 +199,15 @@ class Settings(BaseSettings):
         }
 
     def validate(self) -> None:
-        if not self.demo_mode and (not self.api_key or not self.api_secret):
-            raise ValueError("LIVE mode requires API_KEY and API_SECRET to be set in .env.")
+        # Required in both DEMO and LIVE mode: the bot only ever trades against a real
+        # Binance account (Demo Trading or live) now -- there is no mock/simulated
+        # trading fallback to fall back to silently. Get demo keys from demo.binance.com.
+        if not self.api_key or not self.api_secret:
+            mode = "DEMO" if self.demo_mode else "LIVE"
+            raise ValueError(
+                f"{mode} mode requires API_KEY and API_SECRET to be set in .env "
+                "(demo keys: https://demo.binance.com)."
+            )
 
         valid_timeframes = {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
         if self.grid_timeframe not in valid_timeframes:

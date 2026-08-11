@@ -9,9 +9,6 @@ import pandas as pd
 from loguru import logger
 
 
-DEMO_MOCK_BALANCE = 10000.0
-
-
 class CircuitBreaker:
     def __init__(self, failure_threshold: int = 5, recovery_time: int = 120):
         self.failure_threshold = failure_threshold
@@ -53,10 +50,16 @@ class Exchange:
         self.demo = demo
         self.config = config
         self.has_credentials = bool(config.get("apiKey") and config.get("secret"))
-        self._mock_orders: dict[str, dict] = {}
-        self._mock_filled: dict[str, dict] = {}
-        self._mock_positions: dict[str, float] = {}
-        self._mock_balance: float = DEMO_MOCK_BALANCE
+        if not self.has_credentials:
+            # No mock/simulated trading fallback: both DEMO and LIVE mode trade against a
+            # real Binance account. Config.validate() already enforces this before an
+            # Exchange is ever constructed in main.py; this is a defense-in-depth check
+            # for any other caller, so a missing-credentials bug fails loudly instead of
+            # quietly falling back to fabricated balances/orders (see AUDIT.md).
+            raise ValueError(
+                "Binance API credentials are required (both DEMO and LIVE mode use a real "
+                "account -- there is no mock trading fallback). Set apiKey/secret."
+            )
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self._circuit_breaker = CircuitBreaker()
@@ -78,16 +81,7 @@ class Exchange:
             try:
                 self.exchange.load_markets()
                 self._sync_time()
-                if demo and self.has_credentials:
-                    logger.info("Connected to Binance Futures DEMO mode")
-                elif demo:
-                    logger.warning(
-                        "Demo mode WITHOUT API keys — using mock balance of {} USDT. "
-                        "Get demo keys from demo.binance.com",
-                        DEMO_MOCK_BALANCE,
-                    )
-                else:
-                    logger.info("Connected to Binance Futures LIVE mode")
+                logger.info("Connected to Binance Futures {} mode", "DEMO" if demo else "LIVE")
                 return
             except Exception as e:
                 last_error = e
@@ -137,9 +131,6 @@ class Exchange:
         self._balance_cache_time = 0.0
 
     def set_leverage(self, symbol: str, leverage: int) -> None:
-        if self.demo and not self.has_credentials:
-            logger.info("Leverage set to {}x for {} (mock)", leverage, symbol)
-            return
         try:
             self.exchange.set_leverage(leverage, symbol)
             logger.info("Leverage set to {}x for {}", leverage, symbol)
@@ -241,8 +232,6 @@ class Exchange:
 
     def get_balance(self, asset: str = "USDT") -> float:
         """Return the available free asset balance."""
-        if self.demo and not self.has_credentials:
-            return self._mock_balance
         try:
             balance = self.exchange.fetch_balance()
             return float(balance.get(asset, {}).get("free", 0))
@@ -266,8 +255,6 @@ class Exchange:
 
     def get_total_equity(self, asset: str = "USDT") -> float:
         """Return the total asset equity, including used margin or reserved funds."""
-        if self.demo and not self.has_credentials:
-            return self._mock_balance
         try:
             balance = self.exchange.fetch_balance()
             total = float(balance.get(asset, {}).get("total", 0))
@@ -297,8 +284,6 @@ class Exchange:
 
     def get_balance_info(self, asset: str = "USDT") -> dict[str, float]:
         """Return both free and total balance values for clearer reconciliation."""
-        if self.demo and not self.has_credentials:
-            return {"free": self._mock_balance, "total": self._mock_balance, "used": 0.0}
         try:
             balance = self.exchange.fetch_balance()
             asset_bal = balance.get(asset, {})
@@ -346,8 +331,6 @@ class Exchange:
         {"symbol": "DOGEUSDT", "incomeType": "REALIZED_PNL", "income": "0.12345678",
          "time": 1710000000000, "tranId": ..., "asset": "USDT", ...}.
         """
-        if self.demo and not self.has_credentials:
-            return []
         params: dict[str, Any] = {"limit": limit}
         try:
             params["symbol"] = self.exchange.market(symbol)["id"]
@@ -371,15 +354,6 @@ class Exchange:
 
         Returns the exchange order dict.
         """
-        if self.demo and not self.has_credentials:
-            fake_id = f"MOCK-{side[:1].upper()}-{int(time.time()*1000)}"
-            self._mock_orders[fake_id] = {"side": side, "price": price}
-            logger.info(
-                "MOCK ORDER | {} {} {} @ {} (id={})",
-                side.upper(), amount, symbol, price, fake_id,
-            )
-            return {"id": fake_id}
-
         last_err = None
         client_order_id = f"g{uuid.uuid4().hex[:31]}"
         for attempt in range(1, max_attempts + 1):
@@ -469,10 +443,6 @@ class Exchange:
         raise last_err
 
     def cancel_order(self, order_id: str, symbol: str) -> bool:
-        if self.demo and not self.has_credentials:
-            self._mock_orders.pop(order_id, None)
-            logger.info("MOCK CANCEL | id={}", order_id)
-            return True
         try:
             self.exchange.cancel_order(order_id, symbol)
             logger.info("ORDER CANCELLED | id={}", order_id)
@@ -512,39 +482,12 @@ class Exchange:
         return False
 
     def get_open_orders(self, symbol: str) -> list[dict]:
-        if self.demo and not self.has_credentials:
-            current = self._retry(self.exchange.fetch_ticker, symbol, label="fetch_ticker(mock)")
-            current = current["last"]
-            open_list = []
-            filled = []
-            for oid, order in self._mock_orders.items():
-                if order["side"] == "buy" and current <= order["price"]:
-                    filled.append(oid)
-                    continue
-                if order["side"] == "sell" and current >= order["price"]:
-                    filled.append(oid)
-                    continue
-                open_list.append({"id": oid})
-            for oid in filled:
-                self._mock_filled[oid] = self._mock_orders.pop(oid)
-            return open_list
         return self._retry(self.exchange.fetch_open_orders, symbol, label="fetch_open_orders")
 
     def get_positions(self, symbol: str) -> list[dict]:
-        if self.demo and not self.has_credentials:
-            return []
         return self._retry(self.exchange.fetch_positions, [symbol], label="fetch_positions")
 
     def fetch_order(self, order_id: str, symbol: str, max_attempts: int = 3, delay: float = 1.0) -> dict | None:
-        if self.demo and not self.has_credentials:
-            order = self._mock_orders.get(order_id)
-            if order is not None:
-                return {"id": order_id, "status": "open", "side": order["side"], "price": order["price"]}
-            filled = self._mock_filled.get(order_id)
-            if filled is not None:
-                return {"id": order_id, "status": "closed", "side": filled["side"], "price": filled["price"]}
-            return None
-
         for attempt in range(1, max_attempts + 1):
             try:
                 return self._retry(self.exchange.fetch_order, order_id, symbol, label="fetch_order")
@@ -564,10 +507,6 @@ class Exchange:
 
     def close_position(self, symbol: str, side: str, amount: float, max_attempts: int | None = None) -> dict:
         close_side = "sell" if side == "long" else "buy"
-        if self.demo and not self.has_credentials:
-            key = f"MOCK-CLOSE-{side[:1].upper()}-{int(time.time()*1000)}"
-            logger.info("MOCK CLOSE POSITION | {} {} {} (id={})", close_side.upper(), amount, symbol, key)
-            return {"id": key}
         order = self._retry(
             self.exchange.create_market_order, symbol, close_side, amount,
             label="close_position", max_attempts=max_attempts,
@@ -577,14 +516,6 @@ class Exchange:
 
     def place_stop_market(self, symbol: str, side: str, amount: float, stop_price: float) -> dict:
         """Place a stop-market order (e.g. stop-loss to close a long position)."""
-        if self.demo and not self.has_credentials:
-            fake_id = f"MOCK-SL-{int(time.time()*1000)}"
-            self._mock_orders[fake_id] = {"side": side, "price": stop_price, "type": "stop_market"}
-            logger.info(
-                "MOCK STOP-MARKET | {} {} {} @ stop={} (id={})",
-                side.upper(), amount, symbol, stop_price, fake_id,
-            )
-            return {"id": fake_id}
         params = {"stopPrice": stop_price, "reduceOnly": True}
         order = self._retry(
             self.exchange.create_order, symbol, "stop_market", side, amount, None, params,
@@ -598,8 +529,6 @@ class Exchange:
 
     def close_all_positions(self, symbol: str) -> int:
         """Close any existing open positions. Returns number of positions closed."""
-        if self.demo and not self.has_credentials:
-            return 0
         positions = self.get_positions(symbol)
         closed = 0
         for pos in positions:
@@ -682,8 +611,6 @@ class Exchange:
 
     def get_stop_orders(self, symbol: str) -> list[dict]:
         """Fetch all open stop/conditional orders (stop-market, take-profit, etc)."""
-        if self.demo and not self.has_credentials:
-            return []
         try:
             return self._retry(
                 self.exchange.fetch_open_orders, symbol,
@@ -696,8 +623,6 @@ class Exchange:
 
     def cancel_all_stop_orders(self, symbol: str) -> int:
         """Cancel every stop/conditional (algo) order for the symbol."""
-        if self.demo and not self.has_credentials:
-            return 0
         stop_orders = self.get_stop_orders(symbol)
         if not stop_orders:
             return 0

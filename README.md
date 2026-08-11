@@ -13,7 +13,7 @@ Currently configured for `DOGEUSDT` in demo/testnet mode (see `.env`).
 ```
 main.py               entry point / trading loop
 grid.py                grid engine: level placement, fills, recentering, trailing SL
-exchange.py            Binance USDM wrapper (retries, circuit breaker, mock demo mode)
+exchange.py            Binance USDM wrapper (retries, circuit breaker, demo/live via API creds)
 risk.py                kill switch / drawdown / daily loss / recovery sizing
 trend_filter.py        ADX/EMA multi-timeframe regime detection
 config.py               settings (pydantic-settings, reads .env)

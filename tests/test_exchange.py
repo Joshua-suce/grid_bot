@@ -48,6 +48,19 @@ class FakeBackend:
         return str(amount)
 
 
+def test_exchange_requires_credentials_in_demo_mode():
+    """No mock/simulated trading fallback: DEMO mode without real API keys must
+    fail loudly at construction time rather than silently trading against a
+    fabricated $10k mock balance (see AUDIT.md)."""
+    with pytest.raises(ValueError, match="credentials"):
+        Exchange({"apiKey": "", "secret": ""}, demo=True)
+
+
+def test_exchange_requires_credentials_in_live_mode():
+    with pytest.raises(ValueError, match="credentials"):
+        Exchange({"apiKey": "", "secret": ""}, demo=False)
+
+
 def test_cancel_order_network_error_returns_false():
     fake = FakeBackend([{"id": "1"}], cancel_failures=9999)
     ex = make_exchange(fake)

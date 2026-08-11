@@ -319,6 +319,39 @@ passthrough (present and `None`-when-omitted), `_position_unrealized_pnl`
 preferring the exchange figure over a contradicting manual calculation, the
 long-side fallback, and a regression test pinning the short-side sign fix.
 
+### 10. Removed the mock/simulated trading fallback entirely -- MEDIUM (safety-relevant)
+**Evidence:** user request -- the bot should only ever trade against a real
+Binance account (Demo Trading or live), never fabricate balances, positions,
+or fills.
+
+`exchange.py` had a `demo=True and not has_credentials` fallback path used
+throughout: a hardcoded `DEMO_MOCK_BALANCE = 10000.0` returned from every
+balance/equity getter, orders faked with `MOCK-*` client IDs tracked in
+in-memory dicts, fills simulated by comparing the mock order's price against
+the real ticker, and `get_positions()`/`get_income_history()` unconditionally
+returning empty. This was intended as a zero-setup way to try the bot without
+API keys, but it meant a bot silently missing credentials (a blank `.env`, a
+typo'd key name, etc.) would start up, log as if trading, and never trade
+anything real or error out -- exactly the kind of "made up" behavior flagged
+in issues #7-#9.
+
+**Fix:** the fallback is gone. `Settings.validate()` (`config.py`) now
+requires `API_KEY`/`API_SECRET` in **both** DEMO and LIVE mode (previously
+only LIVE); `Exchange.__init__` (`exchange.py`) raises `ValueError`
+immediately if constructed without credentials, as a defense-in-depth check
+independent of `validate()`. Every `if self.demo and not self.has_credentials`
+branch, the `_mock_orders`/`_mock_filled`/`_mock_positions`/`_mock_balance`
+state, and the `DEMO_MOCK_BALANCE` constant were deleted -- `demo=True` now
+only toggles `ccxt`'s `enable_demo_trading(True)` (Binance's real Demo
+Trading endpoint), no local simulation layer.
+
+**Tests:** `tests/test_config.py` (new) covers `validate()` rejecting missing
+credentials in both modes and passing once they're set.
+`tests/test_exchange.py` gained a construction-time rejection test for both
+modes. 165/165 tests passing overall (existing exchange tests already
+constructed `Exchange` via `Exchange.__new__` with `has_credentials` set
+directly, bypassing `__init__`, so they were unaffected by this change).
+
 ## Recommendation
 
 The fixes above are all defensive/correctness fixes with no strategy changes
