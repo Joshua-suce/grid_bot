@@ -7,6 +7,7 @@ from main import (
     get_position_details,
     get_short_position,
     get_total_position,
+    _position_unrealized_pnl,
 )
 
 
@@ -92,6 +93,44 @@ def test_get_position_details_includes_short_positions():
     assert len(details) == 2
     assert any(p["side"] == "short" and p["qty"] == 5.0 for p in details)
     assert any(p["side"] == "long" and p["qty"] == 3.0 for p in details)
+
+
+def test_get_position_details_passes_through_exchange_unrealized_pnl():
+    """The exchange's own mark-price-based unrealizedPnl should pass through
+    verbatim rather than being silently dropped/recomputed -- see AUDIT.md
+    follow-up on not re-deriving numbers the exchange already provides."""
+    exchange = FakeExchange([
+        {"side": "long", "contracts": 3, "entryPrice": 0.069, "unrealizedPnl": 1.23},
+    ])
+    details = get_position_details(exchange, "DOGEUSDT")
+    assert details[0]["unrealized_pnl"] == 1.23
+
+
+def test_get_position_details_unrealized_pnl_none_when_exchange_omits_it():
+    exchange = FakeExchange([{"side": "long", "contracts": 3, "entryPrice": 0.069}])
+    details = get_position_details(exchange, "DOGEUSDT")
+    assert details[0]["unrealized_pnl"] is None
+
+
+def test_position_unrealized_pnl_prefers_exchange_field():
+    pos = {"side": "short", "entry_price": 0.07, "qty": 5.0, "unrealized_pnl": -9.99}
+    # Even though the manual short-side formula would give a different (positive)
+    # number here, the exchange's own figure must win.
+    assert _position_unrealized_pnl(pos, current_price=0.06) == -9.99
+
+
+def test_position_unrealized_pnl_falls_back_for_long_when_exchange_omits_it():
+    pos = {"side": "long", "entry_price": 0.069, "qty": 3.0, "unrealized_pnl": None}
+    assert _position_unrealized_pnl(pos, current_price=0.079) == pytest.approx(0.03)
+
+
+def test_position_unrealized_pnl_fallback_respects_short_sign():
+    """Regression: a prior inline fallback in main.py applied the long-side
+    formula unconditionally, which silently inverted the sign for shorts
+    (profitable-when-price-drops shorts would show as a loss, and vice versa)."""
+    pos = {"side": "short", "entry_price": 0.07, "qty": 5.0, "unrealized_pnl": None}
+    # Price dropped below entry -- a short should show a profit.
+    assert _position_unrealized_pnl(pos, current_price=0.06) == pytest.approx(0.05)
 
 
 def test_build_scale_out_orders_splits_qty_at_half():

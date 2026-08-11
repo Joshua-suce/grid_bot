@@ -152,11 +152,15 @@ def get_net_position(exchange: Exchange, symbol: str) -> tuple[str, float]:
 
 
 def get_position_details(exchange: Exchange, symbol: str) -> list[dict]:
-    """Return list of position dicts with entry_price, qty, side.
+    """Return list of position dicts with entry_price, qty, side, unrealized_pnl.
 
     Normalizes both standard one-way short encoding (side='short', qty>0) and
     negative-contracts encoding (side='long', qty<0) so the bot can consistently
     report and protect positions in either direction.
+
+    unrealized_pnl passes through ccxt's unified 'unrealizedPnl' field -- Binance's
+    own mark-price-based figure -- when the exchange provides it, else None (some
+    mock/test exchanges omit it; see _position_unrealized_pnl for the fallback).
     """
     try:
         positions = exchange.get_positions(symbol)
@@ -175,14 +179,37 @@ def get_position_details(exchange: Exchange, symbol: str) -> list[dict]:
                 amt = abs(amt)
             if side not in {"long", "short"}:
                 continue
+            raw_upnl = pos.get("unrealizedPnl")
+            try:
+                upnl = float(raw_upnl) if raw_upnl is not None else None
+            except (TypeError, ValueError):
+                upnl = None
             result.append({
                 "side": side,
                 "entry_price": entry,
                 "qty": amt,
+                "unrealized_pnl": upnl,
             })
         return result
     except Exception:
         return []
+
+
+def _position_unrealized_pnl(pos: dict, current_price: float) -> float:
+    """Prefer the exchange's own mark-price-based unrealized_pnl (see
+    get_position_details); only fall back to a last-price estimate when the
+    exchange didn't provide one. Keeping the exchange's figure as the default
+    avoids re-deriving numbers it already gives us (AUDIT.md follow-up to
+    issues #7/#8) and sidesteps a latent sign bug the previous inline fallback
+    had: it applied the long-side formula unconditionally regardless of side,
+    which silently inverted the sign for any short position.
+    """
+    upnl = pos.get("unrealized_pnl")
+    if upnl is not None:
+        return upnl
+    if pos["side"] == "short":
+        return (pos["entry_price"] - current_price) * pos["qty"]
+    return (current_price - pos["entry_price"]) * pos["qty"]
 
 
 def _notify_status(
@@ -192,10 +219,7 @@ def _notify_status(
     """Send position + balance to Telegram. Call only on significant events."""
     pos_details = get_position_details(exchange, symbol)
     for pos in pos_details:
-        if pos["side"] == "short":
-            unrealized = (pos["entry_price"] - price) * pos["qty"]
-        else:
-            unrealized = (price - pos["entry_price"]) * pos["qty"]
+        unrealized = _position_unrealized_pnl(pos, price)
         notifier.on_position_update(symbol, pos["side"], pos["entry_price"], pos["qty"], price, unrealized)
     balance_info = exchange.get_balance_info()
     equity = exchange.get_total_equity()
@@ -787,7 +811,13 @@ def run_bot() -> None:
                     balance = exchange.get_balance_cached()
                     equity = exchange.get_total_equity_cached()
                     exposure = grid.get_exposure_pct(equity)
-                    unrealized = grid.get_unrealized_pnl(price)
+                    # Sourced from the exchange's own positions (unrealized_pnl is
+                    # Binance's real mark-price-based figure when available -- see
+                    # get_position_details/_position_unrealized_pnl) rather than the
+                    # grid's internal per-level guess, which can drift the same way
+                    # the realized-PnL bookkeeping did (AUDIT.md issues #7/#8).
+                    pos_details = get_position_details(exchange, settings.symbol)
+                    unrealized = sum(_position_unrealized_pnl(p, price) for p in pos_details)
                     exchange.enforce_order_limit(settings.symbol, keep_count=grid.grid_count + 2, tracked_ids=grid.get_tracked_order_ids())
                     fills = grid.check_fills(balance)
                     if fills:
@@ -844,9 +874,8 @@ def run_bot() -> None:
 
                     risk.update_unrealized(unrealized)
 
-                    pos_details = get_position_details(exchange, settings.symbol)
                     for pos in pos_details:
-                        pos_unrealized = (price - pos["entry_price"]) * pos["qty"]
+                        pos_unrealized = _position_unrealized_pnl(pos, price)
                         events.position_snapshot(
                             symbol=settings.symbol, side=pos["side"],
                             entry_price=pos["entry_price"], qty=pos["qty"],

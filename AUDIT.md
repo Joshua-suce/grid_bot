@@ -279,6 +279,46 @@ falls back to it when omitted, and never mutates `state.daily_realized_pnl`).
 Full suite: 160 passed (`test_main.py`/`test_telegram_notifier.py` included
 this run -- `pydantic`/`httpx` were available in this environment).
 
+### 9. Unrealized PnL was locally re-derived instead of using the exchange's own figure -- LOW-MEDIUM (one latent sign bug found along the way)
+**Evidence:** code inspection, prompted by wanting every PnL figure shown to
+the user (or fed into the risk kill switch) to be exchange-verified rather
+than re-computed locally -- the same principle behind issues #7/#8.
+
+Three places recomputed unrealized PnL manually from `entry_price`/`qty`/last
+price instead of using ccxt's unified `unrealizedPnl` field (Binance's own
+mark-price-based number, already present in every `fetch_positions()`
+response):
+- `_notify_status()`'s Telegram position update,
+- the main loop's `events.position_snapshot()` call -- and this one had an
+  actual bug, not just an approximation: it applied `(price - entry) * qty`
+  unconditionally regardless of side, which silently inverts the sign for any
+  short position (a profitable short would be logged as a loss, and vice
+  versa),
+- `risk.update_unrealized()`, fed from `grid.get_unrealized_pnl(price)` --
+  the grid's own per-level estimate, subject to the same
+  blended-entry-vs-per-level-entry drift as issues #7/#8, and it's an input
+  to the daily-loss kill switch (`_check_daily_loss`'s `total_daily =
+  daily_realized_pnl + daily_unrealized_pnl`).
+
+**Fix:** `get_position_details()` (main.py) now passes through the
+exchange's `unrealizedPnl` as `unrealized_pnl` on each position dict (`None`
+when an exchange/mock doesn't provide it). A new `_position_unrealized_pnl()`
+helper prefers that real figure and only falls back to the manual
+side-aware calculation when it's unavailable; all three call sites above now
+go through this one helper, fixing the short-side sign bug as a side effect
+of removing the duplicated inline logic. The main loop fetches
+`pos_details` once and reuses it for both the unrealized-PnL sum (now real,
+fed into `risk.update_unrealized()`) and the position-snapshot loop, instead
+of fetching positions twice per iteration.
+`grid.get_unrealized_pnl()` has no remaining callers -- left in place as
+harmless dead code, consistent with how `RiskManager.can_recover()` and
+`GridEngine._min_profit_multiplier` were handled above.
+
+**Tests:** `tests/test_main.py` gained coverage for `unrealized_pnl`
+passthrough (present and `None`-when-omitted), `_position_unrealized_pnl`
+preferring the exchange figure over a contradicting manual calculation, the
+long-side fallback, and a regression test pinning the short-side sign fix.
+
 ## Recommendation
 
 The fixes above are all defensive/correctness fixes with no strategy changes
