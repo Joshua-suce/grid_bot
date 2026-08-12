@@ -894,6 +894,129 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## Aggression without dormancy: the router's two remaining defects (#29-#30)
+
+Both found while chasing one instruction: *be profitable in all trends and never
+dormant -- fix the strategy mode rather than turning it off*. Router mode was doing the
+opposite of both, for two independent reasons.
+
+### 30. The trend follower could never open a position live -- CRITICAL
+
+`TrendFollower`'s only entry path was `place_initial_orders`. As #28 established,
+main.py calls that exactly once, at startup, before the loop. Inside the loop the grid
+re-places filled levels from within `check_fills`; nothing ever calls
+`place_initial_orders` again.
+
+So in live router mode the sequence was: trend confirmed -> handoff -> trend follower
+activated -> **stands flat for the entire move**. The bot would have gone quiet in
+exactly the conditions the router exists to trade -- the dormancy that prompted the
+work, caused by the fix for it.
+
+The backtester could not see this: its loop calls `strategy.place_initial_orders(balance)`
+every candle, so the follower was driven by a path production does not have. That
+divergence is now itself a known limit of the harness (below).
+
+Two changes, both idempotent:
+
+- `activate()` opens immediately if the regime already supports a side, matching
+  `GridEngine.activate`, which places its ladder rather than waiting to be driven.
+- `check_fills` -- called every iteration whenever a strategy is live -- arms the entry
+  when there is no position and no resting order.
+
+`place_initial_orders` already no-ops while a position or entry order exists, so being
+driven from both paths in one iteration (as the backtester now does) still opens one
+position. Verified adversarially: with the fix reverted, 2 of the 5 new tests fail.
+
+### 29. The handoff market-dumped whatever the grid was holding -- HIGH
+
+`_begin_handoff` paused the outgoing strategy and closed its position immediately, on
+the reasoning that one-way position mode allows only one writer. The safety reasoning
+was right; the timing was not. A grid accumulates inventory *expecting* to unwind it
+through its own levels -- flattening it at market realises precisely the loss those
+levels exist to avoid, and pays a taker fee for the privilege.
+
+Instrumented over 90 days of DOGE 1h:
+
+```
+handoffs completed        : 44
+...with an OPEN position  : 18
+DOGE force-liquidated     : 64767
+realised AT those dumps   : -46.16
+router total net          : -92.78
+```
+
+Half the router's entire shortfall was the switching mechanism, not either strategy.
+The split confirmed it: grid self-pnl +275.41 over 474 fills, trend self-pnl **+0.65**
+over 56 fills and 28 cycles. The trend follower is roughly breakeven -- it was not the
+thing losing money.
+
+The switch now waits. `_begin_handoff` records the target and a clock; the outgoing
+strategy stays live and keeps working its position down; the moment it is genuinely
+flat the switch completes for free. Only after `ROUTER_HANDOFF_GRACE_SECONDS`
+(default 21600 -- 6h) does the old force-close path run.
+
+Three supporting details, each a bug in its own right if omitted:
+
+- **The grace clock must not restart.** `_begin_handoff` is reached on every iteration
+  while a switch is pending; re-stamping the start time would push the deadline away
+  faster than time passes and the router would wait forever.
+- **The waiting strategy may close but not open.** Left at its normal cap the grid
+  keeps refilling the side it is meant to be working down and never reaches flat, so
+  the grace expires into the forced dump anyway. During a pending handoff the router
+  clamps `max_position_qty` to what is already open: exits still fill, nothing new
+  does. It still gets to re-arm those exits -- `place_initial_orders` delegates to it
+  while waiting, since refusing would strand the very inventory being unwound.
+- **A pending switch is cancelled if the regime comes back.** Otherwise the grace clock
+  keeps running against a switch nobody wants, and the next trend inherits a spent one
+  and dumps instantly.
+
+The safety property is untouched: the incoming strategy is activated only once flat is
+confirmed against the exchange, and an unreadable position still counts as not flat.
+
+### What it measured
+
+DOGE 1h, 90 days, 12 start offsets, `ADX_RANGE_THRESHOLD=15`, everything else at the
+current `.env`. `idle` is the share of candles with no strategy trading at all.
+
+| mode | mean | sd | sem | positive | fills | switches | forced dumps | idle |
+|---|---|---|---|---|---|---|---|---|
+| grid only, no filter | -14.18 | 51.38 | 14.83 | 5/12 | 718 | 0 | 0 | 0% |
+| grid + filter (pause) | **+21.79** | 39.56 | 11.42 | 7/12 | 508 | 0 | 0 | **30%** |
+| router, grace=0 (old behaviour) | -33.64 | 31.54 | 9.10 | 2/12 | 514 | 40.2 | 15.8 | 0% |
+| router, grace=2h | -31.89 | 31.75 | 9.17 | 2/12 | 515 | 38.5 | 14.4 | 0% |
+| router, grace=6h | **-2.99** | 57.70 | 16.66 | 7/12 | 502 | 31.8 | 9.8 | **0%** |
+| router, grace=12h | -43.53 | 59.57 | 17.20 | 2/12 | 506 | 29.3 | 6.6 | 0% |
+
+What this does and does not establish:
+
+- **The dump was costing real money.** grace=0 -> grace=6h is +30.65 mean and 2/12 ->
+  7/12 positive, with forced dumps down from 15.8 to 9.8 per run. That is the same
+  order as the -46.16 measured directly at the dump moments.
+- **It is not statistically established.** The sem on that difference is roughly 19 on
+  overlapping (non-independent) samples -- about 1.6 sigma. And the relationship is not
+  monotonic: grace=12h has the *fewest* forced dumps (6.6) and the *worst* mean
+  (-43.53), which is not what a clean causal story would look like. Waiting longer also
+  means holding clamped inventory through more of a trend. 6h is a plausible middle,
+  not a tuned optimum, and tuning it on this one series would be fitting noise.
+- **The router still does not beat pausing.** grid+filter is +21.79 against the
+  router's -2.99. What the router buys is the thing that was actually asked for:
+  it is in the market ~100% of the time against grid+filter's ~70%, at a cost of
+  roughly 25 in mean PnL over 90 days on this series -- itself inside the noise band.
+
+So the router is no longer the clear loser it was (-43 against +48 on the earlier
+6-offset run), and its remaining gap is within the noise floor. Continuous market
+presence is now a defensible trade rather than an expensive one.
+
+
+### Known limit this exposed
+
+The backtest loop calls `place_initial_orders` every candle; main.py's loop never does.
+That divergence hid #30 completely. Strategy code must therefore be self-arming from
+`check_fills` and `activate` -- being driven by the backtester is not evidence that
+production will drive it at all.
+
+---
+
 ## Stop-loss protection defects from the 2026-08-12 live run (issues #25-#26)
 
 Both surfaced at the same instant -- the 14:06 recenter -- and share a shape: an event

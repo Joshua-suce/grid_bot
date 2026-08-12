@@ -207,6 +207,16 @@ class Settings(BaseSettings):
         default=300, ge=0, le=86400,
         description="Minimum time a trend position is held before its stop can fire",
     )
+    router_handoff_grace_seconds: int = Field(
+        default=21600, ge=0, le=604800,
+        description=(
+            "How long the outgoing strategy is given to unwind its own position before "
+            "the router force-closes it to complete a switch. Market-dumping a grid's "
+            "inventory realises exactly the loss its levels exist to avoid, so the "
+            "default is generous: wait, take the switch free the moment it goes flat, "
+            "and only pay to close if it never gets there."
+        ),
+    )
     router_min_regime_seconds: int = Field(
         default=900, ge=0, le=86400,
         description=(

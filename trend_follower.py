@@ -133,8 +133,15 @@ class TrendFollower:
         )
 
     def activate(self, balance: float) -> None:
+        """Go live and open straight away if the regime already supports a side.
+
+        GridEngine.activate places its ladder here rather than waiting to be driven, so
+        this does the same. Without it the router hands over on a confirmed trend and
+        the bot stands flat until something else happens to call place_initial_orders.
+        """
         self.active = True
         logger.info("TREND FOLLOWER ACTIVATED | regime={}", self._regime)
+        self.place_initial_orders(balance)
 
     def pause(self) -> None:
         """Cancel the resting entry order but keep any open position.
@@ -265,6 +272,18 @@ class TrendFollower:
                     exit_fill = self._close_position("trailing_stop")
                     if exit_fill:
                         fills.append(exit_fill)
+
+        # Re-arm. Entry lives in place_initial_orders, and main.py's live loop calls
+        # that exactly once, at startup, before the loop begins -- so in router mode
+        # the trend follower would take over on a confirmed trend and then never open
+        # anything, leaving the bot flat through the whole move (AUDIT #30). check_fills
+        # is called every iteration whenever a strategy is live, so the entry is armed
+        # from here too. Both paths are idempotent: place_initial_orders no-ops while a
+        # position or a resting entry order exists, so being driven twice in one
+        # iteration (as the backtester does) still opens only one position.
+        if self.active and self._side is None and self._order_id is None:
+            self.place_initial_orders(balance)
+
         return fills
 
     def _can_exit(self) -> bool:

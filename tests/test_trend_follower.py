@@ -317,3 +317,77 @@ def test_reconcile_handles_negative_contracts_encoding():
     tf.reconcile_positions()
     assert tf._side == "short"
     assert tf._qty == 4000.0
+
+
+# --- #30: the strategy must arm itself, not wait to be driven --------------
+
+def test_activating_into_a_known_regime_opens_immediately():
+    """GridEngine.activate places its ladder there and then. This must too: the router
+    calls activate() at the end of a handoff and nothing else in main.py's loop opens a
+    trend position."""
+    ex = FakeExchange()
+    tf = TrendFollower(exchange=ex, symbol="DOGEUSDT", min_hold_seconds=0)
+    tf.initialize(ex.price, balance=5000)
+    tf.update_regime("uptrend")
+
+    tf.activate(5000)
+
+    assert [o["side"] for o in ex.placed] == ["buy"]
+
+
+def test_entry_is_armed_from_check_fills_like_the_live_loop():
+    """AUDIT #30. main.py calls place_initial_orders exactly once, at startup, before
+    the loop; inside the loop the grid re-places filled levels from within check_fills.
+    A trend follower whose only entry path was place_initial_orders would take over on
+    a confirmed trend and then stand flat for the entire move -- the bot would look
+    dormant in exactly the conditions the router exists to trade. So check_fills, which
+    does run every iteration, arms the entry too."""
+    ex = FakeExchange()
+    tf = TrendFollower(exchange=ex, symbol="DOGEUSDT", min_hold_seconds=0)
+    tf.initialize(ex.price, balance=5000)
+    tf.active = True                 # activated without a regime yet
+    tf.update_regime("uptrend")      # regime arrives afterwards, as it does live
+
+    tf.check_fills(5000)             # the only call main.py's loop makes
+
+    assert [o["side"] for o in ex.placed] == ["buy"], "no position opened during a trend"
+
+
+def test_being_driven_twice_in_one_iteration_still_opens_one_position():
+    """The backtester calls check_fills and place_initial_orders in the same candle."""
+    ex = FakeExchange()
+    ex.fill_immediately = False
+    tf = TrendFollower(exchange=ex, symbol="DOGEUSDT", min_hold_seconds=0)
+    tf.initialize(ex.price, balance=5000)
+    tf.activate(5000)
+    tf.update_regime("uptrend")
+
+    tf.check_fills(5000)
+    tf.place_initial_orders(5000)
+    tf.check_fills(5000)
+
+    assert len(ex.placed) == 1, f"placed {len(ex.placed)} entries for one signal"
+
+
+def test_no_entry_is_armed_while_the_regime_is_undecided():
+    ex = FakeExchange()
+    tf = TrendFollower(exchange=ex, symbol="DOGEUSDT", min_hold_seconds=0)
+    tf.initialize(ex.price, balance=5000)
+    tf.activate(5000)
+    tf.update_regime("ranging")
+
+    tf.check_fills(5000)
+
+    assert ex.placed == []
+
+
+def test_a_paused_strategy_does_not_arm_itself():
+    ex = FakeExchange()
+    tf = TrendFollower(exchange=ex, symbol="DOGEUSDT", min_hold_seconds=0)
+    tf.initialize(ex.price, balance=5000)
+    tf.update_regime("uptrend")
+    tf.active = False
+
+    tf.check_fills(5000)
+
+    assert ex.placed == []

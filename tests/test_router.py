@@ -81,12 +81,15 @@ class FakeExchange:
         return True
 
 
-def make(position=0.0, min_regime_seconds=0):
+def make(position=0.0, min_regime_seconds=0, handoff_grace_seconds=0):
+    """handoff_grace_seconds defaults to 0 so the force-close path is exercised
+    without waiting; tests for the graceful path pass a real grace explicitly."""
     ex = FakeExchange(position)
     grid, trend = FakeStrategy("grid"), FakeStrategy("trend")
     r = StrategyRouter(
         strategies={"grid": grid, "trend": trend},
         min_regime_seconds=min_regime_seconds,
+        handoff_grace_seconds=handoff_grace_seconds,
         exchange=ex, symbol="DOGEUSDT",
     )
     grid.activate(5000)
@@ -129,16 +132,110 @@ def test_outgoing_strategy_is_paused_before_the_switch():
 
 
 def test_position_is_flattened_before_handing_over():
-    r, grid, trend, ex = make(position=5000.0)
+    """Once the grace period is spent, an unresolved position is closed outright."""
+    r, grid, trend, ex = make(position=5000.0, handoff_grace_seconds=0)
     r.update_regime("uptrend")
     r.place_initial_orders(5000)
     assert ex.closes == 1
     assert r.active_name == "trend"
+    assert r.forced_flattens >= 1
+
+
+def test_a_healthy_position_is_not_dumped_to_make_the_switch():
+    """AUDIT #29. The router used to market-close whatever the grid was holding the
+    moment a regime was confirmed. Across 90 days of DOGE that dumped 64,767 DOGE over
+    18 handoffs for -46.16 realised -- roughly half the router's entire shortfall
+    against simply pausing the grid. The grid accumulates inventory *expecting* to
+    unwind it through its own levels; flattening it realises exactly the loss those
+    levels exist to avoid. So inside the grace period the switch waits."""
+    r, grid, trend, ex = make(position=5000.0, handoff_grace_seconds=3600)
+    r.update_regime("uptrend")
+    r.place_initial_orders(5000)
+
+    assert ex.closes == 0, "dumped an open position instead of waiting for it to unwind"
+    assert r.active_name == "grid"
+    assert r.handoff_in_progress, "the switch should still be pending, not abandoned"
+    assert grid.active, "outgoing strategy must keep working to reach flat"
+
+
+def test_the_switch_completes_for_free_once_the_position_unwinds_naturally():
+    r, grid, trend, ex = make(position=5000.0, handoff_grace_seconds=3600)
+    r.update_regime("uptrend")
+    assert r.active_name == "grid"
+
+    ex.position = 0.0            # the grid's own levels closed it out
+    r.update_regime("uptrend")
+
+    assert r.active_name == "trend"
+    assert ex.closes == 0, "paid to close a position that had already gone flat"
+    assert r.forced_flattens == 0
+
+
+def test_the_grace_period_expires_rather_than_waiting_for_ever():
+    """Waiting is the cheap path, not an excuse to never switch."""
+    r, grid, trend, ex = make(position=5000.0, handoff_grace_seconds=60)
+    r.update_regime("uptrend")
+    assert r.active_name == "grid"
+
+    r._handoff_started -= 61      # grace spent
+    r.update_regime("uptrend")
+
+    assert r.active_name == "trend"
+    assert ex.closes == 1
+    assert r.forced_flattens == 1
+
+
+def test_the_grace_clock_is_not_restarted_by_repeated_ticks():
+    """_begin_handoff is reached on every iteration while a switch is pending. If it
+    reset the clock each time, the deadline would move away faster than time passed and
+    the router would wait for ever holding a position it meant to hand over."""
+    r, grid, trend, ex = make(position=5000.0, handoff_grace_seconds=60)
+    r.update_regime("uptrend")
+    started = r._handoff_started
+
+    for _ in range(5):
+        r.update_regime("uptrend")
+    assert r._handoff_started == started
+
+
+def test_waiting_strategy_may_close_but_not_open():
+    """The wait only ends if the outgoing strategy actually reaches flat. A grid left
+    at its normal cap keeps refilling the side it is meant to be working down, so the
+    grace period would expire into the forced dump this was written to avoid. During a
+    pending handoff the cap is clamped to what is already open: exits still fill,
+    nothing new does."""
+    r, grid, trend, ex = make(position=5000.0, handoff_grace_seconds=3600)
+    r.update_regime("uptrend")
+    r.set_position_limit(5000.0, 0.0, 20000.0)
+
+    _, _, cap = grid.position_limits[-1]
+    assert cap == 5000.0, "outgoing strategy was still allowed to add exposure"
+
+
+def test_position_limit_is_untouched_when_no_handoff_is_pending():
+    r, grid, trend, ex = make()
+    r.set_position_limit(5000.0, 0.0, 20000.0)
+    assert grid.position_limits[-1] == (5000.0, 0.0, 20000.0)
+
+
+def test_a_pending_switch_is_cancelled_if_the_regime_comes_back():
+    """Nothing to hand over if the regime returns to the strategy already trading --
+    and the grace clock must stop, or the next trend inherits a spent one and dumps."""
+    r, grid, trend, ex = make(position=5000.0, handoff_grace_seconds=3600)
+    r.update_regime("uptrend")
+    assert r.handoff_in_progress
+
+    r.update_regime("ranging")
+
+    assert not r.handoff_in_progress
+    assert r.active_name == "grid"
+    assert ex.closes == 0
+    assert r._handoff_started == 0.0
 
 
 def test_incoming_strategy_is_not_activated_while_a_position_remains():
     """The core safety property: never two writers on one net position."""
-    r, grid, trend, ex = make(position=5000.0)
+    r, grid, trend, ex = make(position=5000.0, handoff_grace_seconds=0)
     ex.close_fails = True
     r.update_regime("uptrend")
     r.place_initial_orders(5000)
@@ -152,7 +249,7 @@ def test_incoming_strategy_is_not_activated_while_a_position_remains():
 
 
 def test_failed_handoff_retries_and_completes_once_flat():
-    r, grid, trend, ex = make(position=5000.0)
+    r, grid, trend, ex = make(position=5000.0, handoff_grace_seconds=0)
     ex.close_fails = True
     r.update_regime("uptrend")
     r.place_initial_orders(5000)
@@ -164,13 +261,27 @@ def test_failed_handoff_retries_and_completes_once_flat():
     assert not r.handoff_in_progress
 
 
-def test_no_orders_are_placed_during_a_handoff():
-    r, grid, trend, ex = make(position=5000.0)
+def test_the_incoming_strategy_places_nothing_while_a_handoff_is_pending():
+    r, grid, trend, ex = make(position=5000.0, handoff_grace_seconds=0)
     ex.close_fails = True
     r.update_regime("uptrend")
-    before = grid.orders_placed + trend.orders_placed
+    before = trend.orders_placed
     r.place_initial_orders(5000)
-    assert grid.orders_placed + trend.orders_placed == before
+    assert trend.orders_placed == before, "incoming strategy traded on top of a position"
+    assert not grid.active, "a forced close must stand the outgoing strategy down"
+
+
+def test_the_outgoing_strategy_keeps_working_while_waiting_for_flat():
+    """It is still live for a reason: it is unwinding. Refusing to let it re-arm its
+    own exits would strand the position and guarantee the forced close."""
+    r, grid, trend, ex = make(position=5000.0, handoff_grace_seconds=3600)
+    r.update_regime("uptrend")
+    before = grid.orders_placed
+
+    r.place_initial_orders(5000)
+
+    assert grid.orders_placed > before
+    assert trend.orders_placed == 0
 
 
 def test_unverifiable_position_is_treated_as_not_flat():
@@ -340,12 +451,13 @@ def test_router_state_carries_grid_bounds_for_mains_restore_path(monkeypatch):
 def test_handoff_completes_without_place_initial_orders_ever_being_called():
     """main.py calls place_initial_orders once, at startup, before the loop.
 
-    Every other strategy call in its loop sits behind `if grid.active:`, and
-    _begin_handoff pauses the outgoing strategy -- so active goes False and none of
-    them run. A handoff driven only from place_initial_orders could never advance:
-    the bot would pause the grid on the first confirmed trend and stop trading
-    permanently. update_regime is the one unconditional per-iteration call, so it
-    must be able to carry a handoff to completion on its own.
+    Every other strategy call in its loop sits behind `if grid.active:`, so the moment
+    anything pauses the outgoing strategy -- the force-close path here, an emergency
+    stop, a failed flatten -- none of them run again. A handoff driven only from
+    place_initial_orders could never advance past that point: the bot would stop
+    trading permanently on the first confirmed trend. update_regime is the one
+    unconditional per-iteration call, so it must be able to carry a handoff to
+    completion on its own.
     """
     r, grid, trend, ex = make(position=5000.0)
 

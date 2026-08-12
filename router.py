@@ -61,6 +61,7 @@ class StrategyRouter:
         routing: dict | None = None,
         default: str = "grid",
         min_regime_seconds: int = 900,
+        handoff_grace_seconds: int = 21600,
         exchange=None,
         symbol: str = "",
         notifier: object | None = None,
@@ -72,6 +73,8 @@ class StrategyRouter:
         self.routing = dict(routing or DEFAULT_ROUTING)
         self.default = default
         self.min_regime_seconds = min_regime_seconds
+        # How long to let the outgoing strategy unwind naturally before force-closing.
+        self.handoff_grace_seconds = handoff_grace_seconds
         self.exchange = exchange
         self.symbol = symbol
         self._notifier = notifier
@@ -82,8 +85,11 @@ class StrategyRouter:
         self._pending_name: str | None = None
         self._pending_since = 0.0
         self._handoff_target: str | None = None
+        self._handoff_started = 0.0
         self.switches = 0
         self.failed_handoffs = 0
+        self.deferred_ticks = 0
+        self.forced_flattens = 0
 
     # --- the live strategy -------------------------------------------------
 
@@ -124,6 +130,17 @@ class StrategyRouter:
         if target == self.active_name:
             self._pending_name = None
             self._pending_since = 0.0
+            if self._handoff_target is not None:
+                # The regime came back to the strategy already trading. Nothing to hand
+                # over -- drop the pending switch so the grace clock stops and the
+                # outgoing strategy's position stops being treated as inventory to
+                # unwind. Cheaper than completing a switch we would only reverse.
+                logger.info(
+                    "ROUTER | handoff to {} cancelled -- regime returned to {}",
+                    self._handoff_target, self.active_name,
+                )
+                self._handoff_target = None
+                self._handoff_started = 0.0
             return
 
         now = time.time()
@@ -145,11 +162,12 @@ class StrategyRouter:
         #
         # main.py calls place_initial_orders exactly once, at startup, before the loop
         # begins; every other strategy call in the loop sits behind `if grid.active:`.
-        # Since _begin_handoff pauses the outgoing strategy, active goes False and none
-        # of those run -- so a handoff driven only from place_initial_orders would never
-        # advance and the bot would stop trading permanently on the first confirmed
-        # trend. update_regime is the one call made unconditionally every iteration, so
-        # progress is anchored to it. Caught by the router backtest (AUDIT #28).
+        # The moment anything stands the outgoing strategy down -- the force-close path,
+        # a failed flatten, an emergency stop -- active goes False and none of those run
+        # again, so a handoff driven only from place_initial_orders would never advance
+        # and the bot would stop trading permanently. update_regime is the one call made
+        # unconditionally every iteration, so progress is anchored to it. Caught by the
+        # router backtest (AUDIT #28).
         if self._handoff_target is not None:
             self._continue_handoff(self._current_balance())
 
@@ -169,9 +187,30 @@ class StrategyRouter:
             return 0.0
 
     def _begin_handoff(self, target: str) -> None:
-        logger.info("ROUTER | handoff {} -> {} starting", self.active_name, target)
+        """Start a switch. Deliberately does NOT pause or flatten yet.
+
+        The outgoing strategy keeps working until it is naturally flat. A grid
+        accumulates inventory expecting to unwind it through its own levels; pausing
+        and market-closing that inventory realises the loss the levels existed to
+        avoid. Measured on DOGE 1h/90d: 18 of 44 handoffs dumped an open position,
+        64,767 DOGE force-liquidated, -46.16 realised at those moments alone -- about
+        half the router's total shortfall versus simply pausing the grid (AUDIT #29).
+
+        So: wait for flat, and only force the close once handoff_grace_seconds has
+        passed. The safety rule is unchanged -- the incoming strategy is activated only
+        when the position is confirmed flat, so there is never a moment with two
+        writers on one net position.
+        """
+        logger.info(
+            "ROUTER | handoff {} -> {} starting (waiting for flat, grace {}s)",
+            self.active_name, target, self.handoff_grace_seconds,
+        )
+        if self._handoff_target == target:
+            # Already waiting for this one. Restarting the clock here would push the
+            # deadline out every iteration and the grace period would never expire.
+            return
         self._handoff_target = target
-        self.strategy.pause()
+        self._handoff_started = time.time()
 
     def _flat_on_exchange(self) -> bool:
         """Re-read the exchange rather than trusting internal bookkeeping.
@@ -191,17 +230,35 @@ class StrategyRouter:
             return False
 
     def _continue_handoff(self, balance: float) -> None:
-        """Drive the pause -> flatten -> verify -> activate sequence.
+        """Wait for flat, then hand over. Force the close only once grace expires.
 
-        Called every iteration while a handoff is in progress. Each stage is retried on
-        the next tick rather than forced, so a failed close cannot leave two strategies
-        sharing one position.
+        Called every iteration while a handoff is pending. The outgoing strategy stays
+        active and keeps unwinding through its own levels; we take the switch the
+        moment it happens to be flat, which costs nothing. Only if it never gets there
+        within handoff_grace_seconds do we pause and market-close it.
+
+        Every stage is retried on the next tick rather than forced, so a failed close
+        can never leave two strategies sharing one position.
         """
         target = self._handoff_target
         if target is None:
             return
 
         if not self._flat_on_exchange():
+            waited = time.time() - self._handoff_started
+            if waited < self.handoff_grace_seconds:
+                # Still holding inventory and still inside grace: let the outgoing
+                # strategy keep working it down through its own exits. Dumping here is
+                # what cost -46.16 across 18 handoffs (AUDIT #29).
+                self.deferred_ticks += 1
+                return
+
+            logger.warning(
+                "ROUTER | handoff to {} still not flat after {:.0f}s grace — forcing close",
+                target, waited,
+            )
+            self.forced_flattens += 1
+            self.strategy.pause()
             try:
                 self.exchange.close_position(self.symbol)
                 logger.info("ROUTER | flattening before handoff to {}", target)
@@ -214,6 +271,8 @@ class StrategyRouter:
                 logger.warning("ROUTER | still not flat after close -- retrying next tick")
                 return
 
+        # Flat (naturally or forced): stand the outgoing strategy down and switch.
+        self.strategy.pause()
         previous = self.active_name
         self.active_name = target
         self._handoff_target = None
@@ -276,6 +335,15 @@ class StrategyRouter:
         gone before the incoming one is asked to place anything."""
         if self.handoff_in_progress:
             self._continue_handoff(balance)
+            if self.handoff_in_progress:
+                # Still waiting for flat. The outgoing strategy stays live on purpose,
+                # so let it keep re-arming its own exits -- refusing here would strand
+                # the inventory it is trying to work down and guarantee the forced
+                # close this design exists to avoid. What stops it *adding* exposure is
+                # the cap clamp in set_position_limit, not silence here.
+                if self.strategy.active:
+                    return self.strategy.place_initial_orders(balance)
+            # Just completed: activate() already placed for the incoming strategy.
             return 0
         return self.strategy.place_initial_orders(balance)
 
@@ -285,6 +353,14 @@ class StrategyRouter:
     def set_position_limit(
         self, long_position: float, short_position: float, max_position_qty: float,
     ) -> None:
+        if self.handoff_in_progress:
+            # Waiting for the outgoing strategy to reach flat. Clamp the cap to what is
+            # already open so it can still close through its own levels but cannot open
+            # anything new -- otherwise a grid keeps refilling the side it is meant to
+            # be working down and never gets flat, and the grace period expires into
+            # exactly the forced dump this was written to avoid.
+            max_position_qty = min(max_position_qty, max(long_position, short_position))
+
         # Every strategy is kept current: a dormant one must not wake with a stale view
         # of the position, which is how reduce-only rejections start (AUDIT #11).
         for s in self.strategies.values():
@@ -366,6 +442,7 @@ class StrategyRouter:
             "handoff_target": self._handoff_target,
             "switches": self.switches,
             "failed_handoffs": self.failed_handoffs,
+            "forced_flattens": self.forced_flattens,
         }
         base["strategies"] = {name: s.to_dict() for name, s in self.strategies.items()}
         return base
@@ -380,6 +457,9 @@ class StrategyRouter:
             self._handoff_target = None
         self.switches = int(router_state.get("switches", 0))
         self.failed_handoffs = int(router_state.get("failed_handoffs", 0))
+        self.forced_flattens = int(router_state.get("forced_flattens", 0))
+        if self._handoff_target is not None:
+            self._handoff_started = time.time()
 
         sub_states = (data or {}).get("strategies") or {}
         if sub_states:

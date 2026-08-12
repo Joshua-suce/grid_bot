@@ -419,6 +419,7 @@ class BacktestResult:
     stop_loss_hits: int = 0
     strategy_switches: int = 0
     failed_handoffs: int = 0
+    forced_flattens: int = 0
     time_in_position_pct: float = 0.0
     time_paused_pct: float = 0.0
     equity_curve: list[float] = field(default_factory=list, repr=False)
@@ -464,6 +465,7 @@ class BacktestResult:
             f"  stop-loss hits       {self.stop_loss_hits}",
             f"  strategy switches    {self.strategy_switches}",
             f"  failed handoffs      {self.failed_handoffs}",
+            f"  forced flattens      {self.forced_flattens}",
             f"  crossing refused     {self.rejected_crossing}",
             f"  reduceOnly rejected  {self.rejected_reduce_only}",
             f"  min-notional skipped {self.rejected_min_notional}",
@@ -503,6 +505,7 @@ def run_backtest(
     trend_atr_stop_multiplier: float = 2.0,
     trend_min_hold_seconds: int = 300,
     router_min_regime_seconds: int = 900,
+    router_handoff_grace_seconds: int = 21600,
     adx_trend_threshold: float = 30.0,
     adx_range_threshold: float = 20.0,
     ema_fast: int = 20,
@@ -534,6 +537,7 @@ def run_backtest(
             trend_atr_stop_multiplier=trend_atr_stop_multiplier,
             trend_min_hold_seconds=trend_min_hold_seconds,
             router_min_regime_seconds=router_min_regime_seconds,
+            router_handoff_grace_seconds=router_handoff_grace_seconds,
             adx_trend_threshold=adx_trend_threshold,
             adx_range_threshold=adx_range_threshold, ema_fast=ema_fast, ema_slow=ema_slow,
             adx_period=adx_period,
@@ -583,7 +587,7 @@ def _run(ohlcv, *, symbol, starting_balance, grid_count, capital_per_grid_pct,
          replacement_cooldown, recenter_margin_pct, candle_seconds, warmup,
          price_decimals, amount_decimals, use_trend_filter, use_router,
          trend_capital_pct, trend_atr_stop_multiplier, trend_min_hold_seconds,
-         router_min_regime_seconds, adx_trend_threshold,
+         router_min_regime_seconds, router_handoff_grace_seconds, adx_trend_threshold,
          adx_range_threshold, ema_fast, ema_slow, adx_period) -> BacktestResult:
     from trend_filter import atr as calc_atr
 
@@ -657,6 +661,7 @@ def _run(ohlcv, *, symbol, starting_balance, grid_count, capital_per_grid_pct,
                 strategies={"grid": engine, "trend": trend},
                 default="grid",
                 min_regime_seconds=router_min_regime_seconds,
+                handoff_grace_seconds=router_handoff_grace_seconds,
                 exchange=ex,
                 symbol=symbol,
             )
@@ -774,6 +779,7 @@ def _run(ohlcv, *, symbol, starting_balance, grid_count, capital_per_grid_pct,
         if use_router:
             result.strategy_switches = strategy.switches
             result.failed_handoffs = strategy.failed_handoffs
+            result.forced_flattens = strategy.forced_flattens
 
     return result
 

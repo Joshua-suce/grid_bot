@@ -61,13 +61,15 @@ def _install_strategy(engine: GridEngine, exchange: Exchange, events, notifier):
         notifier=notifier,
     )
     logger.info(
-        "STRATEGY ROUTER ENABLED | grid <-> trend | min_regime_hold={}s",
+        "STRATEGY ROUTER ENABLED | grid <-> trend | min_regime_hold={}s | handoff_grace={}s",
         settings.router_min_regime_seconds,
+        settings.router_handoff_grace_seconds,
     )
     return StrategyRouter(
         strategies={"grid": engine, "trend": trend},
         default="grid",
         min_regime_seconds=settings.router_min_regime_seconds,
+        handoff_grace_seconds=settings.router_handoff_grace_seconds,
         exchange=exchange,
         symbol=settings.symbol,
         notifier=notifier,
