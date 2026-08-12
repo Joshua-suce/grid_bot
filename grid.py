@@ -151,6 +151,11 @@ class GridEngine:
         self._notifier = notifier
         self._block_buys = False
         self._block_sells = False
+        # Last net position seen by set_position_limit(), used to decide whether an
+        # order actually *reduces* a position (reduceOnly is only legal then -- see
+        # _reduce_only_qty). Refreshed from the exchange every main-loop iteration.
+        self._net_long_qty: float = 0.0
+        self._net_short_qty: float = 0.0
         self._last_replacement_time: float = 0.0
         # Per-level cooldown tracking (keyed by object id, not persisted): a fill on
         # one level used to reset a single engine-wide timer that gated ALL orphan/
@@ -191,6 +196,9 @@ class GridEngine:
         old_block_sells = self._block_sells
         old_sell_scale = self._sell_scale
 
+        self._net_long_qty = max(0.0, long_position)
+        self._net_short_qty = max(0.0, short_position)
+
         self._block_buys, self._buy_scale = self._position_limit_state(long_position, max_position_qty)
         self._block_sells, self._sell_scale = self._position_limit_state(short_position, max_position_qty)
 
@@ -229,6 +237,36 @@ class GridEngine:
         if ratio < 0.5:
             return False, 1.0
         return False, 1.0 - (ratio - 0.5) / 0.5
+
+    def _reduce_only_qty(self, side: str) -> float:
+        """Return how much quantity an order on `side` could legally close right now.
+
+        Binance rejects a reduceOnly order (-2022) whenever it cannot reduce the net
+        position: a reduceOnly SELL with no long open, or one whose size exceeds the
+        remaining long, is refused outright. In one-way position mode the sell side of
+        a grid is an *exit* while long but an *entry* while short, so reduceOnly can
+        never be a constant -- it has to be derived from the live net position.
+
+        Returns 0.0 when no position on the closing side exists, i.e. the order opens
+        exposure and must be sent WITHOUT reduceOnly.
+        """
+        if side == "sell":
+            return self._net_long_qty
+        if side == "buy":
+            return self._net_short_qty
+        return 0.0
+
+    def _exit_order_params(self, side: str, quantity: float) -> tuple[dict | None, float]:
+        """Build order params + quantity for a level that may be closing a position.
+
+        Returns (params, quantity). params is None for a normal opening order.
+        Quantity is clamped to the closable size when the order is reduceOnly, because
+        Binance also rejects a reduceOnly order larger than the remaining position.
+        """
+        closable = self._reduce_only_qty(side)
+        if closable <= 0:
+            return None, quantity
+        return {"reduceOnly": True, "postOnly": False}, min(quantity, closable)
 
     def _cancel_resting_orders(self, side: str, reason: str) -> int:
         """Cancel resting orders on one side so a position-capped grid stops growing."""
@@ -758,12 +796,28 @@ class GridEngine:
                 )
                 continue
 
+            # Slice the ACTUAL position across the exit levels. Sizing each level at
+            # the normal grid notional instead meant the unwind tried to sell
+            # len(levels) x grid_qty against a position often far smaller than that:
+            # Binance accepted orders until the cumulative reduceOnly quantity reached
+            # the position and rejected the rest (-2022), so every recenter logged a
+            # burst of guaranteed-fail placements (105 in one session).
+            remaining = amt
+            per_level = amt / len(levels)
             placed = 0
             for level in levels:
                 try:
-                    normal_qty = self._calc_usdt_per_grid(balance) / max(level.price, 1e-12)
-                    qty = self.exchange.exchange.amount_to_precision(self.symbol, normal_qty)
+                    if remaining <= 0:
+                        break
+                    slice_qty = min(per_level, remaining)
+                    qty = self.exchange.exchange.amount_to_precision(self.symbol, slice_qty)
                     if float(qty) <= 0:
+                        continue
+                    if float(qty) * level.price < MIN_NOTIONAL_USDT:
+                        logger.debug(
+                            "UNWIND | slice {} @ {} below {} USDT minimum — skipping level",
+                            qty, level.price, MIN_NOTIONAL_USDT,
+                        )
                         continue
                     params = {"reduceOnly": True, "postOnly": False}
                     order = self.exchange.place_limit_order(self.symbol, exit_side, level.price, float(qty), params=params)
@@ -774,6 +828,7 @@ class GridEngine:
                     level.quantity = float(qty)
                     level.entry_price = entry
                     level.fill_count = 1
+                    remaining -= float(qty)
                     placed += 1
                     logger.info(
                         "UNWIND | {} {} reduce-only {} @ {} (qty={}, entry={})",
@@ -1045,10 +1100,16 @@ class GridEngine:
         level.entry_price = fill_price
 
         try:
-            if new_side == "sell":
-                params = {"reduceOnly": True, "postOnly": False}
-            else:
-                params = None
+            # reduceOnly is only legal when this order actually closes an open
+            # position. Hard-coding it on every sell meant that while the grid was
+            # net SHORT -- where a sell ADDS exposure -- every single replacement was
+            # rejected with -2022, so the sell side could never re-arm and the grid
+            # decayed into a one-sided book (265 such rejections in one session).
+            params, adj_qty = self._exit_order_params(new_side, float(quantity))
+            if adj_qty <= 0:
+                raise ValueError("replacement quantity resolved to zero")
+            quantity = self.exchange.exchange.amount_to_precision(self.symbol, adj_qty)
+            level.quantity = float(quantity)
             order = self.exchange.place_limit_order(self.symbol, new_side, new_price, float(quantity), params=params)
             if "id" not in order:
                 raise ValueError("Order response missing 'id'")
@@ -1132,15 +1193,30 @@ class GridEngine:
         stranded_above = current_price > self.grid_upper and not active_sells
         stranded_below = current_price < self.grid_lower and not active_buys
 
-        # A one-sided grid is also dead INSIDE the band: with no active buys and
-        # price below every resting sell (or vice versa) no order on the book can
-        # ever fill until price crosses the whole grid. The live idle bug: price
-        # wedged at the bottom of the range with a maxed long and all sells above —
-        # zero fills for 10+ hours while recenter correctly refused. Recenter here
-        # re-anchors the sells close to price so the grid keeps trading.
+        # A one-sided grid can also be dead INSIDE the band: with no active buys and
+        # price below every resting sell (or vice versa) nothing on the book fills
+        # until price crosses the whole grid.
+        #
+        # But "one-sided" is the NORMAL, HEALTHY state while unwinding inventory: a
+        # capped long legitimately has buys blocked and exit sells resting above
+        # price, and those sells fill as soon as price ticks up. Treating that as
+        # dead made recenter fire on every cooldown expiry forever (median 196s
+        # apart, 89 times in one session), and because recenter pauses the grid it
+        # CANCELLED the very exit orders that were about to fill -- the position
+        # could never unwind. Only call it dead when the missing side is missing for
+        # no reason: not deliberately blocked by the position cap, and with no
+        # inventory whose exit orders explain the imbalance.
+        buys_intentionally_absent = self._block_buys or self._net_long_qty > 0
+        sells_intentionally_absent = self._block_sells or self._net_short_qty > 0
         dead_inside = (
-            (not active_buys and active_sells and current_price < min(l.price for l in active_sells))
-            or (not active_sells and active_buys and current_price > max(l.price for l in active_buys))
+            (
+                not active_buys and active_sells and not buys_intentionally_absent
+                and current_price < min(l.price for l in active_sells)
+            )
+            or (
+                not active_sells and active_buys and not sells_intentionally_absent
+                and current_price > max(l.price for l in active_buys)
+            )
         )
 
         if in_margin_band and not stranded_above and not stranded_below and not dead_inside:
@@ -1190,10 +1266,16 @@ class GridEngine:
         self.place_initial_orders(balance)
         self.active = True
         self._last_recenter_time = now
-        self._peak_price = current_price
-        self._trough_price = current_price
-        self._trailing_sl_price = None
-        self._trailing_sl_price_short = None
+        # Only re-anchor the trailing stop when there is no position to protect.
+        # Resetting unconditionally handed the ratchet back to the market on every
+        # recenter: with recenter firing repeatedly the peak was continuously reset
+        # to the current price, so a long's stop tracked price downward instead of
+        # holding its high-water mark.
+        if self._net_long_qty <= 0 and self._net_short_qty <= 0:
+            self._peak_price = current_price
+            self._trough_price = current_price
+            self._trailing_sl_price = None
+            self._trailing_sl_price_short = None
 
         logger.info(
             "GRID RECENTERED | new range [{}-{}] | spacing={}",
@@ -1202,24 +1284,41 @@ class GridEngine:
         return True
 
     def update_trailing_sl(self, current_price: float) -> None:
+        """Raise the long trailing stop toward price. Never lowers it.
+
+        A trailing stop is a ratchet: while a position stays open it may only move in
+        the position's favour. This used to recompute the level from grid_lower and a
+        _peak_price that recenter() reset to the current price, so in a downtrend the
+        "stop" walked DOWN with the market (observed: 0.07003 -> 0.06905 across one
+        continuously-open long) and could never be hit -- precisely when it was the
+        only thing protecting the position. reset_trailing() on a side flip is the
+        one place the ratchet is deliberately released.
+        """
         if current_price > self._peak_price:
             self._peak_price = current_price
         static_sl = self.grid_lower * (1 - self.stop_loss_pct)
         if self._peak_price > 0:
-            trailing_sl = self._peak_price * (1 - self._trailing_sl_trigger)
-            self._trailing_sl_price = max(static_sl, trailing_sl)
+            candidate = max(static_sl, self._peak_price * (1 - self._trailing_sl_trigger))
         else:
-            self._trailing_sl_price = static_sl
+            candidate = static_sl
+        if self._trailing_sl_price is None:
+            self._trailing_sl_price = candidate
+        else:
+            self._trailing_sl_price = max(self._trailing_sl_price, candidate)
 
     def update_trailing_sl_short(self, current_price: float) -> None:
+        """Lower the short trailing stop toward price. Never raises it (see above)."""
         if self._trough_price == 0.0 or current_price < self._trough_price:
             self._trough_price = current_price
         static_sl = self.grid_upper * (1 + self.stop_loss_pct)
         if self._trough_price > 0:
-            trailing_sl = self._trough_price * (1 + self._trailing_sl_trigger)
-            self._trailing_sl_price_short = min(static_sl, trailing_sl)
+            candidate = min(static_sl, self._trough_price * (1 + self._trailing_sl_trigger))
         else:
-            self._trailing_sl_price_short = static_sl
+            candidate = static_sl
+        if self._trailing_sl_price_short is None:
+            self._trailing_sl_price_short = candidate
+        else:
+            self._trailing_sl_price_short = min(self._trailing_sl_price_short, candidate)
 
     def get_stop_loss_price(self) -> float:
         if self._trailing_sl_price is not None:

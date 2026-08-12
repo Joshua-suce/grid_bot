@@ -352,6 +352,136 @@ modes. 165/165 tests passing overall (existing exchange tests already
 constructed `Exchange` via `Exchange.__new__` with `has_credentials` set
 directly, bypassing `__init__`, so they were unaffected by this change).
 
+## Technical diagnosis of the 2026-08-11 session (issues #11-#16)
+
+Traced from `logs/grid_2026-08-11.log` after the run "got messy". The headline
+numbers for that single session: **89 dead-grid recenters at a median 196s
+apart** (the recenter cooldown is 180s -- the bot was recentering as fast as it
+was allowed to, continuously), **740 `-2022 ReduceOnly Order is rejected`
+errors**, and a 9148 DOGE long held for over an hour whose stop-loss drifted
+*down* from 0.07003 to 0.06905 while it was open.
+
+These are not six independent bugs. #11 and #13 form a feedback loop that #12,
+#14 and #15 then amplify:
+
+```
+net short  --> every replacement SELL sent reduceOnly (#11) --> -2022, always
+           --> sell side can never re-arm --> grid decays to one-sided book
+           --> "DEAD GRID INSIDE BAND" fires (#13) --> recenter
+           --> recenter pauses grid == cancels the resting exit orders
+           --> rebuild + re-unwind (over-sized, #12) --> more -2022
+           --> state is immediately "dead" again --> wait out 180s cooldown
+           --> recenter ... (89x)
+```
+
+Each turn of that loop also reset the trailing stop anchor (#15), which is why
+the stop walked downward all night instead of ratcheting.
+
+### 11. `reduceOnly` hard-coded on every replacement sell -- CRITICAL
+**Evidence:** 265 rejections from `grid:_handle_fill`; every one a SELL placed
+while the account was net short.
+
+`_handle_fill` set `params = {"reduceOnly": True}` for *every* sell replacement.
+In Binance one-way position mode the sell side of a grid is an **exit while
+long** but an **entry while short** -- `reduceOnly` is only legal in the first
+case. While the bot was short, every single sell replacement was rejected, so
+the sell side could never re-arm; the grid bled sell levels until it was
+one-sided, which is what tripped #13. (It partially self-healed one cycle later
+because `check_fills`'s orphan path re-places the same level *without*
+`reduceOnly` -- two code paths placing the same order with different params.)
+
+**Fix:** `_reduce_only_qty()` / `_exit_order_params()` derive the flag from the
+live net position (cached in `set_position_limit`, which already receives
+`long_position`/`short_position` every loop): `reduceOnly` only when the order
+actually closes something, and the quantity clamped to the remaining position
+(Binance also rejects a `reduceOnly` order *larger* than the position).
+
+### 12. Unwind sized every exit level at full grid notional -- HIGH
+**Evidence:** 105 rejections from `grid:_unwind_position_through_grid`; the
+`placed=` counter in the unwind summary reads 6 or 7 out of 10 whenever the
+position is smaller than `10 x grid_qty`.
+
+`_unwind_position_through_grid` placed one order per free exit level, each sized
+`_calc_usdt_per_grid(balance) / price` -- the *normal grid size*, with no
+reference to how big the position actually was. Against a 9148 position with
+~1450 per level it asked to close ~14,500: the exchange accepted orders until
+the cumulative reduce-only quantity reached the position and rejected the rest.
+Guaranteed-fail API calls on every recenter.
+
+**Fix:** slice the actual position (`per_level = amt / len(levels)`), track
+`remaining`, stop when it is exhausted, and skip slices below `MIN_NOTIONAL_USDT`.
+
+### 13. "Dead grid" false positive drove the recenter loop -- CRITICAL
+**Evidence:** 89 `DEAD GRID INSIDE BAND` recenters, median 196s apart, while the
+position sat unchanged at 9148 for over an hour.
+
+`recenter()` treated "no active buys + all sells above price" as a grid that can
+never fill. But that is the **normal, healthy state of a capped long unwinding**:
+the position limit deliberately blocks the buy side (`POSITION LIMIT | long
+9148 >= 8197 -- buy orders blocked`) and the exit sells rest above price
+precisely so they fill when price ticks up. Declaring it dead made recenter fire
+on every cooldown expiry -- and because `recenter()` calls `pause()`, which
+cancels every open order, **it destroyed the exit orders that were about to
+fill**. The position could not unwind; it was cancelled and re-posted every 196
+seconds, ~20 order writes per cycle, all night.
+
+**Fix:** the dead-grid test now requires the missing side to be missing *for no
+reason* -- not blocked by the position cap (`_block_buys`/`_block_sells`) and
+with no inventory whose exit orders explain the imbalance. The genuine failure
+it was written for (idle grid, no position, price stranded past every resting
+order) still triggers, and is covered by
+`test_genuinely_dead_grid_still_recenters`.
+
+### 14. Trailing stop-loss was not a ratchet -- HIGH (safety-relevant)
+**Evidence:** long open continuously from 22:36; `SL STATUS` shows
+sl=0.07003181 -> 0.06965351 -> 0.06921701 -> 0.06912001 -> **0.06905211**.
+
+`update_trailing_sl` recomputed the level from scratch each call as
+`max(grid_lower * (1 - stop_loss_pct), peak * (1 - trigger))`. Both inputs move
+down when the grid recenters downward, so the "stop" followed price down. A
+trailing stop must be monotonic while a position is open -- one that slides down
+in a downtrend can never be hit, which is exactly when it is the only protection
+left.
+
+**Fix:** both directions now ratchet (`max(...)` for long, `min(...)` for short)
+against the previously published level. `reset_trailing()` on a side flip
+remains the one sanctioned release.
+
+### 15. `recenter()` wiped the trailing anchor mid-position -- HIGH
+`recenter()` unconditionally set `_peak_price = current_price` and
+`_trailing_sl_price = None`. With #13 firing every 196s the high-water mark was
+continuously handed back to the market, which is the mechanism behind #14.
+
+**Fix:** only re-anchor when flat (`_net_long_qty <= 0 and _net_short_qty <= 0`).
+
+### 16. Stop-loss rebuilt on every partial fill -- MEDIUM
+`_sl_needs_update` returned True on any quantity delta down to 1e-6 relative, and
+`_refresh_sl_stops` is cancel-then-place -- so **every partial fill opened a
+~1s window with no stop on the book**, dozens of times per hour.
+
+Stops are `reduceOnly`, so a stop *larger* than the position is harmless (it
+closes whatever remains); only under-coverage is real exposure. The check now
+always refreshes when the stop no longer covers the position or the trigger
+price moved, and tolerates over-coverage up to 10% before resizing.
+
+**Tests:** `tests/test_grid_diagnosis.py` (new, 16 tests) pins all six. Verified
+adversarially: with the fixes stashed, 9 of the 16 fail against the original
+code -- including the exact production states (`capped long with exit sells is
+not a dead grid`, `unwind slices the position not the grid notional`,
+`replacement sell is not reduce only while net short`).
+
+### Not changed (diagnosed, no defect found)
+- **Fee units.** `maker_fee_pct=0.02` in `.env` is *percent*; `main.py` converts
+  with `/100` at every `GridEngine` construction site. Verified against the log:
+  fill #1341 charged 0.047841 on (0.07091+0.07168) x 1681, implying a 0.0002
+  rate. Correct.
+- **`_cycle_pnl` sign convention.** `-delta * qty` for shorts is right.
+- **Balance/equity figures.** Already sourced from `fetch_balance()` (issues
+  #9/#10); the numbers in the log are the real account's.
+- **`regime=uncertain` with `grid=ON`.** By design: only `is_trending()` pauses
+  the grid, `uncertain` does not. Flagged as a tuning question, not a bug -- but
+  see the recommendation below.
+
 ## Recommendation
 
 The fixes above are all defensive/correctness fixes with no strategy changes
@@ -363,3 +493,29 @@ days on `configs/defensive.env` first, and keep an eye on the first
 activity (it bootstraps by re-deriving from the reconciler's persisted
 `pnl_reconciler` state, not a fresh zero, so a same-day restart should show
 continuity rather than a reset).
+
+### What to watch on the next run (issues #11-#16)
+
+These six are correctness fixes to existing mechanisms, not strategy changes,
+but they change behaviour visibly. Confirm on the next session:
+
+1. `DEAD GRID INSIDE BAND` should become **rare**. If it still fires on a
+   cadence close to `RECENTER_COOLDOWN` (180s), the loop is not fully closed --
+   capture the surrounding 200 lines before restarting.
+2. `ReduceOnly Order is rejected` should approach **zero**. A residual few are
+   expected from genuine races (a position closing between the position read and
+   the placement); a steady stream is not.
+3. `SL STATUS` for a continuously-open position must show `sl=` **monotonic** --
+   non-decreasing for a long, non-increasing for a short. Any reversal while the
+   position stays open means the ratchet is still leaking somewhere.
+4. `UNWIND | ... rides through N levels (placed=M)` should show `M == N` (or M
+   short only because slices fell under the 5 USDT minimum), never M < N due to
+   rejections.
+
+The underlying economics are unchanged and still unfavourable: the account is
+net negative because commission (-42.68 over the reconciled window) exceeds
+gross realized gains, at ~370 fills/day on a 1.95%-wide grid. These fixes stop
+the bot from *destroying its own exit orders* and from trading with a stop that
+slides downward — they do not make a fee-losing configuration profitable. Once
+the run is clean, the next lever is trade frequency vs. spacing (widen
+`RANGE_MIN_SPACING_PCT` / reduce `GRID_COUNT`), not more plumbing.

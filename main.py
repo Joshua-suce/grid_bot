@@ -526,6 +526,14 @@ def run_bot() -> None:
                 sl_orders["trail"]["price"],
             )
 
+    # Refreshing a stop means cancel-then-place, which leaves the position unprotected
+    # for the round trip. Rebuilding on every quantity change made that gap recur on
+    # literally every partial fill. Stops are reduceOnly, so a stop LARGER than the
+    # position is harmless (it closes whatever remains) -- only under-coverage is a
+    # real exposure. So: always refresh when the stop no longer covers the position or
+    # the trigger price moved; tolerate over-coverage until it drifts materially.
+    SL_OVER_COVERAGE_TOLERANCE = 0.10
+
     def _sl_needs_update(side: str, qty: float) -> bool:
         if not sl_orders:
             return True
@@ -536,10 +544,12 @@ def run_bot() -> None:
             cur = sl_orders.get(kind)
             if cur is None:
                 return True
-            if abs(cur["qty"] - oqty) > max(1e-8, oqty * 1e-6):
-                return True
             if abs(cur["price"] - oprice) > max(oprice * 0.001, 1e-8):
                 return True
+            if cur["qty"] < oqty - max(1e-8, oqty * 1e-6):
+                return True  # under-covered: the position outgrew its stop
+            if cur["qty"] > oqty * (1 + SL_OVER_COVERAGE_TOLERANCE) + 1e-8:
+                return True  # stale oversized stop, resize to keep sizing honest
         return False
 
     position_side, position_qty = get_net_position(exchange, settings.symbol)
