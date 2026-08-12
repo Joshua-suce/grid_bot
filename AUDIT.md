@@ -894,6 +894,124 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 32. The bot sold its own inventory at a loss to keep the ladder tidy -- HIGH
+
+From the 2026-08-12 22:04 demo run. Price fell out of the grid, the ladder was rebuilt
+lower, and the unwind spread the open long across the new sell levels:
+
+```
+22:04:34 RECENTERING GRID | price 0.06902 outside [0.06904107-0.07165893]
+22:05:01 UNWIND | long 10456.0 reduce-only SELL @ 0.06928 (entry=0.06962068)
+22:05:01 UNWIND | long 10456.0 reduce-only SELL @ 0.06954 (entry=0.06962068)
+22:05:03 UNWIND | long 10456.0 reduce-only SELL @ 0.06981 (entry=0.06962068)
+...
+22:07:38 FILL #13 | SELL @ 0.06928 | profit=-0.712368
+22:07:40 FILL #14 | SELL @ 0.06954 | profit=-0.168708
+```
+
+Two of the five exits were priced **below the position's own average entry**. Both
+filled. -0.88 realised, against a session total of -1.83 -- roughly half the loss, and
+entirely self-inflicted: the hard stop was at 0.06697, nowhere near, and price was back
+above 0.0694 within four minutes.
+
+`_unwind_position_through_grid` exists precisely to avoid realising a loss on recenter,
+which is why the docstring says it beats market-closing. But it took `level.price`
+without ever comparing it to `entry`. Recentring *downward* while holding a long moves
+the whole exit ladder below cost, so the function did exactly what it was written to
+prevent, one limit order at a time.
+
+The engine's other profitability check does not catch this. `_is_level_profitable`
+compares grid *spacing* against fees -- whether a round trip is worth doing at all. It
+knows nothing about what the open position cost.
+
+### The rule
+
+Binance nets everything into a single position at one blended average entry (the same
+truth AUDIT #7/#8 turned on). So a sell below that average realises a loss no matter
+which level the engine has internally paired it with. Two guards now enforce that:
+
+- `_unwind_position_through_grid` filters exit levels to those clearing break-even
+  before slicing the position across them, so the position is spread over the levels
+  that actually pay rather than the first N in the list.
+- `_place_order_for_level` applies the same test, because the unwind is not the only
+  route to the mistake: after a downward recenter the *ordinary* ladder has sell levels
+  below cost too.
+
+Break-even is the average entry plus one round trip of maker fees, read from the
+exchange with a 2-second cache -- internal per-level bookkeeping is exactly the thing
+that drifts, and this decides whether an order is allowed to lose money. An unreadable
+position returns "no constraint", so an API failure cannot silently freeze the grid.
+
+A grid is allowed to sit on inventory and wait; that is what its levels are for. What
+it must not do is book a loss to tidy the ladder. If price never returns, the hard stop
+-- not an exit ladder priced below cost -- is what closes the position.
+
+### Measured
+
+DOGE 1h, 90 days, 12 start offsets, current `.env`:
+
+| mode | mean | sd | sem | positive | fills | max dd |
+|---|---|---|---|---|---|---|
+| grid + filter, sells below cost allowed | 28.64 | 44.17 | 12.75 | 8/12 | 514 | 1.29% |
+| grid + filter, break-even guard | **40.00** | 59.93 | 17.30 | 8/12 | 491 | 1.27% |
+| router, sells below cost allowed | 14.09 | 48.59 | 14.03 | 8/12 | 500 | 1.46% |
+| router, break-even guard | 4.92 | 35.96 | 10.38 | 7/12 | 490 | 1.46% |
+
+The guard helps grid mode by +11.36 and costs router mode -9.17. Both are well under
+one standard error on overlapping samples, so **the backtest does not settle this
+either way**; what it does show is that refusing ~4% of fills costs nothing in
+drawdown (1.29% -> 1.27%, 1.46% -> 1.46%).
+
+The change is kept regardless of that, and the reasoning is not statistical. Selling
+below your own cost is not a parameter to tune -- it is the bot paying to make its
+bookkeeping neat. The live evidence is one unambiguous event: -0.88 realised in four
+minutes on a position that was never in danger. A 12-sample backtest is not grounds for
+keeping a mechanism that does that.
+
+### 33. "uncertain" was the normal state, and nothing said so
+
+The same run logged `regime=uncertain` for its entire 90 minutes. Not a fault -- but the
+router sends `uncertain` to the grid, so the trend follower was never once eligible, and
+nothing in the log explained why.
+
+Two gates have to pass, and both are strict. Each timeframe classifies as trending only
+at `ADX >= 30` and ranging only at `ADX <= 15`; **everything between is `uncertain` by
+definition**, and that band is half the usable ADX range. Then `_merge_timeframes`
+requires two of the three timeframes (30m, 1h, 1d) to agree. Three independent readings
+each having to clear the same band, twice over, makes `uncertain` the default outcome
+rather than an edge case.
+
+Nothing was changed about the thresholds -- the backtests below say more switching is
+not obviously better, and retuning them on one symbol and period would be fitting noise.
+What changed is that the state is now legible:
+
+- `TrendFilter.explain()` reports each timeframe's regime, its ADX, the band edges, and
+  the agreement rule.
+- main.py logs that line every regime check, and the status line carries the live ADX:
+  `regime=uncertain(adx=21.4)`.
+
+So "why is the trend follower never running" is now answerable from the log rather than
+from the source.
+
+Also fixed here: `BUY SCALE` was logged on every iteration. The position cap moves with
+equity, so an exact float comparison always differed; it now compares at the precision
+the message prints.
+
+Relaxing the trend threshold so the follower runs more often, same 12 offsets:
+
+| adx_trend_threshold | mean | sd | sem | positive | fills | max dd |
+|---|---|---|---|---|---|---|
+| 30 (current) | 4.92 | 35.96 | 10.38 | 7/12 | 490 | 1.46% |
+| 25 | **-51.75** | 64.70 | 18.68 | 3/12 | 455 | 2.33% |
+| 20 | 10.72 | 23.92 | 6.91 | 8/12 | 334 | 1.14% |
+
+30 -> 25 collapses, 25 -> 20 recovers past the start. A monotone knob does not behave
+like that; this is the noise floor, measured. Reading a recommendation out of it would
+be fitting one symbol and one 90-day window, so the thresholds stay where they are and
+the state is merely made visible instead.
+
+---
+
 ## 31. Router mode crashed every iteration on a private attribute -- CRITICAL
 
 The 19:22 demo run placed its ten orders, logged `GRID ACTIVATED`, and then produced

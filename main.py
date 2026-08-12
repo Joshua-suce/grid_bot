@@ -876,6 +876,8 @@ def run_bot() -> None:
                     except Exception:
                         pass
 
+                    logger.info("REGIME | {} -> {}", trend.explain(), trend.regime.value)
+
                     if trend.regime.value != old_regime:
                         events.trend_change(old_regime, trend.regime.value, trend.adx_value, settings.trend_timeframe)
                         notifier.on_trend_change(old_regime, trend.regime.value, trend.adx_value)
@@ -1151,7 +1153,8 @@ def run_bot() -> None:
                     grid.total_pnl - grid.total_fees,
                     pnl_reconciler.net_realized_pnl, pnl_reconciler.daily_net_pnl,
                     balance, equity,
-                    "ON" if grid.active else "OFF", trend.regime.value,
+                    "ON" if grid.active else "OFF",
+                    f"{trend.regime.value}(adx={trend.adx_value:.1f})",
                     grid.get_spread_pct() * 100,
                 )
 

@@ -145,6 +145,8 @@ class GridEngine:
         self._trailing_sl_price: float | None = None
         self._trailing_sl_trigger: float = trailing_sl_trigger_pct
         self._peak_price = 0.0
+        self._break_even_cache: tuple[str, float] | None = None
+        self._break_even_time = 0.0
         self._trough_price = 0.0
         self._trailing_sl_price_short: float | None = None
         # Ratcheted static stop levels. See get_hard_stop_loss_price -- recenter moves
@@ -237,7 +239,10 @@ class GridEngine:
                 "POSITION LIMIT | long {} >= {} — buy orders blocked",
                 round(long_position, 2), round(max_position_qty, 2),
             )
-        elif self._buy_scale != old_buy_scale and self._buy_scale < 1.0:
+        # Rounded to the precision the message itself prints. The cap moves with equity
+        # every iteration, so an exact comparison logged BUY SCALE on every single loop
+        # -- 0.53, 0.53, 0.52, 0.53 -- burying the lines that matter (AUDIT #33).
+        elif round(self._buy_scale, 2) != round(old_buy_scale, 2) and self._buy_scale < 1.0:
             logger.info("BUY SCALE | long={:.1f}/{:.1f} | scale={:.2f}", long_position, max_position_qty, self._buy_scale)
 
         if self._block_sells and not old_block_sells:
@@ -245,7 +250,7 @@ class GridEngine:
                 "POSITION LIMIT | short {} >= {} — sell orders blocked",
                 round(short_position, 2), round(max_position_qty, 2),
             )
-        elif self._sell_scale != old_sell_scale and self._sell_scale < 1.0:
+        elif round(self._sell_scale, 2) != round(old_sell_scale, 2) and self._sell_scale < 1.0:
             logger.info("SELL SCALE | short={:.1f}/{:.1f} | scale={:.2f}", short_position, max_position_qty, self._sell_scale)
 
     @staticmethod
@@ -500,6 +505,73 @@ class GridEngine:
         round_trip_fees = 2 * self.maker_fee_pct * level_price
         return expected_profit > round_trip_fees * self._min_profit_multiplier
 
+    def _position_break_even(self) -> tuple[str, float] | None:
+        """Return (side, break_even_price) for the open position, or None when flat.
+
+        The exchange nets everything into one position at one blended average entry,
+        so *any* sell below that average realises a loss on a long, no matter which
+        grid level the engine has paired it with internally. Break-even here means the
+        average entry plus the round trip's fees.
+
+        Read from the exchange, cached briefly: internal per-level bookkeeping is
+        exactly the thing that drifts (AUDIT #7/#8), and this decides whether an order
+        is allowed to lose money.
+        """
+        now = time.time()
+        if (now - self._break_even_time) < 2.0:
+            return self._break_even_cache
+        try:
+            positions = self.exchange.get_positions(self.symbol)
+        except Exception:
+            # Unknown position: do not claim break-even. The caller treats None as
+            # "no constraint", which is the pre-existing behaviour, not a new risk.
+            return self._break_even_cache
+
+        result = None
+        for pos in positions:
+            side = pos.get("side", "")
+            qty = float(pos.get("contracts", 0) or 0)
+            entry = float(pos.get("entryPrice", 0) or 0)
+            if qty == 0 or entry <= 0:
+                continue
+            if qty < 0:
+                side = "short" if side == "long" else "long"
+                qty = abs(qty)
+            fees = 2 * self.maker_fee_pct
+            if side == "long":
+                result = ("long", entry * (1 + fees))
+            elif side == "short":
+                result = ("short", entry * (1 - fees))
+            break
+
+        self._break_even_cache = result
+        self._break_even_time = now
+        return result
+
+    def _would_realise_a_loss(self, side: str, price: float) -> bool:
+        """Would an order on `side` at `price` close part of the open position at a loss?
+
+        This is the guard AUDIT #32 added. On 2026-08-12 a downward recenter rebuilt the
+        ladder below a long held at 0.06962 and then sold into it at 0.06928 and 0.06954
+        -- reduce-only orders the bot placed itself, for -0.88 realised, over half that
+        session's entire loss. The position was not in trouble: the stop was far below
+        and price recovered within minutes.
+
+        A grid is allowed to sit on inventory and wait; that is what its levels are for.
+        What it must not do is voluntarily book a loss to keep the ladder tidy. If price
+        never comes back, the hard stop -- not an exit ladder priced below cost -- is
+        what closes the position.
+        """
+        be = self._position_break_even()
+        if be is None:
+            return False
+        pos_side, break_even = be
+        if pos_side == "long" and side == "sell":
+            return price < break_even
+        if pos_side == "short" and side == "buy":
+            return price > break_even
+        return False
+
     def _existing_open_order(self, price: float, side: str) -> dict | None:
         """Return an open exchange order already resting at the same price+side, if any.
 
@@ -531,6 +603,15 @@ class GridEngine:
             return False
         if level.side == "sell" and self._block_sells:
             logger.debug("SKIP SELL ORDER | short position limit reached")
+            return False
+        if self._would_realise_a_loss(level.side, level.price):
+            be = self._position_break_even()
+            logger.info(
+                "SKIP {} @ {} | below break-even {} on the open {} — would book a loss "
+                "to close inventory the grid is meant to wait out (AUDIT #32)",
+                level.side.upper(), level.price,
+                round(be[1], 8) if be else None, be[0] if be else None,
+            )
             return False
         if not self._is_level_profitable(level.price):
             logger.info(
@@ -846,11 +927,33 @@ class GridEngine:
                 continue
 
             exit_side = "sell" if side == "long" else "buy"
-            levels = [l for l in self.levels if l.side == exit_side and l.order_id is None]
+            free = [l for l in self.levels if l.side == exit_side and l.order_id is None]
+
+            # Only levels that actually clear cost. Unwinding through the grid exists to
+            # avoid realising the loss a market close would have taken; a level priced
+            # below break-even does the same thing, just slower. On 2026-08-12 a
+            # downward recenter placed reduce-only sells at 0.06928 and 0.06954 against
+            # a long held at 0.06962 -- both filled, -0.88 realised, over half that
+            # session's loss, on a position whose stop was far below and which price
+            # recovered past within minutes (AUDIT #32).
+            fees = 2 * self.maker_fee_pct
+            break_even = entry * (1 + fees) if side == "long" else entry * (1 - fees)
+            levels = [
+                l for l in free
+                if ((l.price >= break_even) if side == "long" else (l.price <= break_even))
+            ]
+            skipped = len(free) - len(levels)
+            if skipped:
+                logger.info(
+                    "UNWIND | {} of {} {} level(s) sit below break-even {} (entry {}) — "
+                    "leaving them empty rather than booking the loss",
+                    skipped, len(free), exit_side, round(break_even, 8), round(entry, 8),
+                )
             if not levels:
                 logger.warning(
-                    "UNWIND | no free {} levels to absorb {} {} position @ {} — position rides unhedged",
-                    exit_side, side, amt, round(entry, 8),
+                    "UNWIND | no {} level above break-even {} to absorb {} {} @ {} — "
+                    "position waits for price to recover; the hard stop is the backstop",
+                    exit_side, round(break_even, 8), side, amt, round(entry, 8),
                 )
                 continue
 

@@ -220,3 +220,131 @@ def test_profitability_gate_uses_round_trip_not_single_leg_fees():
 
     single_leg = grid.maker_fee_pct * price
     assert grid._is_level_profitable(price) is (grid.grid_spacing > 2 * single_leg)
+
+
+# --- #32: never book a loss to keep the ladder tidy ------------------------
+
+class _PositionExchange:
+    """Stub reporting one open long, as Binance does: netted, one blended entry."""
+
+    def __init__(self, qty=10456.0, entry=0.06962068):
+        self.qty = qty
+        self.entry = entry
+        self.placed: list[dict] = []
+        self._next = 0
+
+    class exchange:
+        @staticmethod
+        def amount_to_precision(symbol, amount):
+            return f"{float(amount):.0f}"
+
+        @staticmethod
+        def price_to_precision(symbol, price):
+            return f"{float(price):.5f}"
+
+    def get_positions(self, symbol):
+        if self.qty == 0:
+            return []
+        return [{"side": "long", "contracts": self.qty, "entryPrice": self.entry}]
+
+    def get_open_orders(self, symbol):
+        return []
+
+    def get_open_order_ids(self, symbol):
+        return set()
+
+    def can_place_order(self, symbol):
+        return True
+
+    def get_balance(self):
+        return 4900.0
+
+    def place_limit_order(self, symbol, side, price, amount, max_attempts=3,
+                          params=None, post_only=True, allow_taker_fallback=False):
+        self._next += 1
+        order = {"id": f"o{self._next}", "side": side, "price": price, "amount": amount}
+        self.placed.append(order)
+        return order
+
+
+def _engine_with_position(ex, lower=0.06771107, upper=0.07032893):
+    from grid import GridEngine
+
+    engine = GridEngine(
+        exchange=ex, symbol="DOGEUSDT",
+        grid_lower=lower, grid_upper=upper, grid_count=10,
+        capital_per_grid_pct=0.018, stop_loss_pct=0.03,
+    )
+    engine.initialize((lower + upper) / 2, balance=4900.0)
+    return engine
+
+
+def test_unwind_does_not_sell_below_the_blended_entry():
+    """AUDIT #32, replaying the 2026-08-12 22:04 recenter exactly.
+
+    Price fell out of the grid, the ladder was rebuilt lower, and the unwind placed
+    reduce-only sells at 0.06928 and 0.06954 against a long whose average entry was
+    0.06962068. Both filled: -0.712368 and -0.168708, over half the whole session's
+    loss. The position was not in trouble -- the hard stop sat at 0.06697 and price was
+    back above 0.0694 within minutes.
+
+    Binance nets everything into one position at one average entry, so a sell below it
+    realises a loss no matter which level the engine has paired it with.
+    """
+    ex = _PositionExchange(qty=10456.0, entry=0.06962068)
+    engine = _engine_with_position(ex)
+
+    engine._unwind_position_through_grid(4900.0)
+
+    sells = [o for o in ex.placed if o["side"] == "sell"]
+    assert sells, "placed no exit orders at all"
+    break_even = 0.06962068 * (1 + 2 * engine.maker_fee_pct)
+    below = [o["price"] for o in sells if o["price"] < break_even]
+    assert below == [], f"unwind sold below break-even {break_even:.8f} at {below}"
+
+
+def test_unwind_places_nothing_rather_than_dumping_when_every_level_is_underwater():
+    """A whole ladder below cost means wait, not sell. The hard stop is the backstop."""
+    ex = _PositionExchange(qty=10456.0, entry=0.08000)
+    engine = _engine_with_position(ex)
+
+    engine._unwind_position_through_grid(4900.0)
+
+    assert [o for o in ex.placed if o["side"] == "sell"] == []
+
+
+def test_the_grid_will_not_place_a_sell_below_break_even_while_long():
+    """The unwind is not the only path to the same mistake: after a downward recenter
+    the ordinary ladder has sell levels below the open position's cost too."""
+    ex = _PositionExchange(qty=10456.0, entry=0.06962068)
+    engine = _engine_with_position(ex)
+
+    engine.place_initial_orders(4900.0)
+
+    break_even = 0.06962068 * (1 + 2 * engine.maker_fee_pct)
+    bad = [o["price"] for o in ex.placed if o["side"] == "sell" and o["price"] < break_even]
+    assert bad == [], f"grid placed losing sells at {bad}"
+
+
+def test_a_flat_engine_is_completely_unconstrained():
+    """No position, no break-even, no new restriction -- the ordinary grid is unchanged."""
+    ex = _PositionExchange(qty=0.0)
+    engine = _engine_with_position(ex)
+
+    placed = engine.place_initial_orders(4900.0)
+
+    assert placed > 0
+    assert any(o["side"] == "sell" for o in ex.placed)
+    assert any(o["side"] == "buy" for o in ex.placed)
+
+
+def test_an_unreadable_position_does_not_silently_block_the_grid():
+    """If the position cannot be read we must not invent a break-even and freeze."""
+    class Unreadable(_PositionExchange):
+        def get_positions(self, symbol):
+            raise RuntimeError("API down")
+
+    ex = Unreadable(qty=10456.0)
+    engine = _engine_with_position(ex)
+
+    assert engine._would_realise_a_loss("sell", 0.0680) is False

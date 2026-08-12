@@ -95,6 +95,7 @@ class TrendFilter:
         self.last_check = 0.0
         self.adx_value = 0.0
         self._timeframes: dict[str, MarketRegime] = {}
+        self._adx_by_timeframe: dict[str, float] = {}
         self._ohlcv: dict[str, pd.DataFrame] = {}
         self._pending_regime: MarketRegime | None = None
         self._pending_since: float = 0.0
@@ -175,6 +176,7 @@ class TrendFilter:
     def update(self, ohlcv: pd.DataFrame, timeframe: str = "4h") -> MarketRegime:
         regime, adx_val = self._evaluate_timeframe(ohlcv)
         self._timeframes[timeframe] = regime
+        self._adx_by_timeframe[timeframe] = adx_val
         self.adx_value = adx_val
         self._last_ohlcv = ohlcv
         self._ohlcv[timeframe] = ohlcv
@@ -222,6 +224,28 @@ class TrendFilter:
         self.last_check = time.time()
         return self.regime
 
+    def explain(self) -> str:
+        """One line saying why the regime is what it is.
+
+        'uncertain' is the default outcome here, not an edge case, and nothing in the
+        logs said so. Two independent gates have to pass: each timeframe needs ADX
+        outside the band (>= trend_threshold to trend, <= range_threshold to range --
+        everything between is uncertain by definition), and then two of the three
+        timeframes have to agree. A whole session can sit in 'uncertain' with the trend
+        follower never once eligible, which looks like a dormant bot rather than an
+        undecided market (AUDIT #33).
+        """
+        if not self._timeframes:
+            return "no timeframes evaluated yet"
+        parts = [
+            f"{tf}={regime.value}(adx={self._adx_by_timeframe.get(tf, 0.0):.1f})"
+            for tf, regime in self._timeframes.items()
+        ]
+        return (
+            f"{' '.join(parts)} | bands: range<={self.range_threshold:g} "
+            f"trend>={self.trend_threshold:g} | needs 2 of {len(self._timeframes)} to agree"
+        )
+
     def _merge_timeframes(self) -> MarketRegime:
         if not self._timeframes:
             return MarketRegime.UNCERTAIN
@@ -249,6 +273,7 @@ class TrendFilter:
     def add_timeframe(self, ohlcv: pd.DataFrame, timeframe: str) -> None:
         regime, adx_val = self._evaluate_timeframe(ohlcv)
         self._timeframes[timeframe] = regime
+        self._adx_by_timeframe[timeframe] = adx_val
         self._ohlcv[timeframe] = ohlcv
         if self._last_ohlcv is None:
             self._last_ohlcv = ohlcv
