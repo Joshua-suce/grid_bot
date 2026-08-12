@@ -20,6 +20,7 @@ from trade_journal import TradeJournal
 from event_journal import EventJournal
 from pnl_tracker import PnLReconciler
 from router import StrategyRouter
+from signals import SignalGenerator
 from trend_follower import TrendFollower
 
 
@@ -369,6 +370,20 @@ def run_bot() -> None:
         confirmation_seconds=settings.trend_confirmation_seconds,
         flat_range_window=settings.flat_range_window,
         flat_range_pct=settings.flat_range_pct,
+    )
+
+    # Deliberately given no exchange handle -- it reports on regime changes and cannot
+    # act on them. See signals.py.
+    signal_gen = (
+        SignalGenerator(
+            symbol=settings.symbol,
+            log_dir=settings.log_dir,
+            notifier=notifier,
+            event_journal=events,
+            notify=settings.signals_notify,
+        )
+        if settings.signals_enabled
+        else None
     )
 
     risk = RiskManager(
@@ -847,6 +862,15 @@ def run_bot() -> None:
                         events.trend_change(old_regime, trend.regime.value, trend.adx_value, settings.trend_timeframe)
                         notifier.on_trend_change(old_regime, trend.regime.value, trend.adx_value)
 
+                    # Read-only: records the call and scores the previous one. Called
+                    # unconditionally -- it does its own change detection, and the first
+                    # call establishes a baseline rather than emitting a phantom signal.
+                    if signal_gen is not None:
+                        try:
+                            signal_gen.observe(trend.regime.value, price, trend.adx_value)
+                        except Exception as e:
+                            logger.debug("SIGNAL | observe failed: {}", e)
+
                     atr_series = calc_atr(ohlcv_tf["high"], ohlcv_tf["low"], ohlcv_tf["close"], period=14)
                     current_atr = float(atr_series.iloc[-1]) if not np.isnan(atr_series.iloc[-1]) else price * 0.02
                     grid.update_volatility(current_atr / price)
@@ -1178,6 +1202,11 @@ def run_bot() -> None:
                 state_mgr.save(state_data)
         except Exception as e:
             logger.error("Failed to save state on shutdown: {}", e)
+        if signal_gen is not None:
+            try:
+                signal_gen.log_accuracy()
+            except Exception as e:
+                logger.debug("SIGNAL | accuracy report failed: {}", e)
         notifier.close()
         logger.info("Bot stopped. State saved.")
 

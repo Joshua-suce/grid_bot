@@ -216,6 +216,24 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Signals (read-only observer) ---
+    signals_enabled: bool = Field(
+        default=True,
+        description=(
+            "Record what each confirmed regime change implied, and score it against "
+            "what price did before the next one. Costs nothing -- the observer has no "
+            "exchange handle and cannot place orders -- and the accuracy it accumulates "
+            "is the evidence the router's thresholds currently lack (AUDIT.md #24)."
+        ),
+    )
+    signals_notify: bool = Field(
+        default=False,
+        description=(
+            "Push actionable signals to Telegram. Off by default: the CSV is the point, "
+            "and alerting on every regime flip trains you to ignore the channel."
+        ),
+    )
+
     # --- Polling ---
     poll_interval: int = Field(default=30, ge=5, le=300, description="Seconds between fill checks")
     force_trade_now: bool = Field(default=False, description="If true, bypass trend gating and activate grid immediately.")
