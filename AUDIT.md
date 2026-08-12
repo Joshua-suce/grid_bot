@@ -894,6 +894,46 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## Where the bot stands after #29-#33
+
+Full walk-forward at HEAD, driven from the live `.env` (`STRATEGY_MODE=router`,
+`GRID_COUNT=10`, `MIN_PROFIT_MULTIPLIER=3.0`, `ADX 15/30`), 12 start offsets per
+instrument, 90 days of 1h candles. DOGE is the instrument everything was developed
+against; ETH and SOL are out of sample.
+
+| instrument | mode | mean | sem | positive | fills | in position | max dd | stops | return on 5000 |
+|---|---|---|---|---|---|---|---|---|---|
+| DOGE | grid + filter | **40.00** | 17.30 | 8/12 | 491 | 83% | 1.27% | 18.4 | +0.80% |
+| DOGE | router | 4.92 | 10.38 | 7/12 | 490 | 82% | 1.46% | 17.3 | +0.10% |
+| ETH | grid + filter | 14.90 | 14.13 | 9/12 | 666 | 84% | 1.67% | 19.5 | +0.30% |
+| ETH | router | **28.67** | 14.34 | 8/12 | 708 | 87% | 1.62% | 18.8 | +0.57% |
+| SOL | grid + filter | 24.41 | 21.04 | 6/12 | 789 | 84% | 1.58% | 24.9 | +0.49% |
+| SOL | router | **26.91** | 17.10 | 8/12 | 812 | 89% | 2.38% | 19.4 | +0.54% |
+
+What this does and does not say:
+
+- **All six are positive.** At the start of this sequence the router averaged -43 on
+  DOGE and the grid alone -83 on the same data. That is the whole delta from #29-#33.
+- **Router mode is defensible out of sample.** It loses badly to the filter on DOGE
+  (+4.92 vs +40.00, the one instrument everything was tuned against) and wins on both
+  instruments that were not (+28.67 vs +14.90, +26.91 vs +24.41). Positive-window
+  counts are identical across all three: 23 of 36 each. Nothing here justifies changing
+  `STRATEGY_MODE` in either direction.
+- **The returns are small.** +0.10% to +0.80% of capital over 90 days -- roughly 0.4% to
+  3.3% annualised, before any of the costs the harness does not model.
+- **A single run can lose.** The standard error is the same size as the mean nearly
+  everywhere, and about a third of the 36 windows per mode finished negative. "Positive
+  on average across 12 overlapping windows" is not "will not lose over the next month".
+- **It carries inventory almost all the time** (82-89% in position) and takes ~18-25
+  stop-outs per 90 days. The equity path is shallow (max drawdown 1.3-2.4%) because
+  position size is capped, not because it exits early.
+
+Known limits of the harness, unchanged and all of which make these numbers
+**optimistic**: no slippage or order-book depth, no partial fills, no funding, one
+candle per loop iteration, and main.py's kill switches are not simulated.
+
+---
+
 ## 32. The bot sold its own inventory at a loss to keep the ladder tidy -- HIGH
 
 From the 2026-08-12 22:04 demo run. Price fell out of the grid, the ladder was rebuilt

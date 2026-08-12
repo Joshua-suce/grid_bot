@@ -348,3 +348,51 @@ def test_an_unreadable_position_does_not_silently_block_the_grid():
     engine = _engine_with_position(ex)
 
     assert engine._would_realise_a_loss("sell", 0.0680) is False
+
+
+def test_buying_is_never_blocked_by_the_guard_so_it_unsticks_itself():
+    """The guard restricts the *closing* side only, and that is what stops it becoming
+    a dormancy trap.
+
+    Holding a long at 0.06962, sells below cost are refused -- but the grid keeps
+    buying underneath. Each lower buy drags the blended average entry down, which drags
+    break-even down with it, which makes previously-refused sell levels eligible. The
+    position works its own way out instead of waiting on one price level.
+    """
+    ex = _PositionExchange(qty=10456.0, entry=0.06962068)
+    engine = _engine_with_position(ex)
+
+    engine.place_initial_orders(4900.0)
+    assert [o for o in ex.placed if o["side"] == "buy"], "guard blocked the buy side"
+
+    high = engine._position_break_even()[1]
+    ex.entry = 0.06900          # the lower buys filled; average entry drops
+    engine._break_even_time = 0.0
+    low = engine._position_break_even()[1]
+
+    assert low < high, "break-even did not follow the average entry down"
+
+
+def test_the_stop_loss_path_is_untouched_by_the_guard():
+    """Refusing to sell below cost must not also refuse to protect the position. Stops
+    are placed by main.py straight through the exchange, never as grid levels, so the
+    backstop survives however long the grid waits."""
+    import inspect
+
+    import grid as grid_module
+
+    callers = [
+        name for name, fn in inspect.getmembers(grid_module.GridEngine, inspect.isfunction)
+        if "_would_realise_a_loss(" in inspect.getsource(fn) and name != "_would_realise_a_loss"
+    ]
+    assert sorted(callers) == ["_place_order_for_level"], (
+        f"the break-even guard reached beyond order placement into {callers}"
+    )
+
+    # And the stop prices themselves never consult it.
+    for name in ("get_stop_loss_price", "get_hard_stop_loss_price",
+                 "get_short_stop_loss_price", "get_short_hard_stop_loss_price"):
+        src = inspect.getsource(getattr(grid_module.GridEngine, name))
+        assert "_would_realise_a_loss" not in src and "_position_break_even" not in src, (
+            f"{name} consults the break-even guard -- protection must not depend on it"
+        )
