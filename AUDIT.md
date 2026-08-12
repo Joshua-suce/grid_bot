@@ -838,19 +838,64 @@ grid-specific -- so adding a new coupling to main.py fails the suite until someo
 decides which side of the line it belongs on. That is the mechanism that stops this
 abstraction rotting the way an undocumented interface would.
 
-### Steps 3 and 4 -- deliberately not built yet
+---
 
-**Step 3 (a trend-following strategy)** and **step 4 (the regime router)** are scoped
-but unbuilt. Two reasons, one practical and one evidential:
+## Trend follower (issue #23) and regime router (issue #24) -- steps 3 and 4
 
-- The router's switching thresholds are the parameters that would decide everything,
-  and the backtest evidence above shows the noise floor (sd 50-126) exceeds the effect
-  sizes (~40) on a single symbol and period. Tuning a router on that would repeat
-  exactly the mistake the harness caught. Walk-forward evaluation across more
-  instruments has to come first.
-- Step 4 also requires the handoff state machine (cancel -> flatten -> verify flat ->
-  hand over) inside main.py's trading loop. That is the highest-risk edit in the
-  project and warrants a dedicated pass, not the tail of a long session.
+`trend_follower.py` is the grid's complement: it holds one position in the direction of
+a confirmed trend, exits on a ratcheted ATR-scaled trailing stop or when the regime
+stops supporting the side. It exists because the bot previously *detected* trends and
+responded by switching off, leaving capital idle through every trend.
+
+Its fee rule is the opposite of the grid's, for the opposite reason. Grid levels must
+never cross (AUDIT #17) because a level earns one grid spacing and a taker fee consumes
+a large share of it. A trend position targets multiples of ATR, so 0.04% is noise and
+missing the entry costs far more -- entries and exits therefore cross deliberately.
+
+Deliberately absent: pyramiding, partial exits, re-entry after a stop. Each adds
+parameters, and the noise floor measured above already exceeds the effect sizes being
+chased, so extra knobs would be unfalsifiable rather than useful.
+
+`router.py` presents a single `Strategy` to main.py and delegates to whichever strategy
+the regime selects. Anything off-protocol (`recenter`, `grid_lower`, `levels`, ...)
+falls through `__getattr__`, which is why TrendFollower implements harmless equivalents
+of `GRID_SPECIFIC_MEMBERS` -- main.py needs no changes to drive either.
+
+### The handoff is the dangerous part
+
+In one-way position mode there is one net position per symbol. Activating a strategy
+while another still holds one means both write to the same position: they pay fees to
+cancel each other out, and the reduce-only bookkeeping AUDIT #11 fixed goes stale with
+two writers. The sequence is strict and stops on failure:
+
+```
+pause outgoing    cancel its resting orders
+flatten           close the position it held
+verify flat       re-read the exchange -- the exchange is the truth
+hand over         only now activate the incoming strategy
+```
+
+If verification still sees a position the router stays paused and retries next tick. An
+API failure during verification counts as *not flat*: an unknown position must never
+read as no position. `test_incoming_strategy_is_not_activated_while_a_position_remains`
+pins this.
+
+Switching costs a taker fee to flatten plus the spread to re-enter, so
+`ROUTER_MIN_REGIME_SECONDS` (default 900) requires a regime to persist before it is
+acted on, on top of TrendFilter's own confirmation window.
+
+### Off by default, and why
+
+`STRATEGY_MODE` defaults to `grid`, reproducing the previous behaviour exactly. The
+router is opt-in because **its switching thresholds remain unvalidated** -- the
+measured noise floor (sd 50-126) exceeds the effect sizes (~40) on a single symbol and
+period, and SOL already showed a ranking reversing out of sample. The mechanism is
+built and tested; the evidence that it *helps* is not there yet, and turning it on by
+default would be asserting something the data does not support.
+
+The remaining work is evidential, not structural: walk-forward evaluation across
+several instruments, and backtest support for the router so the thresholds can be
+tuned against history rather than a live account.
 
 ### What this changes about the roadmap
 

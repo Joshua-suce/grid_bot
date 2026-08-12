@@ -111,6 +111,15 @@ class Strategy(Protocol):
         """Supply current ATR as a fraction of price, for volatility-scaled sizing."""
         ...
 
+    def update_regime(self, regime: str) -> None:
+        """Report the current market regime: ranging / uptrend / downtrend / uncertain.
+
+        Added so a strategy can learn the regime through the interface rather than the
+        router reaching into concrete types. A grid ignores it (main.py already gates
+        it externally); a trend follower needs it to pick a side.
+        """
+        ...
+
     # --- stops -------------------------------------------------------------
 
     def get_stop_loss_price(self) -> float | None:

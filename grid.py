@@ -177,6 +177,7 @@ class GridEngine:
         # every level and handed ~39% of gross back to the exchange. Fees are the
         # dominant cost at this trade frequency, so the floor belongs in config.
         self._min_profit_multiplier: float = min_profit_multiplier
+        self._regime: str = "uncertain"
         self._open_orders_fetch_time: float = 0.0
         self._open_orders_map: dict[tuple[float, str], dict] = {}
         self._warned_small_fixed_allocation = False
@@ -194,6 +195,15 @@ class GridEngine:
             self._volatility_mult = max(0.8, 1.0 - (atr_pct - 0.03) * 5)
         else:
             self._volatility_mult = 1.0
+
+    def update_regime(self, regime: str) -> None:
+        """Part of the Strategy protocol; recorded but not acted on.
+
+        A grid does not change behaviour by regime -- main.py (and the router) gate it
+        externally by pausing, which cancels resting orders. Storing the value keeps it
+        available for logging and avoids a caller having to special-case grids.
+        """
+        self._regime = regime
 
     def set_position_limit(self, long_position: float, short_position: float, max_position_qty: float) -> None:
         """Block new buys when the long position would exceed the limit and new sells

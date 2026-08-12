@@ -19,6 +19,47 @@ from telegram_notifier import TelegramNotifier
 from trade_journal import TradeJournal
 from event_journal import EventJournal
 from pnl_tracker import PnLReconciler
+from router import StrategyRouter
+from trend_follower import TrendFollower
+
+
+def _install_strategy(engine: GridEngine, exchange: Exchange, events, notifier):
+    """Return what the trading loop should drive.
+
+    In the default 'grid' mode this is the engine itself, so behaviour is byte-identical
+    to before the router existed. In 'router' mode the engine is wrapped alongside a
+    trend follower and the router picks between them by regime -- it satisfies the same
+    Strategy protocol and delegates everything else, so the loop below is unchanged
+    either way.
+    """
+    if settings.strategy_mode != "router":
+        return engine
+
+    trend = TrendFollower(
+        exchange, settings.symbol,
+        capital_pct=settings.trend_capital_pct,
+        stop_loss_pct=settings.stop_loss_pct,
+        trailing_sl_trigger_pct=settings.trailing_sl_trigger_pct,
+        atr_stop_multiplier=settings.trend_atr_stop_multiplier,
+        leverage=settings.leverage,
+        max_exposure_pct=settings.max_exposure_pct,
+        min_hold_seconds=settings.trend_min_hold_seconds,
+        event_journal=events,
+        notifier=notifier,
+    )
+    logger.info(
+        "STRATEGY ROUTER ENABLED | grid <-> trend | min_regime_hold={}s",
+        settings.router_min_regime_seconds,
+    )
+    return StrategyRouter(
+        strategies={"grid": engine, "trend": trend},
+        default="grid",
+        min_regime_seconds=settings.router_min_regime_seconds,
+        exchange=exchange,
+        symbol=settings.symbol,
+        notifier=notifier,
+        event_journal=events,
+    )
 
 
 TIMEFRAME_MULTIPLIER = {
@@ -374,6 +415,7 @@ def run_bot() -> None:
             event_journal=events,
             notifier=notifier,
         )
+        grid = _install_strategy(grid, exchange, events, notifier)
         grid.load_from_dict(saved_state["grid"], current_price=exchange.get_price(settings.symbol))
 
         if grid.state_corrupted:
@@ -467,6 +509,7 @@ def run_bot() -> None:
             event_journal=events,
             notifier=notifier,
         )
+        grid = _install_strategy(grid, exchange, events, notifier)
         grid.initialize(current_price, balance)
 
     sl_orders: dict[str, dict] = {}
@@ -716,6 +759,7 @@ def run_bot() -> None:
                                 event_journal=events,
                                 notifier=notifier,
                             )
+                            grid = _install_strategy(grid, exchange, events, notifier)
                             grid.initialize(price, exchange.get_balance())
                             grid.total_fills = old_fills
                             grid.total_pnl = old_pnl
@@ -761,8 +805,15 @@ def run_bot() -> None:
                     atr_series = calc_atr(ohlcv_tf["high"], ohlcv_tf["low"], ohlcv_tf["close"], period=14)
                     current_atr = float(atr_series.iloc[-1]) if not np.isnan(atr_series.iloc[-1]) else price * 0.02
                     grid.update_volatility(current_atr / price)
+                    # In router mode this is what drives strategy selection; a bare
+                    # GridEngine records it and carries on unchanged.
+                    grid.update_regime(trend.regime.value)
 
-                    if not settings.force_trade_now:
+                    if settings.strategy_mode == "router":
+                        # The router owns pause/activate: a trend does not stop
+                        # trading, it hands over to the trend follower.
+                        logger.debug("Router mode: regime {} routed internally", trend.regime.value)
+                    elif not settings.force_trade_now:
                         if trend.is_trending() and grid.active:
                             grid.pause()
                             _reset_sl()
@@ -775,7 +826,9 @@ def run_bot() -> None:
                     else:
                         logger.debug("Force trade mode active; grid remains enabled regardless of trend.")
 
-                if not grid.active and (settings.force_trade_now or trend.is_ranging()):
+                if (settings.strategy_mode != "router"
+                        and not grid.active
+                        and (settings.force_trade_now or trend.is_ranging())):
                     grid.activate(exchange.get_balance())
 
                 if grid.active:

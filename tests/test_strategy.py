@@ -12,6 +12,7 @@ import pytest
 
 from grid import GridEngine
 from strategy import GRID_SPECIFIC_MEMBERS, Strategy
+from trend_follower import TrendFollower
 
 
 class _StubExchange:
@@ -42,10 +43,29 @@ def _protocol_methods() -> list[str]:
     ]
 
 
-def test_grid_engine_implements_every_protocol_method():
-    """GridEngine must already satisfy Strategy -- step 2 changes no behaviour."""
-    missing = [m for m in _protocol_methods() if not hasattr(GridEngine, m)]
-    assert missing == [], f"GridEngine is missing protocol methods: {missing}"
+def _trend_follower() -> TrendFollower:
+    return TrendFollower(exchange=_StubExchange(), symbol="DOGEUSDT")
+
+
+IMPLEMENTATIONS = [GridEngine, TrendFollower]
+
+
+@pytest.mark.parametrize("impl", IMPLEMENTATIONS, ids=lambda c: c.__name__)
+def test_implements_every_protocol_method(impl):
+    """Every strategy must satisfy Strategy. GridEngine does so unchanged, which is
+    the point of step 2; TrendFollower was written against it in step 3."""
+    missing = [m for m in _protocol_methods() if not hasattr(impl, m)]
+    assert missing == [], f"{impl.__name__} is missing protocol methods: {missing}"
+
+
+@pytest.mark.parametrize("impl", IMPLEMENTATIONS, ids=lambda c: c.__name__)
+def test_implements_the_grid_specific_surface_too(impl):
+    """main.py still calls these, so anything the router can install must answer them
+    -- otherwise switching strategies would crash the trading loop on the first
+    `grid.recenter()`. TrendFollower supplies harmless equivalents."""
+    obj = _engine() if impl is GridEngine else _trend_follower()
+    missing = [m for m in GRID_SPECIFIC_MEMBERS if not hasattr(obj, m)]
+    assert missing == [], f"{impl.__name__} cannot stand in for main.py: missing {missing}"
 
 
 @pytest.mark.parametrize("name", _protocol_methods())
@@ -85,17 +105,6 @@ def test_protocol_covers_what_main_actually_calls():
         f"{sorted(uncovered)}. Add each to the Strategy protocol or to "
         f"GRID_SPECIFIC_MEMBERS."
     )
-
-
-def test_grid_specific_members_really_exist_on_the_engine():
-    """The grid-specific list is the step 3/4 work queue -- it must stay accurate.
-
-    Checked against an instance, not the class: grid_lower/grid_upper/grid_count/
-    grid_spacing/levels are assigned in __init__, so they do not exist on the class.
-    """
-    engine = _engine()
-    missing = [m for m in GRID_SPECIFIC_MEMBERS if not hasattr(engine, m)]
-    assert missing == [], f"GRID_SPECIFIC_MEMBERS lists members GridEngine lacks: {missing}"
 
 
 def test_protocol_state_attributes_exist_on_an_instance():

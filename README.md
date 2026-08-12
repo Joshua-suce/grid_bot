@@ -14,6 +14,8 @@ Currently configured for `DOGEUSDT` in demo/testnet mode (see `.env`).
 main.py               entry point / trading loop
 strategy.py            Strategy protocol -- the interface main.py needs to trade
 grid.py                grid engine: level placement, fills, recentering, trailing SL
+trend_follower.py      trend strategy: one position, ratcheted ATR trailing stop
+router.py              regime router: grid in chop, trend follower in trends
 exchange.py            Binance USDM wrapper (retries, circuit breaker, demo/live via API creds)
 risk.py                kill switch / drawdown / daily loss / recovery sizing
 trend_filter.py        ADX/EMA multi-timeframe regime detection
@@ -112,6 +114,35 @@ Re-run it after a week or two on a new profile and compare the summary line
 (`net/day`, `fee % of gross`, `cycles/day`) against the baseline in
 `configs/balanced.env`'s header comment to see whether the change actually
 helped, rather than guessing.
+
+## Strategies: `STRATEGY_MODE`
+
+```bash
+STRATEGY_MODE=grid     # default -- the grid engine alone
+STRATEGY_MODE=router   # grid in ranging markets, trend follower in trends
+```
+
+A grid earns in chop and bleeds in sustained direction. In `grid` mode a confirmed
+trend simply *pauses* the bot, so capital sits idle through it. In `router` mode the
+same regime signal hands over to `trend_follower.py` instead, which holds one position
+in the trend's direction behind a ratcheted ATR trailing stop.
+
+The router satisfies the same `Strategy` protocol and delegates everything, so the
+trading loop is identical either way.
+
+**Handoffs are strict.** Binance one-way mode keeps a single net position per symbol,
+so the router pauses the outgoing strategy, flattens, re-reads the exchange to confirm
+flat, and only then activates the incoming one. If it cannot confirm flat -- including
+when the API call fails -- it stays paused and retries. It never runs two strategies
+against one position.
+
+Because each switch costs a taker fee to flatten plus the spread to re-enter,
+`ROUTER_MIN_REGIME_SECONDS` (default 900) makes a regime prove itself first.
+
+**`grid` is the default deliberately.** The router's switching thresholds are not yet
+validated: the backtest noise floor exceeds the effect sizes involved, and one
+out-of-sample symbol already reversed a ranking. The mechanism is built and tested; the
+evidence that it helps is not there yet. See `AUDIT.md` issues #23-#24.
 
 ## Backtesting: `run_backtest.py`
 

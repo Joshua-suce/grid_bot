@@ -100,3 +100,23 @@ def test_raising_the_position_cap_also_resolves_it():
     """Three ways out of the incoherence; the error names all of them."""
     _coherent(grid_count=20, max_position_pct=0.20).validate()
     _coherent(grid_count=20, capital_per_grid_pct=0.011).validate()
+
+
+# --- strategy mode ---------------------------------------------------------
+
+def test_strategy_mode_rejects_an_unknown_value():
+    """A typo must fail at startup, not silently fall back to trading one strategy."""
+    s = _coherent(strategy_mode="trendfollower")
+    with pytest.raises(ValueError, match="STRATEGY_MODE must be"):
+        s.validate()
+
+
+@pytest.mark.parametrize("mode", ["grid", "router"])
+def test_valid_strategy_modes_are_accepted(mode):
+    _coherent(strategy_mode=mode).validate()
+
+
+def test_strategy_mode_defaults_to_grid():
+    """The router's switching thresholds are unvalidated (AUDIT.md), so the
+    long-standing single-strategy behaviour must remain the default."""
+    assert Settings.model_fields["strategy_mode"].default == "grid"

@@ -184,6 +184,38 @@ class Settings(BaseSettings):
     telegram_bot_token: str = Field(default="")
     telegram_chat_id: str = Field(default="")
 
+    # --- Strategy selection ---
+    strategy_mode: str = Field(
+        default="grid",
+        description=(
+            "'grid' runs the grid engine alone (the long-standing behaviour). "
+            "'router' installs the regime router, which trades the grid in ranging "
+            "markets and the trend follower in confirmed trends. Defaults to 'grid' "
+            "because the router's switching thresholds are not yet validated -- see "
+            "AUDIT.md on the backtest noise floor."
+        ),
+    )
+    trend_capital_pct: float = Field(
+        default=0.10, gt=0, le=0.50,
+        description="Fraction of equity the trend follower commits to one position",
+    )
+    trend_atr_stop_multiplier: float = Field(
+        default=2.0, ge=0.5, le=10.0,
+        description="Trend follower's trailing stop distance, in ATR multiples",
+    )
+    trend_min_hold_seconds: int = Field(
+        default=300, ge=0, le=86400,
+        description="Minimum time a trend position is held before its stop can fire",
+    )
+    router_min_regime_seconds: int = Field(
+        default=900, ge=0, le=86400,
+        description=(
+            "A regime must persist this long before the router pays to switch. Every "
+            "handoff costs a taker fee to flatten plus the spread to re-enter, so "
+            "switching on regime noise bleeds on transitions alone."
+        ),
+    )
+
     # --- Polling ---
     poll_interval: int = Field(default=30, ge=5, le=300, description="Seconds between fill checks")
     force_trade_now: bool = Field(default=False, description="If true, bypass trend gating and activate grid immediately.")
@@ -270,6 +302,11 @@ class Settings(BaseSettings):
                 f"({self.capital_per_grid_pct:.1%}). The rest can never fill. "
                 f"Use GRID_COUNT <= {max_coherent_count}, or raise MAX_POSITION_PCT, "
                 "or lower CAPITAL_PER_GRID_PCT."
+            )
+
+        if self.strategy_mode not in {"grid", "router"}:
+            raise ValueError(
+                f"STRATEGY_MODE must be 'grid' or 'router', got '{self.strategy_mode}'."
             )
 
         if self.ema_fast >= self.ema_slow:
