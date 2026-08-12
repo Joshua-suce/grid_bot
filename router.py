@@ -276,6 +276,12 @@ class StrategyRouter:
     def get_short_stop_loss_price(self):
         return self.strategy.get_short_stop_loss_price()
 
+    def get_hard_stop_loss_price(self):
+        return self.strategy.get_hard_stop_loss_price()
+
+    def get_short_hard_stop_loss_price(self):
+        return self.strategy.get_short_hard_stop_loss_price()
+
     def update_trailing_sl(self, current_price: float) -> None:
         self.strategy.update_trailing_sl(current_price)
 

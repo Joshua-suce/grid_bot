@@ -129,6 +129,19 @@ class Strategy(Protocol):
     def get_short_stop_loss_price(self) -> float | None:
         ...
 
+    def get_hard_stop_loss_price(self) -> float | None:
+        """Static (non-trailing) stop for a long -- the last line of defence.
+
+        Must also be a ratchet: it may tighten while a position is open but never
+        loosen. A grid derives it from its lower bound, which recentering moves, so
+        without the ratchet a recenter pushes the stop away from the position it
+        protects (AUDIT #25).
+        """
+        ...
+
+    def get_short_hard_stop_loss_price(self) -> float | None:
+        ...
+
     def update_trailing_sl(self, current_price: float) -> None:
         """Advance the long trailing stop. Must be a ratchet: never returns a lower
         stop while the position stays open (AUDIT #14)."""

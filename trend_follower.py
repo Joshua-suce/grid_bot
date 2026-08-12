@@ -399,6 +399,14 @@ class TrendFollower:
     def get_short_stop_loss_price(self) -> float | None:
         return self._trailing_sl_price_short
 
+    def get_hard_stop_loss_price(self) -> float | None:
+        """No separate hard leg: the position exits in one piece at the trailing stop,
+        which is already ratcheted, so it is its own last line of defence."""
+        return self._trailing_sl_price
+
+    def get_short_hard_stop_loss_price(self) -> float | None:
+        return self._trailing_sl_price_short
+
     def reset_trailing(self) -> None:
         self._peak_price = 0.0
         self._trough_price = 0.0

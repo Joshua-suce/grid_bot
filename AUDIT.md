@@ -840,6 +840,67 @@ abstraction rotting the way an undocumented interface would.
 
 ---
 
+## Stop-loss protection defects from the 2026-08-12 live run (issues #25-#26)
+
+Both surfaced at the same instant -- the 14:06 recenter -- and share a shape: an event
+that was *not* a stop firing nonetheless reduced protection on a 7108 DOGE long that
+stayed open. Same class as #14/#15, one layer down.
+
+```
+14:05:26  trail SELL 3554 @ 0.0693647   hard SELL 3554 @ 0.06825994
+14:06:00  recenter -> pause() -> cancel_everything()   <- cancels the stops too
+14:06:16  "SCALE-OUT STOP FIRED"                       <- nothing fired; price was 0.07035
+14:06:17  hard SELL 7108 @ 0.06696984                  <- trail leg gone, hard stop 1.9% wider
+```
+
+### 25. The hard stop followed grid_lower away from an open position -- HIGH
+
+`hard_price` was recomputed as `grid_lower * (1 - stop_loss_pct)` on every refresh, and
+`recenter()` moves `grid_lower`. With a long open, the 14:06 recenter dropped the hard
+stop from `0.06825994` to `0.06696984`.
+
+AUDIT #15 stopped `recenter()` resetting the *trailing* anchor while a position was
+open. The *hard* leg was still free to track the band. **Fix:** `get_hard_stop_loss_price`
+/ `get_short_hard_stop_loss_price` ratchet the static level -- it may tighten while a
+position is open, never loosen -- released by `reset_trailing()` once flat. main.py now
+asks for the ratcheted level instead of recomputing it.
+
+### 26. A cancelled stop was read as a fired stop -- HIGH
+
+`_detect_trail_fill()` inferred a trigger purely from the trail order's absence from
+the open-stop list:
+
+```python
+if sl_orders["trail"]["id"] not in open_ids:
+    _scale_out_done = True
+```
+
+It could not distinguish *triggered* from *cancelled by us* -- and we cancel stops on
+every refresh, on `pause()`, and inside `recenter()`. Worse, `_scale_out_done` latches:
+the trailing leg was never re-placed, so the position spent the rest of its life on the
+hard stop alone.
+
+**Fix:** confirm with the exchange. `trail_stop_fired(order)` (module-level, so it is
+testable) treats only a completed fill as a fire; cancelled, expired, unknown or
+unreachable all read as "did not fire", and the leg is re-placed on the next pass. The
+conservative default matters -- a false positive strips protection permanently, a false
+negative merely re-places an order.
+
+### Caught by the step-2 boundary test
+
+Adding the two getters to main.py immediately failed
+`test_protocol_covers_what_main_actually_calls`, which parses main.py and rejects any
+`grid.<member>` that is classified neither as protocol nor grid-specific. They are
+universal -- any strategy holding a position needs a last-line stop -- so they went into
+the `Strategy` protocol, with implementations on `TrendFollower` and `StrategyRouter`.
+That is the abstraction doing its job on its first real test.
+
+`tests/test_stop_protection.py` (15 tests) pins both, using the numbers from the log.
+Verified adversarially: with the ratchet removed and absence restored as a fire,
+**11 of the 15 fail**.
+
+---
+
 ## Trend follower (issue #23) and regime router (issue #24) -- steps 3 and 4
 
 `trend_follower.py` is the grid's complement: it holds one position in the direction of

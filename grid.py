@@ -147,6 +147,11 @@ class GridEngine:
         self._peak_price = 0.0
         self._trough_price = 0.0
         self._trailing_sl_price_short: float | None = None
+        # Ratcheted static stop levels. See get_hard_stop_loss_price -- recenter moves
+        # grid_lower/grid_upper, and without these the hard stop follows it away from an
+        # open position.
+        self._hard_sl_price: float | None = None
+        self._hard_sl_price_short: float | None = None
         self._last_orderbook: dict = {}
         self._event_journal = event_journal
         self._notifier = notifier
@@ -1353,15 +1358,49 @@ class GridEngine:
         else:
             self._trailing_sl_price_short = min(self._trailing_sl_price_short, candidate)
 
+    def get_hard_stop_loss_price(self) -> float:
+        """Static stop for a long, ratcheted while the position is open.
+
+        The raw level is grid_lower * (1 - stop_loss_pct), so it follows grid_lower --
+        and recenter() moves grid_lower. Observed live on 2026-08-12 at 14:06: a
+        recenter with a 7108 DOGE long open dropped the hard stop from 0.06825994 to
+        0.06696984, pushing it 1.9% further from a position it was meant to protect.
+
+        This is AUDIT #15 one layer down. #15 stopped recenter resetting the *trailing*
+        anchor; the hard leg still tracked grid_lower freely. A stop may tighten while a
+        position is open, never loosen. Released by reset_trailing() once flat.
+        """
+        candidate = self.grid_lower * (1 - self.stop_loss_pct)
+        if self._net_long_qty <= 0:
+            self._hard_sl_price = candidate
+            return candidate
+        if self._hard_sl_price is None:
+            self._hard_sl_price = candidate
+        else:
+            self._hard_sl_price = max(self._hard_sl_price, candidate)
+        return self._hard_sl_price
+
+    def get_short_hard_stop_loss_price(self) -> float:
+        """Mirror of get_hard_stop_loss_price for a short: may fall, never rise."""
+        candidate = self.grid_upper * (1 + self.stop_loss_pct)
+        if self._net_short_qty <= 0:
+            self._hard_sl_price_short = candidate
+            return candidate
+        if self._hard_sl_price_short is None:
+            self._hard_sl_price_short = candidate
+        else:
+            self._hard_sl_price_short = min(self._hard_sl_price_short, candidate)
+        return self._hard_sl_price_short
+
     def get_stop_loss_price(self) -> float:
         if self._trailing_sl_price is not None:
             return self._trailing_sl_price
-        return self.grid_lower * (1 - self.stop_loss_pct)
+        return self.get_hard_stop_loss_price()
 
     def get_short_stop_loss_price(self) -> float:
         if self._trailing_sl_price_short is not None:
             return self._trailing_sl_price_short
-        return self.grid_upper * (1 + self.stop_loss_pct)
+        return self.get_short_hard_stop_loss_price()
 
     def get_scale_out_trail_price(self, side: str = "long") -> float:
         """Trailing price for the scale-out leg.
@@ -1384,11 +1423,17 @@ class GridEngine:
         return max(hard, self._peak_price * (1 - self.stop_loss_pct))
 
     def reset_trailing(self) -> None:
-        """Reset trailing peak/trough tracking, e.g. when the position side flips."""
+        """Release both ratchets, e.g. when the position closes or the side flips.
+
+        The hard-stop ratchet is released here too: with no position open there is
+        nothing to protect, so the static level should track grid_lower again.
+        """
         self._peak_price = 0.0
         self._trough_price = 0.0
         self._trailing_sl_price = None
         self._trailing_sl_price_short = None
+        self._hard_sl_price = None
+        self._hard_sl_price_short = None
 
     def log_sl_status(self, side: str = "long") -> None:
         if side == "short":

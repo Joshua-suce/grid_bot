@@ -23,6 +23,18 @@ from router import StrategyRouter
 from trend_follower import TrendFollower
 
 
+def trail_stop_fired(order: dict | None) -> bool:
+    """Did the trailing stop actually trigger, or was it merely cancelled?
+
+    A missing stop order is ambiguous: we cancel stops ourselves on every refresh, on
+    pause(), and inside recenter(). Only the exchange's own status settles it. Anything
+    that is not a completed fill -- cancelled, expired, unknown, unreachable -- must
+    read as "did not fire", because wrongly latching the scale-out permanently strips
+    the trailing leg from an open position (AUDIT #26).
+    """
+    return (order or {}).get("status") in ("closed", "filled")
+
+
 def _install_strategy(engine: GridEngine, exchange: Exchange, events, notifier):
     """Return what the trading loop should drive.
 
@@ -530,10 +542,12 @@ def run_bot() -> None:
         """
         if side == "long":
             trail_price = grid.get_stop_loss_price()
-            hard_price = grid.grid_lower * (1 - grid.stop_loss_pct)
+            # Ratcheted, not recomputed from grid_lower: a recenter must not push the
+            # hard stop away from an open position (AUDIT #25).
+            hard_price = grid.get_hard_stop_loss_price()
         else:
             trail_price = grid.get_short_stop_loss_price()
-            hard_price = grid.grid_upper * (1 + grid.stop_loss_pct)
+            hard_price = grid.get_short_hard_stop_loss_price()
         return build_scale_out_orders(
             side, qty, settings.sl_scale_out_pct, trail_price, hard_price,
             rounder=lambda q: float(exchange.exchange.amount_to_precision(settings.symbol, q)),
@@ -558,18 +572,49 @@ def run_bot() -> None:
                 logger.error("Failed to place {} stop-loss: {}", kind, e)
 
     def _detect_trail_fill() -> None:
+        """Mark the scale-out done only when the trailing stop actually triggered.
+
+        Order absence alone does not mean it fired -- we cancel stops ourselves on every
+        refresh, on pause(), and inside recenter(). Observed live on 2026-08-12 at
+        14:06: a recenter cancelled both legs, this read the missing id as a fire, and
+        _scale_out_done latched permanently. The trailing leg was never re-placed and a
+        7108 DOGE long spent the rest of its life on the hard stop alone.
+
+        So confirm with the exchange: only a genuinely filled/closed order counts. A
+        cancelled or unreadable one leaves the flag alone, and _refresh_sl_stops
+        re-places the leg on the next pass (AUDIT #26).
+        """
         nonlocal _scale_out_done
         if _scale_out_done or "trail" not in sl_orders:
             return
         if exchange.demo and not exchange.has_credentials:
             return
+        trail_id = sl_orders["trail"]["id"]
         open_ids = {o.get("id") for o in exchange.get_stop_orders(settings.symbol)}
-        if sl_orders["trail"]["id"] not in open_ids:
+        if trail_id in open_ids:
+            return
+
+        try:
+            order = exchange.fetch_order(trail_id, settings.symbol)
+        except Exception as e:
+            logger.debug("SCALE-OUT CHECK | could not fetch {} ({}) — assuming not fired", trail_id, e)
+            order = None
+
+        status = (order or {}).get("status")
+        if trail_stop_fired(order):
             _scale_out_done = True
             logger.warning(
-                "SCALE-OUT STOP FIRED | trailing leg closed at {} — remainder on hard stop only",
+                "SCALE-OUT STOP FIRED | trailing leg filled at {} — remainder on hard stop only",
                 sl_orders["trail"]["price"],
             )
+            return
+
+        logger.debug(
+            "SCALE-OUT CHECK | trail stop {} gone with status={} (cancelled, not fired) "
+            "— leg will be re-placed",
+            trail_id, status,
+        )
+        sl_orders.pop("trail", None)
 
     # Refreshing a stop means cancel-then-place, which leaves the position unprotected
     # for the round trip. Rebuilding on every quantity change made that gap recur on
