@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from exchange import Exchange
+from exchange import Exchange, PostOnlyWouldCross
 
 
 @dataclass
@@ -113,6 +113,7 @@ class GridEngine:
         trailing_sl_trigger_pct: float = 0.05,
         max_exposure_pct: float = 0.50,
         use_market_close_on_replace: bool = False,
+        min_profit_multiplier: float = 3.0,
         event_journal: object | None = None,
         notifier: object | None = None,
     ):
@@ -169,7 +170,13 @@ class GridEngine:
         self.state_corrupted: bool = False
         self._buy_scale: float = 1.0
         self._sell_scale: float = 1.0
-        self._min_profit_multiplier: float = 1.0
+        # How many times the round-trip fee a level's spacing must cover before the
+        # level is worth placing (see _is_level_profitable). This was hardcoded to 1.0,
+        # i.e. break-even plus epsilon: a level clearing its own fees by a hair passed
+        # the gate, so a grid whose spacing was only ~2.6x the round-trip fee placed
+        # every level and handed ~39% of gross back to the exchange. Fees are the
+        # dominant cost at this trade frequency, so the floor belongs in config.
+        self._min_profit_multiplier: float = min_profit_multiplier
         self._open_orders_fetch_time: float = 0.0
         self._open_orders_map: dict[tuple[float, str], dict] = {}
         self._warned_small_fixed_allocation = False
@@ -447,9 +454,16 @@ class GridEngine:
         return pct_allocation
 
     def _is_level_profitable(self, level_price: float) -> bool:
+        """Is one round trip at this level worth more than the fees it will pay?
+
+        A completed cycle earns one grid_spacing of price movement and pays two fees
+        (entry + exit). Both legs rest as post-only maker orders -- crossing orders are
+        now refused rather than downgraded to taker (see PostOnlyWouldCross) -- so
+        2 * maker_fee is the true round-trip cost, not an optimistic floor.
+        """
         expected_profit = self.grid_spacing
-        worst_fees = 2 * self.maker_fee_pct * level_price
-        return expected_profit > worst_fees * self._min_profit_multiplier
+        round_trip_fees = 2 * self.maker_fee_pct * level_price
+        return expected_profit > round_trip_fees * self._min_profit_multiplier
 
     def _existing_open_order(self, price: float, side: str) -> dict | None:
         """Return an open exchange order already resting at the same price+side, if any.
@@ -545,6 +559,15 @@ class GridEngine:
             if self._notifier:
                 self._notifier.on_order_placed(self.symbol, level.side, level.price, float(quantity), order["id"])
             return True
+        except PostOnlyWouldCross:
+            # Not a failure: the level is momentarily on the wrong side of the book.
+            # Leave it pending and unplaced so the next pass retries it. No error log,
+            # no journal entry, no Telegram alert -- and crucially no taker fill.
+            logger.debug(
+                "SKIP CROSSING LEVEL | {} @ {} would cross — leaving unplaced for retry",
+                level.side, level.price,
+            )
+            return False
         except Exception as e:
             logger.error("Failed to place order at {}: {}", level.price, e)
             if self._event_journal:

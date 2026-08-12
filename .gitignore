@@ -12,6 +12,11 @@ __pycache__/
 state/*.json
 state/*.json.old
 state/*.corrupt*
+state/*.bak.*
+state/*.empty
+
+# Cached OHLCV for backtests (regenerable via backtest.fetch_ohlcv)
+data/
 
 # Logs (contains trade history and events)
 logs/*.csv

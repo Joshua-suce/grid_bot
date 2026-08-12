@@ -3,7 +3,7 @@ import time
 import ccxt
 import pytest
 
-from exchange import CircuitBreaker, Exchange
+from exchange import CircuitBreaker, Exchange, PostOnlyWouldCross
 
 
 def make_exchange(fake):
@@ -125,12 +125,31 @@ class PostOnlyBackend:
 
 
 def test_place_limit_order_survives_postonly_reject_on_last_attempt():
+    """With allow_taker_fallback=True (exit orders), a -2019 still falls back to taker."""
     fake = PostOnlyBackend()
     ex = make_exchange(fake)
-    order = ex.place_limit_order("DOGEUSDT", "buy", 0.069, 100, max_attempts=1, post_only=True)
+    order = ex.place_limit_order(
+        "DOGEUSDT", "buy", 0.069, 100, max_attempts=1, post_only=True, allow_taker_fallback=True,
+    )
     assert order["id"] == "placed-ok"
     assert fake._tried_postonly == 1
     assert fake._placed_without_postonly == 1
+
+
+def test_postonly_reject_does_not_silently_become_a_taker_order():
+    """The default must refuse to cross rather than pay taker.
+
+    A grid level earns one grid spacing and pays a fee to do it. Resubmitting a
+    crossing order without postOnly fills it immediately at the taker rate, so the
+    level pays double the fee and captures none of the spread -- a guaranteed loss
+    dressed up as a successful placement.
+    """
+    fake = PostOnlyBackend()
+    ex = make_exchange(fake)
+    with pytest.raises(PostOnlyWouldCross):
+        ex.place_limit_order("DOGEUSDT", "buy", 0.069, 100, max_attempts=1, post_only=True)
+    assert fake._tried_postonly == 1
+    assert fake._placed_without_postonly == 0, "crossed the spread as a taker anyway"
 
 
 class PostOnlyFallbackFailsOnceBackend(PostOnlyBackend):
@@ -159,7 +178,9 @@ def test_place_limit_order_retries_when_postonly_fallback_also_fails():
     """
     fake = PostOnlyFallbackFailsOnceBackend()
     ex = make_exchange(fake)
-    order = ex.place_limit_order("DOGEUSDT", "buy", 0.069, 100, max_attempts=2, post_only=True)
+    order = ex.place_limit_order(
+        "DOGEUSDT", "buy", 0.069, 100, max_attempts=2, post_only=True, allow_taker_fallback=True,
+    )
     assert order["id"] == "placed-ok-2nd-try"
     assert fake._fallback_calls == 2
 
@@ -174,7 +195,9 @@ def test_place_limit_order_raises_real_error_when_fallback_exhausts_retries():
     fake = AlwaysFailFallbackBackend()
     ex = make_exchange(fake)
     with pytest.raises(ccxt.ExchangeError):
-        ex.place_limit_order("DOGEUSDT", "buy", 0.069, 100, max_attempts=2, post_only=True)
+        ex.place_limit_order(
+            "DOGEUSDT", "buy", 0.069, 100, max_attempts=2, post_only=True, allow_taker_fallback=True,
+        )
 
 
 class DriftBackend:

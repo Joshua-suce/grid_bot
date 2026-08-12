@@ -370,6 +370,7 @@ def run_bot() -> None:
             leverage=settings.leverage,
             trailing_sl_trigger_pct=settings.trailing_sl_trigger_pct,
             max_exposure_pct=settings.max_exposure_pct,
+            min_profit_multiplier=settings.min_profit_multiplier,
             event_journal=events,
             notifier=notifier,
         )
@@ -462,6 +463,7 @@ def run_bot() -> None:
             leverage=settings.leverage,
             trailing_sl_trigger_pct=settings.trailing_sl_trigger_pct,
             max_exposure_pct=settings.max_exposure_pct,
+            min_profit_multiplier=settings.min_profit_multiplier,
             event_journal=events,
             notifier=notifier,
         )
@@ -710,6 +712,7 @@ def run_bot() -> None:
                                 leverage=settings.leverage,
                                 trailing_sl_trigger_pct=settings.trailing_sl_trigger_pct,
                                 max_exposure_pct=settings.max_exposure_pct,
+                                min_profit_multiplier=settings.min_profit_multiplier,
                                 event_journal=events,
                                 notifier=notifier,
                             )

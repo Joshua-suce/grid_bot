@@ -9,6 +9,16 @@ import pandas as pd
 from loguru import logger
 
 
+class PostOnlyWouldCross(Exception):
+    """A post-only order was rejected (-2019) because it would cross the spread.
+
+    Distinct from a real placement failure: nothing is wrong with the account or the
+    order, the price is simply on the wrong side of the book at this instant. Callers
+    should skip the level quietly and retry later rather than log an error, alert, or
+    resubmit it as a taker order.
+    """
+
+
 class CircuitBreaker:
     def __init__(self, failure_threshold: int = 5, recovery_time: int = 120):
         self.failure_threshold = failure_threshold
@@ -344,13 +354,25 @@ class Exchange:
 
     def place_limit_order(
         self, symbol: str, side: str, price: float, amount: float, max_attempts: int = 3, params: dict | None = None,
-        post_only: bool = True,
+        post_only: bool = True, allow_taker_fallback: bool = False,
     ) -> dict[str, Any]:
         """Place a limit order.
 
         Normalizes common parameter names and precedence:
         - If 'postOnly' or 'post_only' is present inside params, that value overrides the post_only argument.
         - 'params' is passed through to the underlying exchange API (ccxt) so use keys like 'reduceOnly' and 'stopPrice' there.
+
+        allow_taker_fallback controls what happens when a post-only order is rejected
+        with -2019 because it would cross the spread. Defaults to False, which raises
+        PostOnlyWouldCross instead of resubmitting as a taker order.
+
+        That default matters for grid economics. A grid level earns the spacing between
+        levels and pays a fee to do it; re-sending a crossing order without postOnly
+        fills it immediately at the *taker* rate, so the level pays double the fee and
+        captures none of the spread it existed to collect. Silently doing that turned
+        grid levels into guaranteed small losses. Exit paths (reduce-only unwinds,
+        hedges) already pass postOnly=False explicitly and never reach this branch --
+        for them, getting out is worth the taker fee.
 
         Returns the exchange order dict.
         """
@@ -392,6 +414,18 @@ class Exchange:
             except ccxt.InvalidOrder as e:
                 err_str = str(e)
                 if post_only and ("-2019" in err_str or "would trigger immediate match" in err_str.lower() or "post only" in err_str.lower()):
+                    if not allow_taker_fallback:
+                        # The level is on the wrong side of the book right now. Resting
+                        # it is impossible and crossing it is a guaranteed loss, so
+                        # decline to place at all -- the caller re-places it once price
+                        # moves back or the grid recenters.
+                        logger.debug(
+                            "POST-ONLY WOULD CROSS | {} {} @ {} — skipping rather than paying taker",
+                            side.upper(), amount, price,
+                        )
+                        raise PostOnlyWouldCross(
+                            f"{side} @ {price} would cross the spread; not placing as taker"
+                        ) from e
                     logger.debug("Post-only order rejected (would cross spread) @ {} — placing without postOnly", price)
                     order_params = dict(params or {})
                     order_params["postOnly"] = False

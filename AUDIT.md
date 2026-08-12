@@ -519,3 +519,348 @@ the bot from *destroying its own exit orders* and from trading with a stop that
 slides downward — they do not make a fee-losing configuration profitable. Once
 the run is clean, the next lever is trade frequency vs. spacing (widen
 `RANGE_MIN_SPACING_PCT` / reduce `GRID_COUNT`), not more plumbing.
+
+---
+
+## Fee economics: the losing configuration (issues #17-#20)
+
+The economics deferred above, now addressed. Issues #11-#16 were the bot
+sabotaging its own mechanisms; these four are the reason a *correctly working*
+bot still lost money. Evidence from the reconciled ledger:
+
+```
+gross realized  +13.21
+commission      -45.26     <- 3.4x gross
+funding          +3.05
+net             -28.99
+```
+
+~700 round trips returned **0.026% average capture against a 0.102% theoretical
+spacing** — the grid realized about a quarter of its own edge while paying full
+freight. Two mechanisms leaked the difference, and two settings guaranteed the
+edge was too thin to survive either.
+
+### 17. Crossing orders were silently downgraded to taker fills -- CRITICAL
+
+`exchange.py` caught Binance `-2019` ("post only order would be immediately
+matched") and resubmitted the same order with `postOnly=False`. The order then
+filled instantly at the **taker** rate.
+
+For a grid level this is the worst possible outcome. The level exists to earn one
+grid spacing by resting passively; crossing means it pays double the fee (taker,
+not maker) *and* captures none of the spread it was placed to collect. It was
+logged as `ORDER PLACED`, so it looked like a success.
+
+Observed live at 01:22:40 and 01:22:43 on 2026-08-12: two sells placed below
+market with `postOnly=False`, both filled 22 seconds later, both at a loss
+(`-0.254569`, `-0.148980`) — the first two fills of a freshly started session.
+
+**Fix:** `place_limit_order` gained `allow_taker_fallback` (default `False`) and
+raises the new `PostOnlyWouldCross` instead of crossing. The grid engine treats
+it as a normal transient condition: level left unplaced and retryable, no error
+log, no journal entry, no Telegram alert. Exit paths (reduce-only unwinds,
+hedges) already pass `postOnly=False` explicitly and never reach this branch —
+for them the taker fee is worth paying to get out.
+
+### 18. Grid levels were placed without checking the book side -- HIGH
+
+`_place_order_for_level` placed at `level.price` with `level.side` and never
+re-checked that side against the current market. A restored or stale level whose
+side no longer matched the market was placed anyway and crossed immediately.
+This is what fed #17 its victims. Now that crossing orders are refused, such a
+level is skipped and retried instead of filling at a loss.
+
+### 19. Profitability gate was pinned at break-even -- HIGH
+
+`_is_level_profitable` already compared spacing against round-trip fees, but
+`_min_profit_multiplier` was **hardcoded to 1.0** — break-even plus epsilon. A
+level clearing its own fees by a hair passed the gate. With spacing at only ~2.6x
+the round-trip fee, every level passed and ~39% of gross went straight back to
+the exchange before slippage or any adverse move.
+
+**Fix:** exposed as `MIN_PROFIT_MULTIPLIER`, default **3.0** (keeps ~2/3 of gross
+after fees). The old behaviour remains reachable by setting it to 1.0, but now
+that is an explicit choice rather than a buried constant.
+
+### 20. Two settings made the losing configuration unreachable to fix -- HIGH
+
+Both are now validated at startup, so an incoherent config fails loudly instead
+of trading:
+
+**Spacing below the fee floor.** `RANGE_MIN_SPACING_PCT=0.001` (0.1%) against a
+0.04% maker round trip. `validate()` now requires
+`range_min_spacing_pct >= 2 * maker_fee * min_profit_multiplier` and names all
+three ways out. Raised to `0.002` — a 5.0x ratio, keeping 80% of gross.
+
+**Grid wider than the position cap.** Per-level size is
+`CAPITAL_PER_GRID_PCT` (1.8% of equity) and the cap is `MAX_POSITION_PCT` (12%),
+so only `0.12 / 0.018 = 6.7` levels per side could ever fill — but `GRID_COUNT=20`
+put **10** on each side. Levels 7-20 were decorative. Because both scale with
+equity, **the ratio is fixed and adding capital does not help.**
+
+This is also *why* #13's recenter loop was so destructive: the position hit the
+cap after ~6 fills, that side was blocked, the book went permanently one-sided,
+and the bot lived in exactly the state that made recentering cancel its own
+exits. The live log shows it plainly — `exposure=13.8%` against a 12% cap,
+`filled=10/20`, `POSITION LIMIT | buy orders blocked` repeating.
+
+`validate()` now rejects `grid_count / 2 > max_position_pct / capital_per_grid_pct`
+and suggests a count that works. `GRID_COUNT` lowered to **10** (5 per side vs
+6.7 affordable), which also widens spacing to ~0.22% — both problems, one change.
+
+### Resulting economics
+
+| | before | after |
+|---|---|---|
+| Grid levels | 20 | 10 |
+| Usable levels per side | 5 of 10 | 5 of 5 |
+| Spacing | 0.102% | 0.222% |
+| Spacing / round-trip fee | 2.6x | 5.0x |
+| Gross retained after fees | 61% (all-maker) | 80% |
+| Crossing orders | filled as taker | refused |
+
+Verified across ATR regimes from 0.5% to 8%: the runtime profitability gate
+clears by at least 2.3x in every case, so the new floor cannot silently produce
+a grid that validates and then places nothing.
+
+### What to watch on the next run (issues #17-#20)
+
+1. **Every** initial order should log `postOnly=True`. A `postOnly=False` on a
+   grid level (as opposed to an unwind or hedge) means a crossing order got
+   through somewhere.
+2. `POST-ONLY WOULD CROSS` at DEBUG is normal and healthy — it is the leak being
+   refused. A *continuous* stream of it for the same level means the grid is
+   mis-centred and should recenter rather than retry.
+3. `SKIP ORDER @ ... < min_profit` should be rare at `GRID_COUNT=10`. Frequent
+   hits mean ATR collapsed and the range narrowed below the fee floor; the grid
+   is correctly declining to trade, not broken.
+4. `POSITION LIMIT | buy orders blocked` should now be **occasional**, not
+   permanent. If the grid still lives at its cap, `MAX_POSITION_PCT` and
+   `CAPITAL_PER_GRID_PCT` are still mismatched for the realized volatility.
+5. Commission versus gross in `PNL RECONCILER SYNC`. The target is commission
+   well under gross realized. It was 3.4x over.
+
+### Still not addressed
+
+**Leverage.** `LEVERAGE=5` amplifies the directional-inventory loss that a grid
+takes in a trend. It is deliberately left alone: it is a risk-appetite choice,
+not a config incoherence, and belongs to the account owner rather than the audit.
+
+**No backtester.** Every value above is derived from arithmetic and one live
+session. Nothing here has been validated against historical price action, and
+this remains the single largest gap in the project — a fee-sensitive strategy
+whose parameters can only be tested by spending real days and real fees.
+
+**Trend exposure.** A grid earns in chop and bleeds in trend. The ADX/EMA filter
+pauses the grid in a confirmed trend, but the loss booked on 2026-08-11 was
+largely directional: the bot accumulated into a falling market and unwound at a
+loss (`-1.168`, `-1.060`, `-0.952` on consecutive fills). No amount of fee tuning
+addresses that; it is the strategy's inherent exposure.
+
+---
+
+## Backtesting (issue #21) and what it revealed
+
+`backtest.py` replays historical candles through the **real** `GridEngine` --
+`SimulatedExchange` implements the same 13-method surface the engine calls on the
+live `Exchange`, so the replay exercises actual order placement, fill handling,
+recentering, position caps and post-only logic rather than a second model that
+could agree with the first while both are wrong. `run_backtest.py` is the CLI.
+Verified by 22 tests covering fee arithmetic, position accounting through flat,
+intra-candle fill ordering, and the `-2019` / `-2022` / `-4164` rejections.
+
+Two implementation notes worth keeping:
+
+- **Virtual clock.** `GridEngine` gates replacement (20s) and recentering (180s)
+  on `time.time()`. A replay covering months finishes in seconds, so under the
+  real clock those cooldowns would never expire and the run would be meaningless.
+  `VirtualClock` is installed as the engine's `time` module for the duration.
+- **PnL is computed from position accounting, not from the engine.** The engine's
+  own figure is reported alongside for comparison, and the gap is large -- see
+  below.
+
+### Result 1: the #17-#20 fixes are real and measurable
+
+DOGEUSDT 1h, 90 days (2160 candles), a period in which DOGE fell **-35.9%**:
+
+| configuration | net | gross | fees | fills | maxDD |
+|---|---|---|---|---|---|
+| OLD `gc=20 mult=1.0` | -165.88 | -114.70 | 51.18 | 2831 | 4.7% |
+| NEW `gc=10 mult=3.0` | -161.01 | -124.05 | 36.96 | 1758 | 4.1% |
+| OLD + trend filter | -154.73 | -116.10 | 38.63 | 2041 | 4.9% |
+| NEW + trend filter | **+28.28** | +53.87 | 25.59 | 1132 | 2.2% |
+
+Fees fell 50% and fills 60%. Those are genuine improvements and they hold up.
+
+### Result 2: the direction of the effect is real; the exact numbers are not
+
+A single run is close to meaningless here. Repeating each configuration across 15
+start offsets (identical data, only the first candle differs) separates what holds
+from what is noise:
+
+| configuration | mean | stdev | positive | mean/sd |
+|---|---|---|---|---|
+| OLD `gc=20 mult=1.0` | -83.17 | 106.45 | 4/15 | -0.78 |
+| NEW `gc=10 mult=3.0` | -54.06 | 96.63 | 4/15 | -0.56 |
+| OLD + trend filter | -51.42 | 85.12 | 4/15 | -0.60 |
+| NEW + trend filter | **+28.07** | 51.66 | **11/15** | +0.54 |
+
+**What holds:** the ordering. Every fix improves the mean monotonically, the spread
+narrows as the configuration improves, and only the fully-fixed configuration is
+positive in a majority of offsets. That direction is consistent across all 15 runs,
+so it is an effect rather than a lucky draw.
+
+**What does not hold:** any specific parameter value. Neighbouring `GRID_COUNT`
+values swing wildly on identical data — the signature of fitting noise:
+
+```
+gc=6   +10.06     gc=12  -140.92
+gc=8   -34.43     gc=14   -29.24
+gc=10  +28.28     gc=16    -0.08
+                  gc=20  -154.73
+```
+
+The same applies to `RANGE_ATR_MULTIPLIER`: 2.5 (the `.env` value) scored +6.52 and
+1.5 scored +93.49 on single runs — a gap well inside a 51-point standard deviation,
+so it is not evidence that either is better.
+
+> **Verdict: the #11-#20 fixes demonstrably improve the strategy. They do not
+> demonstrably make it profitable.** `mean/sd = 0.54` is suggestive, not conclusive
+> — the threshold for acting on a result should be nearer 1.0.
+
+Two caveats that make even `0.54` optimistic:
+
+1. **The offsets are not independent samples.** All 15 replay the same 90-day window
+   shifted by at most 84 candles out of 2160 — they overlap ~96%. The standard
+   deviation therefore measures start-anchor sensitivity, not sampling uncertainty of
+   the edge. Effective sample size is far closer to 1 than to 15.
+2. **One symbol, one period, one regime** (DOGE, -35.9%).
+
+**Out-of-sample check — and it does not fully replicate.** Two instruments the
+configuration was never derived from, 5 start offsets each:
+
+| symbol | drift | configuration | mean | stdev | positive |
+|---|---|---|---|---|---|
+| DOGE (in-sample) | -35.9% | OLD | -83.17 | 106.45 | 4/15 |
+| | | NEW + filter | **+28.07** | 51.66 | 11/15 |
+| ETH | -16.5% | OLD | -47.24 | 73.23 | 1/5 |
+| | | NEW + filter | **-3.19** | 85.70 | 3/5 |
+| SOL | -15.7% | OLD | **+54.21** | 125.60 | 3/5 |
+| | | NEW + filter | +12.20 | 74.69 | 4/5 |
+
+**On SOL the old configuration beat the new one** (+54.21 vs +12.20). Mean PnL
+improves on two instruments out of three, not three out of three. An earlier draft of
+this section claimed the direction replicated; that was written from DOGE and ETH
+before SOL finished, and it was wrong.
+
+What *does* hold on all three is the share of runs finishing positive — DOGE 27% ->
+73%, ETH 20% -> 60%, SOL 60% -> 80%. The fixed configuration loses less often
+everywhere, even where its mean is lower.
+
+Both out-of-sample samples are n=5 against standard deviations of 75-126, so neither
+is individually distinguishable from zero or from the other. SOL's +54.21 +/- 125.60
+is not evidence the old configuration is better; it is evidence the sample is too
+small to tell.
+
+> **Honest overall verdict: the #11-#20 changes are sound engineering — they remove
+> real defects, halve fee drag, and reduce the frequency of losing runs on every
+> instrument tested. A consistent improvement in expected PnL is NOT established, and
+> profitability is not established on any instrument.**
+
+This is the harness earning its keep on day one: without it, `gc=10` would have been
+adopted as "the profitable configuration" on the strength of a single `+28.28`, and
+`GRID_COUNT` would have been tuned on pure noise.
+
+### Result 3: the engine's self-reported PnL still drifts badly
+
+On the 90-day replay the engine reported **+249.20** while true position
+accounting gave **+6.52** — a drift of **+242.68**. This is AUDIT #7 reproduced
+under controlled conditions, and it independently justifies sourcing every
+displayed figure from `PnLReconciler` and the exchange rather than from
+`grid.total_pnl`. The engine's internal figure should be treated as diagnostic
+only, never reported to the user as PnL.
+
+### Result 4: `MIN_PROFIT_MULTIPLIER` is currently inactive
+
+Sweeping it across 1.0 / 3.0 / 5.0 on the live `.env` config produced **identical**
+results (net +6.52, 570 fills, every time). With `RANGE_ATR_MULTIPLIER=2.5` and
+`GRID_COUNT=10`, ATR-derived spacing sits far above even five round-trip fees, so
+the gate never binds.
+
+That does not make it useless -- it is the guard that stops a volatility collapse or
+a future config change from silently reproducing the 2.6x-fee grid that lost money.
+But it is a safety net, not an active constraint today, and it should not be credited
+with any of the improvement measured above. The improvement came from `GRID_COUNT`,
+the crossing refusal, and the trend filter.
+
+### How to use this
+
+```
+python run_backtest.py --days 90                    # current .env config
+python run_backtest.py --sweep grid_count=8,10,12   # compare
+python run_backtest.py --robustness                 # measure the noise floor
+```
+
+`--robustness` reports mean/stdev across start offsets. **Below ~0.5 the result is
+indistinguishable from chance** and must not be tuned on, however good the headline
+number looks. Run it before believing any sweep.
+
+---
+
+## Strategy protocol (issue #22) -- step 2 of the multi-strategy plan
+
+`strategy.py` defines `Strategy`, the interface main.py needs from anything that
+trades. **Zero behaviour change:** `GridEngine` already satisfies it as written,
+because the protocol was derived from what main.py actually calls rather than
+invented and imposed.
+
+A structural `Protocol` was chosen over an ABC deliberately. `GridEngine` is 1600
+lines of live-tested logic with real state files behind it; reparenting it would mean
+touching its constructor and MRO for no behavioural gain. Duck-typed conformance
+asserts the same contract while modifying nothing.
+
+The protocol covers 19 members -- lifecycle (`initialize`/`activate`/`pause`/
+`emergency_stop`), trading (`place_initial_orders`/`check_fills`), the risk interface
+(`set_position_limit`/`get_exposure_pct`/`update_volatility`), stops, reconciliation,
+persistence and metrics.
+
+**Ten members are deliberately excluded** as ladder-of-orders specific, and they are
+the remaining step 3/4 work queue:
+
+```
+recenter  grid_lower  grid_upper  grid_count  grid_spacing
+levels    log_sl_status  log_analytics  get_scale_out_trail_price  update_orderbook
+```
+
+`tests/test_strategy.py` (25 tests) keeps the boundary honest. One test parses main.py
+and asserts every `grid.<member>` it calls is classified as either protocol or
+grid-specific -- so adding a new coupling to main.py fails the suite until someone
+decides which side of the line it belongs on. That is the mechanism that stops this
+abstraction rotting the way an undocumented interface would.
+
+### Steps 3 and 4 -- deliberately not built yet
+
+**Step 3 (a trend-following strategy)** and **step 4 (the regime router)** are scoped
+but unbuilt. Two reasons, one practical and one evidential:
+
+- The router's switching thresholds are the parameters that would decide everything,
+  and the backtest evidence above shows the noise floor (sd 50-126) exceeds the effect
+  sizes (~40) on a single symbol and period. Tuning a router on that would repeat
+  exactly the mistake the harness caught. Walk-forward evaluation across more
+  instruments has to come first.
+- Step 4 also requires the handoff state machine (cancel -> flatten -> verify flat ->
+  hand over) inside main.py's trading loop. That is the highest-risk edit in the
+  project and warrants a dedicated pass, not the tail of a long session.
+
+### What this changes about the roadmap
+
+The strategy-protocol and trend-follower work sketched earlier is still the right
+structural direction — regime coverage is a real gap, and the trend filter was the
+single largest measured effect (gross -116 → +54 in the table above). But the
+router's thresholds cannot be tuned on a single symbol and period, because the noise
+floor here exceeds the effect size. Before that work is worth doing, this harness
+needs walk-forward evaluation and more than one instrument.
+
+Known limits of the harness, all of which make results **optimistic**: no slippage
+or depth model, no partial fills, no funding, one candle per loop iteration, and
+main.py's kill switches are not simulated.

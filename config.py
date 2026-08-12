@@ -74,6 +74,14 @@ class Settings(BaseSettings):
         default=0.01, ge=0.0005, le=0.05,
         description="Minimum grid spacing as fraction of price (1.0% = 0.01)",
     )
+    min_profit_multiplier: float = Field(
+        default=3.0, ge=1.0, le=10.0,
+        description=(
+            "A grid level is only placed if its spacing covers this many round-trip "
+            "fees. 1.0 means break-even (the old hardcoded behaviour, which let levels "
+            "trade for near-zero edge); 3.0 keeps roughly two thirds of gross after fees."
+        ),
+    )
 
     # --- Grid Recentering ---
     recenter_enabled: bool = Field(
@@ -227,6 +235,41 @@ class Settings(BaseSettings):
         if self.range_min_spacing_pct < 0.0005:
             raise ValueError(
                 "RANGE_MIN_SPACING_PCT is too low; use at least 0.0005 to avoid excessively tight grids."
+            )
+
+        # --- Spacing must clear fees by a real margin, not a hair ---------------
+        # Every completed cycle earns one grid spacing and pays a round trip of maker
+        # fees. Spacing set near the fee floor is how a bot books thousands of fills
+        # and still ends the day negative: the exchange takes most of the gross.
+        round_trip_fee = 2 * (self.maker_fee_pct / 100)
+        required_spacing = round_trip_fee * self.min_profit_multiplier
+        if self.range_min_spacing_pct < required_spacing:
+            raise ValueError(
+                f"RANGE_MIN_SPACING_PCT ({self.range_min_spacing_pct:.5f} = "
+                f"{self.range_min_spacing_pct * 100:.3f}%) does not clear fees. A round trip "
+                f"costs {round_trip_fee * 100:.3f}% at the maker rate, and "
+                f"MIN_PROFIT_MULTIPLIER={self.min_profit_multiplier} requires spacing of at "
+                f"least {required_spacing:.5f} ({required_spacing * 100:.3f}%). "
+                "Raise RANGE_MIN_SPACING_PCT, lower GRID_COUNT, or lower MIN_PROFIT_MULTIPLIER."
+            )
+
+        # --- The grid must fit inside the position cap --------------------------
+        # Each filled level adds capital_per_grid_pct of equity to the position, and
+        # max_position_pct caps the total. If one side of the grid holds more levels
+        # than the cap allows, the surplus levels can never fill: the cap blocks that
+        # side partway through, the book goes permanently one-sided, and the bot spends
+        # its life in the capped state that makes recentering destructive.
+        levels_per_side = self.grid_count / 2
+        affordable_levels = self.max_position_pct / self.capital_per_grid_pct
+        if levels_per_side > affordable_levels:
+            max_coherent_count = int(2 * affordable_levels)
+            raise ValueError(
+                f"GRID_COUNT ({self.grid_count}) puts {levels_per_side:.0f} levels on each "
+                f"side, but MAX_POSITION_PCT ({self.max_position_pct:.0%}) only affords "
+                f"{affordable_levels:.1f} levels at CAPITAL_PER_GRID_PCT "
+                f"({self.capital_per_grid_pct:.1%}). The rest can never fill. "
+                f"Use GRID_COUNT <= {max_coherent_count}, or raise MAX_POSITION_PCT, "
+                "or lower CAPITAL_PER_GRID_PCT."
             )
 
         if self.ema_fast >= self.ema_slow:

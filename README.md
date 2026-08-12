@@ -12,6 +12,7 @@ Currently configured for `DOGEUSDT` in demo/testnet mode (see `.env`).
 
 ```
 main.py               entry point / trading loop
+strategy.py            Strategy protocol -- the interface main.py needs to trade
 grid.py                grid engine: level placement, fills, recentering, trailing SL
 exchange.py            Binance USDM wrapper (retries, circuit breaker, demo/live via API creds)
 risk.py                kill switch / drawdown / daily loss / recovery sizing
@@ -23,6 +24,9 @@ event_journal.py       logs/events.jsonl -- structured event log
 telegram_notifier.py   optional Telegram alerts
 logger.py              loguru setup (console + rotating file logs)
 cleanup.py             one-shot: cancel everything + close all positions
+reset_state.py         one-shot: clear saved grid/risk state, start fresh
+backtest.py            historical replay through the real grid engine
+run_backtest.py        backtest CLI (single run / sweep / robustness)
 
 configs/                tuning profiles, see below
 tools/analyze_performance.py   evidence-based tuning report, see below
@@ -108,6 +112,35 @@ Re-run it after a week or two on a new profile and compare the summary line
 (`net/day`, `fee % of gross`, `cycles/day`) against the baseline in
 `configs/balanced.env`'s header comment to see whether the change actually
 helped, rather than guessing.
+
+## Backtesting: `run_backtest.py`
+
+```bash
+python run_backtest.py --days 90                    # current .env config
+python run_backtest.py --sweep grid_count=8,10,12   # compare parameter values
+python run_backtest.py --robustness                 # measure the noise floor
+```
+
+Replays historical candles through the **real** `GridEngine` -- `SimulatedExchange`
+implements the same surface the engine calls on the live `Exchange`, so the replay
+exercises actual order placement, fill handling, recentering and post-only logic
+rather than a separate model of them. Candles come from Binance's public klines
+endpoint and are cached under `data/`; no API credentials needed.
+
+**Run `--robustness` before believing any result.** It reruns one configuration
+across many start offsets and reports `mean/stdev`. This strategy is strongly
+path-dependent: on DOGE 1h/90d, holding the config fixed and shifting only the
+starting candle moved net PnL across a ~150 USDT range. A sweep can easily rank
+noise. Below `mean/stdev ≈ 0.5` a result is indistinguishable from chance no
+matter how good the headline number looks.
+
+Known limits, all of which make results **optimistic**: no slippage or order-book
+depth, no partial fills, no funding fees, one candle per loop iteration (the live
+bot polls every 10s), and `main.py`'s kill switches are not simulated. Use it to
+compare configurations against each other -- that comparison is fair, since every
+configuration gets the same optimistic treatment -- not to predict returns.
+
+See `AUDIT.md` "Backtesting (issue #21)" for what the first run revealed.
 
 ## Recent changes
 
