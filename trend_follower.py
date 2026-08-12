@@ -164,6 +164,22 @@ class TrendFollower:
         self.active = False
         logger.error("TREND FOLLOWER EMERGENCY STOP")
 
+    def get_spread_pct(self) -> float:
+        """No orderbook depth is read by this strategy, so there is nothing to report.
+
+        Present because main.py logs the spread every iteration and the router forwards
+        the call to whichever strategy is live (AUDIT #31).
+        """
+        return 0.0
+
+    @property
+    def peak_price(self) -> float:
+        return self._peak_price
+
+    @peak_price.setter
+    def peak_price(self, value: float) -> None:
+        self._peak_price = float(value)
+
     def _cancel_entry(self, reason: str) -> None:
         if self._order_id is None:
             return
@@ -566,11 +582,19 @@ class TrendFollower:
     def update_orderbook(self, *args, **kwargs) -> None:
         return None
 
+    def reset_levels_to_pending(self, *args, **kwargs) -> int:
+        """No ladder to reset -- the position, if any, is real and stays."""
+        return 0
+
     def get_scale_out_trail_price(self, *args, **kwargs) -> float | None:
         """No scale-out: the position exits in one piece at the trailing stop."""
         return None
 
-    def log_sl_status(self) -> None:
+    def log_sl_status(self, side: str = "long") -> None:
+        """`side` is accepted and ignored: this strategy holds at most one position and
+        already knows which way it is facing. main.py passes it positionally
+        (`grid.log_sl_status(position_side)`), so dropping the parameter made every
+        stop-status log a TypeError while the follower was live (AUDIT #31)."""
         if self._side is None:
             return
         stop = self.get_stop_loss_price() if self._side == "long" else self.get_short_stop_loss_price()

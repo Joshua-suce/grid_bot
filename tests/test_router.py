@@ -47,12 +47,16 @@ class FakeStrategy:
     def update_regime(self, regime): self.regime = regime
     def get_stop_loss_price(self): return None
     def get_short_stop_loss_price(self): return None
+    def get_hard_stop_loss_price(self): return None
+    def get_short_hard_stop_loss_price(self): return None
     def update_trailing_sl(self, current_price): pass
     def update_trailing_sl_short(self, current_price): pass
     def reset_trailing(self): pass
     def reconcile_state(self): pass
     def reconcile_positions(self): pass
     def get_tracked_order_ids(self): return set()
+    def get_spread_pct(self): return 0.0
+    peak_price: float = 0.0
     def to_dict(self): return {"name": self.name}
     def load_from_dict(self, data, current_price): pass
 

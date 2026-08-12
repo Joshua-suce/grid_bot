@@ -77,6 +77,15 @@ def _install_strategy(engine: GridEngine, exchange: Exchange, events, notifier):
     )
 
 
+# Exceptions that mean "this program is wrong", as opposed to "the exchange or the
+# network misbehaved". The loop's recovery path (reconnect, resync time, retry) can do
+# nothing about these, and treating them as connection trouble is how a one-line defect
+# hid behind 27 minutes of RECONNECTED messages -- see AUDIT #31.
+BUG_ERRORS = (
+    AttributeError, TypeError, NameError, IndexError,
+    UnboundLocalError, ZeroDivisionError, AssertionError,
+)
+
 TIMEFRAME_MULTIPLIER = {
     "1m": 1440, "5m": 288, "15m": 96, "30m": 48,
     "1h": 24, "4h": 6, "1d": 1,
@@ -461,14 +470,7 @@ def run_bot() -> None:
             grid.reconcile_positions()
         else:
             logger.info("No exchange positions — resetting stale grid levels to pending")
-            for level in grid.levels:
-                level.order_id = None
-                if level.side == "sell" and level.status == "replaced":
-                    level.side = "buy"
-                    level.price = level.entry_price if level.entry_price else level.price
-                    level.status = "pending"
-                elif level.status != "pending":
-                    level.status = "pending"
+            grid.reset_levels_to_pending(exchange.get_price(settings.symbol))
             logger.info("Placing fresh grid orders after cleanup")
             grid.place_initial_orders(exchange.get_balance())
 
@@ -728,6 +730,7 @@ def run_bot() -> None:
 
     loop_count = 0
     consecutive_errors = 0
+    seen_bug_errors: set[str] = set()
     last_analytics_fill_count = 0
     try:
         while True:
@@ -798,7 +801,7 @@ def run_bot() -> None:
                             old_pnl = grid.total_pnl
                             old_fees = grid.total_fees
                             old_cycles = grid.total_completed_cycles
-                            old_peak = grid._peak_price
+                            old_peak = grid.peak_price
                             old_grid_lower, old_grid_upper = grid.grid_lower, grid.grid_upper
 
                             grid = GridEngine(
@@ -827,7 +830,7 @@ def run_bot() -> None:
                             grid.total_pnl = old_pnl
                             grid.total_fees = old_fees
                             grid.total_completed_cycles = old_cycles
-                            grid._peak_price = old_peak
+                            grid.peak_price = old_peak
                             risk.exit_recovery()
                             grid.activate(exchange.get_balance())
                             notifier.on_grid_start(settings.symbol, grid.grid_lower, grid.grid_upper, grid.grid_count)
@@ -1136,7 +1139,7 @@ def run_bot() -> None:
                     pnl_reconciler.net_realized_pnl, pnl_reconciler.daily_net_pnl,
                     balance, equity,
                     "ON" if grid.active else "OFF", trend.regime.value,
-                    grid._last_orderbook.get("spread_pct", 0) * 100,
+                    grid.get_spread_pct() * 100,
                 )
 
                 if grid.active and grid.total_fills > 0 and grid.total_fills % 10 == 0 and grid.total_fills != last_analytics_fill_count:
@@ -1150,7 +1153,43 @@ def run_bot() -> None:
                 raise
             except Exception as e:
                 consecutive_errors += 1
-                logger.error("Loop error (consecutive={}): {}", consecutive_errors, e)
+                signature = f"{type(e).__name__}: {e}"
+
+                if isinstance(e, BUG_ERRORS):
+                    # A defect in this program, not a market or network problem.
+                    # Reconnecting cannot fix it and the old handler did exactly that
+                    # every third iteration, burning the poll budget while logging only
+                    # str(e) -- an AttributeError reads as the bare attribute name, so
+                    # 27 minutes of log said "Loop error: _last_orderbook" and nothing
+                    # else. Log the type and a traceback, alert once, and keep the loop
+                    # running at full speed so whatever still works keeps working
+                    # (AUDIT #31).
+                    first_time = signature not in seen_bug_errors
+                    if first_time or consecutive_errors % 10 == 0:
+                        logger.opt(exception=True).error(
+                            "BUG IN LOOP (consecutive={}) | {} | this is a code defect, "
+                            "not a connection problem", consecutive_errors, signature,
+                        )
+                    else:
+                        logger.error("BUG IN LOOP (consecutive={}) | {}", consecutive_errors, signature)
+                    if first_time:
+                        seen_bug_errors.add(signature)
+                        try:
+                            notifier.send(
+                                f"<b>BOT DEFECT</b>\n{signature}\n"
+                                f"The trading loop is raising every iteration. Orders "
+                                f"already placed remain on the exchange."
+                            )
+                        except Exception:
+                            pass
+                    # Deliberately no auto-shutdown: emergency_stop cancels the resting
+                    # stop-loss orders too, so killing the bot over a defect that may
+                    # sit in the tail of the iteration would leave an open position
+                    # with nothing protecting it. Loud and running beats silent and flat.
+                    time.sleep(settings.poll_interval)
+                    continue
+
+                logger.error("Loop error (consecutive={}): {}", consecutive_errors, signature)
                 if "-1021" in str(e):
                     exchange._sync_time()
                     time.sleep(2)

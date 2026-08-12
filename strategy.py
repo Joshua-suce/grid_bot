@@ -179,6 +179,21 @@ class Strategy(Protocol):
         """Restore from a state file, setting state_corrupted if unusable."""
         ...
 
+    # --- observability -----------------------------------------------------
+
+    def get_spread_pct(self) -> float:
+        """Last observed bid/ask spread as a fraction of price, 0.0 if unknown.
+
+        On the protocol rather than GRID_SPECIFIC_MEMBERS because main.py logs it every
+        iteration unconditionally, so anything the router can install must answer it.
+        """
+        ...
+
+    peak_price: float
+    """Ratchet anchor for the long stops. Readable *and* writable: main.py carries it
+    across the engine rebuild in recovery so the stop does not reset to the current
+    price on a position that is still open."""
+
     # --- metrics -----------------------------------------------------------
 
     total_fills: int
@@ -192,6 +207,7 @@ class Strategy(Protocol):
 # conformance test can report the remaining coupling instead of it living in prose.
 GRID_SPECIFIC_MEMBERS = (
     "recenter",
+    "reset_levels_to_pending",
     "grid_lower",
     "grid_upper",
     "grid_count",

@@ -51,6 +51,14 @@ DEFAULT_ROUTING = {
     "downtrend": "trend",
 }
 
+# Public attributes that belong to the router itself. Everything else assigned on a
+# router instance is forwarded to the live strategy -- see __setattr__.
+_ROUTER_OWNED = frozenset({
+    "strategies", "routing", "default", "min_regime_seconds", "handoff_grace_seconds",
+    "exchange", "symbol", "active_name",
+    "switches", "failed_handoffs", "deferred_ticks", "forced_flattens",
+})
+
 
 class StrategyRouter:
     """Presents one Strategy to main.py; switches which one is really trading."""
@@ -106,6 +114,11 @@ class StrategyRouter:
 
         Covers the grid-specific surface main.py still calls. Guarded against
         recursion during __init__ before `strategies` exists.
+
+        Private names are NOT forwarded: `_regime`, `_pending_name` and friends belong
+        to the router, and forwarding them would mean an internal typo silently read a
+        strategy's unrelated attribute instead of failing. Callers must use public
+        members -- test_strategy.py enforces that main.py does (AUDIT #31).
         """
         if name.startswith("_") or name in ("strategies", "active_name"):
             raise AttributeError(name)
@@ -115,6 +128,32 @@ class StrategyRouter:
         except AttributeError:
             raise AttributeError(name) from None
         return getattr(strategies[active], name)
+
+    def __setattr__(self, name: str, value) -> None:
+        """Route writes to the live strategy, mirroring __getattr__.
+
+        Without this, `grid.total_fills = old_fills` -- which main.py does when it
+        rebuilds the engine after recovery -- lands in the router's own __dict__. From
+        then on every read finds that stale shadow copy first and __getattr__ is never
+        consulted, so the counters freeze at whatever was restored and the strategy's
+        real figures never surface again. Same for `peak_price`, where the shadow would
+        strand the stop ratchet's anchor on the wrong object.
+        """
+        if (name.startswith("_")
+                or name in _ROUTER_OWNED
+                or "strategies" not in self.__dict__):
+            object.__setattr__(self, name, value)
+            return
+
+        declared = getattr(type(self), name, None)
+        if isinstance(declared, property):
+            if declared.fset is not None:
+                object.__setattr__(self, name, value)   # the router's own setter
+                return
+            # A read-only aggregate like total_fills, which reads through to the live
+            # strategy. Writes belong there too -- shadowing them on the router would
+            # freeze the figure the property was written to expose.
+        setattr(self.strategies[self.active_name], name, value)
 
     # --- regime handling ---------------------------------------------------
 
@@ -372,6 +411,17 @@ class StrategyRouter:
     def update_volatility(self, atr_pct: float) -> None:
         for s in self.strategies.values():
             s.update_volatility(atr_pct)
+
+    def get_spread_pct(self) -> float:
+        return self.strategy.get_spread_pct()
+
+    @property
+    def peak_price(self) -> float:
+        return self.strategy.peak_price
+
+    @peak_price.setter
+    def peak_price(self, value: float) -> None:
+        self.strategy.peak_price = value
 
     def get_stop_loss_price(self):
         return self.strategy.get_stop_loss_price()

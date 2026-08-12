@@ -131,3 +131,60 @@ def test_unknown_order_does_not_count_as_fired():
 
 def test_missing_status_does_not_count_as_fired():
     assert trail_stop_fired({"id": "x"}) is False
+
+
+# --- #31: the startup reset must not damage the ladder ---------------------
+
+def _reset_engine():
+    from grid import GridEngine
+
+    class _Stub:
+        class exchange:
+            @staticmethod
+            def amount_to_precision(symbol, amount):
+                return f"{float(amount):.0f}"
+
+            @staticmethod
+            def price_to_precision(symbol, price):
+                return f"{float(price):.5f}"
+
+    return GridEngine(
+        exchange=_Stub(), symbol="DOGEUSDT",
+        grid_lower=0.0690, grid_upper=0.0716, grid_count=10,
+        capital_per_grid_pct=0.018, stop_loss_pct=0.03,
+    )
+
+
+def test_reset_to_pending_keeps_the_ladder_whole():
+    """A replaced sell reverts to a buy at its entry price, which can collide with the
+    buy already sitting there. Before this lived in the engine the duplicate was saved
+    and only merged on the *next* start -- the log said "DEDUPLICATED 1 levels (10 -> 9)"
+    followed by a refill, every restart (AUDIT #31)."""
+    engine = _reset_engine()
+    engine.initialize(0.0703, balance=5000)
+    before = len(engine.levels)
+
+    collide_with = engine.levels[0]
+    victim = engine.levels[-1]
+    victim.side = "sell"
+    victim.status = "replaced"
+    victim.entry_price = collide_with.price      # reverts straight onto an occupied slot
+    victim.order_id = "stale-1"
+
+    engine.reset_levels_to_pending(0.0703)
+
+    prices_sides = [(l.price, l.side) for l in engine.levels]
+    assert len(prices_sides) == len(set(prices_sides)), f"duplicate slots left: {prices_sides}"
+    assert len(engine.levels) == before, "the ladder lost a line"
+    assert all(l.order_id is None for l in engine.levels)
+    assert all(l.status == "pending" for l in engine.levels)
+
+
+def test_reset_to_pending_leaves_a_clean_ladder_untouched():
+    engine = _reset_engine()
+    engine.initialize(0.0703, balance=5000)
+    before = [(l.price, l.side) for l in engine.levels]
+
+    engine.reset_levels_to_pending(0.0703)
+
+    assert [(l.price, l.side) for l in engine.levels] == before

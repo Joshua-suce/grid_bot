@@ -894,6 +894,98 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 31. Router mode crashed every iteration on a private attribute -- CRITICAL
+
+The 19:22 demo run placed its ten orders, logged `GRID ACTIVATED`, and then produced
+this for twenty-seven minutes:
+
+```
+19:23:37 | ERROR | Loop error (consecutive=1): _last_orderbook
+19:23:52 | ERROR | Loop error (consecutive=2): _last_orderbook
+19:24:17 | ERROR | Loop error (consecutive=3): _last_orderbook
+19:24:17 | WARNING | Multiple consecutive errors — attempting reconnection
+19:24:34 | INFO  | RECONNECTED | exchange connection restored
+```
+
+`main.py` logged the spread with `grid._last_orderbook.get("spread_pct", 0)`. In router
+mode `grid` is a `StrategyRouter`, whose `__getattr__` refuses to forward underscore
+names -- forwarding them would let an internal typo silently read a strategy's
+unrelated attribute. So the status log raised `AttributeError` on every iteration.
+
+What it actually cost, precisely: the crash is in the *tail* of the loop, after fills,
+stops, recentering and the state save. Trading logic ran. What did not run was the
+`PRICE=... fills=... net=...` status line -- so the run was completely unobservable --
+and `consecutive_errors = 0`, so the counter climbed to 3 every third iteration and
+triggered a reconnect that could not possibly help. Each cycle burned 10-25s of a 10s
+poll interval on reconnect and reconcile traffic.
+
+Four separate defects made that possible, and all four are fixed.
+
+**The private access itself.** `get_spread_pct()` and a `peak_price` property are now
+public on both strategies and on the protocol, and the router delegates both
+explicitly. (`isinstance` against a `runtime_checkable` Protocol uses
+`inspect.getattr_static`, which never fires `__getattr__` -- a forwarding proxy only
+satisfies the protocol for members its own class actually declares.)
+
+**The test that was supposed to catch it, didn't.** The step-2 boundary test scanned
+main.py for `grid.<member>` and then dropped the private ones:
+
+```python
+used = {u for u in used if not u.startswith("_")}   # private probes are not contract
+```
+
+They are exactly the contract that breaks. That line is gone, replaced by three checks
+that fail on the real failure mode rather than a naming convention:
+
+- no `grid._private` access in main.py at all;
+- every member main.py touches must *resolve* on a real router with each strategy live;
+- every call site main.py makes must *bind* against each strategy's signature.
+
+The last one immediately found a second live crash nobody had hit yet:
+`TrendFollower.log_sl_status(self)` against main.py's `grid.log_sl_status(side)` --
+`TypeError` on every stop-status log once the follower took over.
+
+**Writes were shadowing too.** `grid.total_fills = old_fills` and
+`grid._peak_price = old_peak`, which main.py runs when it rebuilds the engine after
+recovery, landed in the router's own `__dict__`. From that point every read finds the
+stale shadow first and `__getattr__` is never consulted. The router now has
+`__setattr__`, routing writes to the live strategy and keeping only its own bookkeeping
+locally; read-only aggregate properties forward writes rather than raising.
+
+**The handler hid all of it.** `logger.error("Loop error ...: {}", e)` prints an
+`AttributeError` as the bare attribute name -- no type, no traceback, no line. Bug-class
+exceptions (`AttributeError`, `TypeError`, `NameError`, `IndexError`,
+`UnboundLocalError`, `ZeroDivisionError`, `AssertionError`) are now logged with type and
+traceback, alert once over Telegram, and do **not** trigger the reconnect path, which
+can never fix a code defect. There is deliberately no auto-shutdown on them:
+`emergency_stop` cancels the resting stop-loss orders too, so killing the bot over a
+defect that may sit in the tail of the iteration would leave an open position with
+nothing protecting it. Loud and running beats silent and flat.
+
+### Also fixed: the reset that quietly cost a grid line every restart
+
+The same startup path logged this on the same run:
+
+```
+DEDUPLICATED 1 levels with duplicate price+side (10 -> 9)
+RECOVERED grid state | refilled 1 empty grid line(s)
+```
+
+When the exchange reports no position at startup, main.py reverted each replaced sell
+to a buy at its entry price -- and that price can already be occupied. The duplicate was
+saved to the state file and only merged on the *next* start, which then rebuilt the lost
+line from scratch, discarding its fill and cycle bookkeeping. That loop was also raw
+`GridLevel` mutation living in main.py, which the router has no business forwarding.
+
+It is now `GridEngine.reset_levels_to_pending()`, which merges and refills in the
+session that created the duplicate. `TrendFollower` answers it with a no-op.
+
+Verified adversarially: reverting the private access fails 4 tests, reverting the
+`log_sl_status` signature fails 2, and reverting either strategy fix fails its own.
+387 tests pass.
+
+---
+
 ## Aggression without dormancy: the router's two remaining defects (#29-#30)
 
 Both found while chasing one instruction: *be profitable in all trends and never

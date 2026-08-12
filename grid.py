@@ -324,6 +324,26 @@ class GridEngine:
     def update_orderbook(self) -> None:
         self._last_orderbook = self.exchange.get_orderbook_depth(self.symbol)
 
+    def get_spread_pct(self) -> float:
+        """Last observed bid/ask spread as a fraction of price, 0.0 if never read.
+
+        Public because main.py logs it. It used to read `_last_orderbook` directly,
+        which the router refuses to forward -- see AUDIT #31.
+        """
+        return float(self._last_orderbook.get("spread_pct", 0.0) or 0.0)
+
+    @property
+    def peak_price(self) -> float:
+        """Highest price seen while the current long has been open -- the anchor the
+        trailing and hard stops ratchet against. Public for the same reason: main.py
+        carries it across the engine rebuild in recovery, and reaching into
+        `_peak_price` through the router raised AttributeError every iteration."""
+        return self._peak_price
+
+    @peak_price.setter
+    def peak_price(self, value: float) -> None:
+        self._peak_price = float(value)
+
     def get_tracked_order_ids(self) -> set[str]:
         """Return set of order IDs currently tracked by grid levels."""
         return {l.order_id for l in self.levels if l.order_id is not None}
@@ -1474,7 +1494,7 @@ class GridEngine:
             pending_orders, replaced_orders,
             buy_levels, sell_levels, range_pct,
             self._volatility_mult, self.get_stop_loss_price(),
-            exposure, self._last_orderbook.get("spread_pct", 0) * 100,
+            exposure, self.get_spread_pct() * 100,
         )
 
     def _rebuild_levels(self, current_price: float | None = None) -> None:
@@ -1527,6 +1547,46 @@ class GridEngine:
             "_sell_scale": self._sell_scale,
             "levels": [l.to_dict() for l in self.levels],
         }
+
+    def reset_levels_to_pending(self, current_price: float | None = None) -> int:
+        """Clear every level's order id and return it to a pending buy at its own price.
+
+        Called when the exchange reports no position at startup: whatever the state file
+        believed about resting orders and half-finished cycles is stale, and the ladder
+        should be rebuilt from its own prices.
+
+        Reverting a replaced sell to a buy at its entry price is what makes this more
+        than a loop over `levels`: two levels can land on the same price+side, and until
+        this lived in the engine that duplicate was saved to the state file and only
+        noticed on the *next* start ("DEDUPLICATED 1 levels ... 10 -> 9", then a refill
+        that rebuilt the lost line from scratch). Merging and refilling here keeps the
+        ladder whole in the session that damaged it, and keeps main.py out of GridLevel
+        internals -- which the router cannot forward safely anyway (AUDIT #31).
+
+        Returns the number of levels reset.
+        """
+        reset = 0
+        for level in self.levels:
+            level.order_id = None
+            if level.side == "sell" and level.status == "replaced":
+                level.side = "buy"
+                level.price = level.entry_price if level.entry_price else level.price
+                level.status = "pending"
+                reset += 1
+            elif level.status != "pending":
+                level.status = "pending"
+                reset += 1
+
+        before = len(self.levels)
+        self._dedupe_levels()
+        if len(self.levels) != before:
+            logger.warning(
+                "RESET LEVELS | merged {} duplicate price+side level(s) created by the reset",
+                before - len(self.levels),
+            )
+            self._refill_missing_grid_lines(current_price)
+        self.levels.sort(key=lambda l: l.price)
+        return reset
 
     def _dedupe_levels(self) -> None:
         """Merge duplicate price+side slots while preserving active bookkeeping.
