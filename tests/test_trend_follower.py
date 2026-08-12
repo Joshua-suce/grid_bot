@@ -391,3 +391,14 @@ def test_a_paused_strategy_does_not_arm_itself():
     tf.check_fills(5000)
 
     assert ex.placed == []
+
+
+def test_price_is_never_outside_a_strategy_that_has_no_range():
+    """main.py's escape checks (`price < grid_lower`, `price > grid_upper`) run against
+    whatever the router has live. A zero-width range at the origin makes the upper test
+    true at every price, which logged GRID EXIT and journalled an event every iteration
+    while the follower was flat (AUDIT #31)."""
+    tf, ex = make()
+    for price in (0.00001, 0.0705, 1_000_000.0):
+        assert not (price < tf.grid_lower)
+        assert not (price > tf.grid_upper)

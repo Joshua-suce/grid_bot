@@ -559,13 +559,20 @@ class TrendFollower:
 
     levels: list = []
 
+    # An unbounded range, not a zero-width one at the origin. main.py tests
+    # `price < grid.grid_lower` and `price > grid.grid_upper` to detect price escaping
+    # the ladder; with 0.0 for both, the upper test is true at every price, and while
+    # the follower was flat that logged GRID EXIT and journalled an event once per
+    # iteration for as long as it stayed live. A strategy with no ladder is never
+    # outside it (AUDIT #31).
+
     @property
     def grid_lower(self) -> float:
         return 0.0
 
     @property
     def grid_upper(self) -> float:
-        return 0.0
+        return float("inf")
 
     @property
     def grid_count(self) -> int:

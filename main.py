@@ -100,8 +100,8 @@ def build_scale_out_orders(
     side: str,
     qty: float,
     scale_out_pct: float,
-    trail_price: float,
-    hard_price: float,
+    trail_price: float | None,
+    hard_price: float | None,
     rounder=None,
     scale_out_done: bool = False,
     startup_trail_price: float = None,
@@ -117,6 +117,19 @@ def build_scale_out_orders(
     yet, `startup_trail_price` (an above-hard anchor, e.g. peak*(1-stop_loss_pct))
     may be passed to arm the split immediately.
     """
+    if trail_price is None or hard_price is None:
+        # The strategy has no stop to offer for this side -- it holds nothing there.
+        # Reachable when the exchange still reports a position the live strategy has
+        # already closed, or right after a handoff: asking a flat trend follower for a
+        # short stop returns None, and the arithmetic below raised TypeError in the
+        # loop (AUDIT #31). No stop is better than a crash; the next iteration re-reads
+        # the position and places one if it is really there.
+        logger.warning(
+            "STOP-LOSS | no {} stop available from the live strategy (trail={} hard={}) "
+            "-- skipping this refresh", side, trail_price, hard_price,
+        )
+        return []
+
     scale = min(max(scale_out_pct, 0.0), 0.95)
     def _round(v: float) -> float:
         return float(rounder(v)) if rounder else float(v)

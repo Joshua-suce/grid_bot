@@ -980,9 +980,26 @@ line from scratch, discarding its fill and cycle bookkeeping. That loop was also
 It is now `GridEngine.reset_levels_to_pending()`, which merges and refills in the
 session that created the duplicate. `TrendFollower` answers it with a no-op.
 
+### Two more that the same audit turned up
+
+Both were reachable in router mode and neither had been hit yet.
+
+**Every price was "outside" the trend follower's range.** `grid_lower` and `grid_upper`
+both returned 0.0, and main.py tests `price > grid.grid_upper` to detect price escaping
+the ladder. That is true at every price, so while the follower was live and flat the
+loop logged GRID EXIT and journalled an event once per iteration. `grid_upper` is now
+`inf`: a strategy with no ladder is never outside it.
+
+**A missing stop price crashed the stop refresh.** `build_scale_out_orders` computed
+`abs(trail_price - hard_price)` without checking for None. A flat trend follower returns
+None for both -- reachable when the exchange still reports a position the strategy has
+already closed, or in the iteration right after a handoff. It now returns no orders and
+warns, so the next iteration re-reads the position and places a stop if it is really
+there. No stop for one iteration is recoverable; a TypeError every iteration is not.
+
 Verified adversarially: reverting the private access fails 4 tests, reverting the
 `log_sl_status` signature fails 2, and reverting either strategy fix fails its own.
-387 tests pass.
+390 tests pass.
 
 ---
 

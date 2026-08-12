@@ -238,3 +238,19 @@ def test_run_bot_aborts_on_dirty_book(monkeypatch):
     monkeypatch.setattr(main_module.settings, "telegram_enabled", False)
     monkeypatch.setattr(main_module, "setup_logging", lambda *a, **k: None)
     main_module.run_bot()
+
+
+def test_build_scale_out_orders_returns_nothing_when_no_stop_is_available():
+    """AUDIT #31. The live strategy can legitimately have no stop for a side -- a trend
+    follower that just closed, or one that is flat while the exchange still reports the
+    position for an iteration. Both prices come back None and the arithmetic raised
+    TypeError inside the trading loop. Skipping the refresh is recoverable; crashing
+    every iteration is not."""
+    assert build_scale_out_orders("short", 5000.0, 0.5, trail_price=None, hard_price=None) == []
+    assert build_scale_out_orders("long", 5000.0, 0.5, trail_price=0.069, hard_price=None) == []
+    assert build_scale_out_orders("long", 5000.0, 0.5, trail_price=None, hard_price=0.069) == []
+
+
+def test_build_scale_out_orders_still_works_with_real_prices():
+    orders = build_scale_out_orders("long", 5000.0, 0.5, trail_price=0.0700, hard_price=0.0680)
+    assert [k for k, _, _ in orders] == ["trail", "hard"]
