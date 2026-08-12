@@ -840,6 +840,60 @@ abstraction rotting the way an undocumented interface would.
 
 ---
 
+## Router backtest support (#27) and the deadlock it found (#28)
+
+`backtest.py` gained `use_router=True`, which wraps the engine alongside a
+`TrendFollower` in a `StrategyRouter` exactly as main.py's `_install_strategy` does,
+and drives the loop through `strategy` rather than `engine`. Two mechanical
+prerequisites:
+
+- **`SimulatedExchange.get_price()`** -- TrendFollower sizes and stops off it.
+- **The virtual clock now patches three modules**, not one. `grid.py`, `router.py` and
+  `trend_follower.py` all gate on `time.time()`: replacement (20s), recentering (180s),
+  the router's regime hold (900s), the follower's minimum hold (300s). Patching only
+  `grid` would leave the others on the real clock, which never advances relative to
+  simulated candles -- the router would switch on the first reading and the follower
+  could never satisfy its hold.
+
+### 28. The handoff could never complete in live trading -- CRITICAL
+
+The first router replay returned `strategy switches: 0` and `time paused: 99.3%`
+despite `handoff grid -> trend starting` appearing in the log. The handoff began and
+never finished.
+
+`_continue_handoff` was driven only from `place_initial_orders`. In main.py:
+
+```
+L471   grid.place_initial_orders(...)     <- once, at startup, BEFORE the loop
+L731   while True:
+L903       if grid.active:                <- everything else lives in here
+L957           grid.check_fills(...)
+L1036          grid.set_position_limit(...)
+```
+
+`place_initial_orders` is never called inside the loop, and every other strategy call
+sits behind `if grid.active:`. Since `_begin_handoff` pauses the outgoing strategy,
+`active` goes False and none of them run. **The bot would have paused the grid on the
+first confirmed trend and stopped trading permanently** -- no orders, no fills, no
+recovery, holding whatever position it had.
+
+`update_regime` is the only strategy call main.py makes unconditionally every
+iteration, so the handoff is now driven from there as well and completes in one call
+in the normal case. `_current_balance()` reads the balance the router already has an
+exchange reference for, falling back to 0.0 rather than aborting.
+
+The flat-before-handover rule is unchanged: `test_update_regime_driven_handoff_still_
+refuses_to_hand_over_dirty` pins that driving it from a new place did not weaken it.
+
+**This is the backtester paying for itself a second time.** The bug was unreachable by
+unit tests -- every router test called `place_initial_orders`, because that is how the
+router was designed to be driven. Only replaying against main.py's actual call pattern
+exposed it, and `STRATEGY_MODE=router` was already enabled in `.env` at the time.
+
+Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
+
+---
+
 ## Stop-loss protection defects from the 2026-08-12 live run (issues #25-#26)
 
 Both surfaced at the same instant -- the 14:06 recenter -- and share a shape: an event

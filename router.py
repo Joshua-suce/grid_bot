@@ -141,6 +141,33 @@ class StrategyRouter:
         if (now - self._pending_since) >= self.min_regime_seconds:
             self._begin_handoff(target)
 
+        # Drive the handoff to completion here, not only from place_initial_orders.
+        #
+        # main.py calls place_initial_orders exactly once, at startup, before the loop
+        # begins; every other strategy call in the loop sits behind `if grid.active:`.
+        # Since _begin_handoff pauses the outgoing strategy, active goes False and none
+        # of those run -- so a handoff driven only from place_initial_orders would never
+        # advance and the bot would stop trading permanently on the first confirmed
+        # trend. update_regime is the one call made unconditionally every iteration, so
+        # progress is anchored to it. Caught by the router backtest (AUDIT #28).
+        if self._handoff_target is not None:
+            self._continue_handoff(self._current_balance())
+
+    def _current_balance(self) -> float:
+        """Balance for activating the incoming strategy.
+
+        update_regime has no balance argument, so read it from the exchange. A failure
+        here must not abort the handoff -- 0.0 still lets activate() run, and the next
+        loop iteration supplies a real figure.
+        """
+        if self.exchange is None:
+            return 0.0
+        try:
+            return float(self.exchange.get_balance())
+        except Exception as e:
+            logger.debug("ROUTER | balance read failed during handoff ({})", e)
+            return 0.0
+
     def _begin_handoff(self, target: str) -> None:
         logger.info("ROUTER | handoff {} -> {} starting", self.active_name, target)
         self._handoff_target = target

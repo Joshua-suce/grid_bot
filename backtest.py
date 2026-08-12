@@ -48,8 +48,12 @@ import pandas as pd
 from loguru import logger
 
 import grid as grid_module
+import router as router_module
+import trend_follower as trend_module
 from exchange import PostOnlyWouldCross
 from grid import GridEngine
+from router import StrategyRouter
+from trend_follower import TrendFollower
 
 MIN_NOTIONAL_USDT = 5.0
 
@@ -84,19 +88,31 @@ class VirtualClock:
 
 
 class _clock_installed:
-    """Context manager swapping GridEngine's `time` module for a VirtualClock."""
+    """Swap the `time` module for a VirtualClock in every module that gates on it.
+
+    grid.py, router.py and trend_follower.py all call time.time() for cooldowns --
+    replacement (20s), recentering (180s), the router's regime hold (900s) and the
+    trend follower's minimum hold (300s). Patching only one of them would leave the
+    others reading the real clock, which in a replay never advances relative to the
+    simulated candles: the router would switch on the first reading and the trend
+    follower could never satisfy its hold. All three or none.
+    """
+
+    _TARGETS = (grid_module, router_module, trend_module)
 
     def __init__(self, clock: VirtualClock):
         self.clock = clock
-        self._saved = None
+        self._saved: list = []
 
     def __enter__(self) -> VirtualClock:
-        self._saved = grid_module.time
-        grid_module.time = self.clock
+        self._saved = [(m, m.time) for m in self._TARGETS]
+        for m in self._TARGETS:
+            m.time = self.clock
         return self.clock
 
     def __exit__(self, *exc) -> None:
-        grid_module.time = self._saved
+        for module, original in self._saved:
+            module.time = original
 
 
 # --------------------------------------------------------------------------
@@ -183,6 +199,10 @@ class SimulatedExchange:
 
     def get_balance(self) -> float:
         return self.equity
+
+    def get_price(self, symbol: str) -> float:
+        """Last traded price. TrendFollower sizes and stops off this."""
+        return self.price
 
     def get_positions(self, symbol: str) -> list[dict]:
         if self.position_qty == 0:
@@ -397,6 +417,8 @@ class BacktestResult:
     rejected_reduce_only: int = 0
     rejected_min_notional: int = 0
     stop_loss_hits: int = 0
+    strategy_switches: int = 0
+    failed_handoffs: int = 0
     time_in_position_pct: float = 0.0
     time_paused_pct: float = 0.0
     equity_curve: list[float] = field(default_factory=list, repr=False)
@@ -440,6 +462,8 @@ class BacktestResult:
             "",
             f"  recenters            {self.recenters}",
             f"  stop-loss hits       {self.stop_loss_hits}",
+            f"  strategy switches    {self.strategy_switches}",
+            f"  failed handoffs      {self.failed_handoffs}",
             f"  crossing refused     {self.rejected_crossing}",
             f"  reduceOnly rejected  {self.rejected_reduce_only}",
             f"  min-notional skipped {self.rejected_min_notional}",
@@ -474,6 +498,11 @@ def run_backtest(
     price_decimals: int = 5,
     amount_decimals: int = 0,
     use_trend_filter: bool = False,
+    use_router: bool = False,
+    trend_capital_pct: float = 0.10,
+    trend_atr_stop_multiplier: float = 2.0,
+    trend_min_hold_seconds: int = 300,
+    router_min_regime_seconds: int = 900,
     adx_trend_threshold: float = 30.0,
     adx_range_threshold: float = 20.0,
     ema_fast: int = 20,
@@ -500,7 +529,12 @@ def run_backtest(
             recenter_cooldown=recenter_cooldown, replacement_cooldown=replacement_cooldown,
             recenter_margin_pct=recenter_margin_pct, candle_seconds=candle_seconds,
             warmup=warmup, price_decimals=price_decimals, amount_decimals=amount_decimals,
-            use_trend_filter=use_trend_filter, adx_trend_threshold=adx_trend_threshold,
+            use_trend_filter=use_trend_filter, use_router=use_router,
+            trend_capital_pct=trend_capital_pct,
+            trend_atr_stop_multiplier=trend_atr_stop_multiplier,
+            trend_min_hold_seconds=trend_min_hold_seconds,
+            router_min_regime_seconds=router_min_regime_seconds,
+            adx_trend_threshold=adx_trend_threshold,
             adx_range_threshold=adx_range_threshold, ema_fast=ema_fast, ema_slow=ema_slow,
             adx_period=adx_period,
         )
@@ -547,7 +581,9 @@ def _run(ohlcv, *, symbol, starting_balance, grid_count, capital_per_grid_pct,
          max_position_pct, max_exposure_pct, range_atr_multiplier, min_profit_multiplier,
          maker_fee, taker_fee, stop_loss_pct, trailing_sl_trigger_pct, recenter_cooldown,
          replacement_cooldown, recenter_margin_pct, candle_seconds, warmup,
-         price_decimals, amount_decimals, use_trend_filter, adx_trend_threshold,
+         price_decimals, amount_decimals, use_trend_filter, use_router,
+         trend_capital_pct, trend_atr_stop_multiplier, trend_min_hold_seconds,
+         router_min_regime_seconds, adx_trend_threshold,
          adx_range_threshold, ema_fast, ema_slow, adx_period) -> BacktestResult:
     from trend_filter import atr as calc_atr
 
@@ -565,7 +601,7 @@ def _run(ohlcv, *, symbol, starting_balance, grid_count, capital_per_grid_pct,
     regimes = (
         _regime_series(ohlcv, ema_fast, ema_slow, adx_period,
                        adx_trend_threshold, adx_range_threshold)
-        if use_trend_filter else None
+        if (use_trend_filter or use_router) else None
     )
 
     seed = ohlcv.iloc[warmup]
@@ -603,9 +639,33 @@ def _run(ohlcv, *, symbol, starting_balance, grid_count, capital_per_grid_pct,
             max_exposure_pct=max_exposure_pct,
             min_profit_multiplier=min_profit_multiplier,
         )
-        engine.initialize(price, balance=starting_balance)
-        engine.place_initial_orders(starting_balance)
-        engine.active = True
+        # In router mode the engine is wrapped alongside a trend follower, exactly as
+        # main.py's _install_strategy does it. `strategy` is what the loop drives; the
+        # router satisfies the same interface and delegates, so nothing below changes.
+        if use_router:
+            trend = TrendFollower(
+                ex, symbol,
+                capital_pct=trend_capital_pct,
+                stop_loss_pct=stop_loss_pct,
+                trailing_sl_trigger_pct=trailing_sl_trigger_pct,
+                atr_stop_multiplier=trend_atr_stop_multiplier,
+                leverage=1,
+                max_exposure_pct=max_exposure_pct,
+                min_hold_seconds=trend_min_hold_seconds,
+            )
+            strategy = StrategyRouter(
+                strategies={"grid": engine, "trend": trend},
+                default="grid",
+                min_regime_seconds=router_min_regime_seconds,
+                exchange=ex,
+                symbol=symbol,
+            )
+        else:
+            strategy = engine
+
+        strategy.initialize(price, balance=starting_balance)
+        strategy.place_initial_orders(starting_balance)
+        strategy.active = True
 
         peak_equity = ex.equity
         in_position_candles = 0
@@ -624,16 +684,16 @@ def _run(ohlcv, *, symbol, starting_balance, grid_count, capital_per_grid_pct,
             # Mirror main.py's per-iteration bookkeeping.
             atr_now = float(atr_series.iloc[i])
             if not pd.isna(atr_now) and c > 0:
-                engine.update_volatility(atr_now / c)
+                strategy.update_volatility(atr_now / c)
 
             long_qty = max(0.0, ex.position_qty)
             short_qty = max(0.0, -ex.position_qty)
             max_qty = (balance * max_position_pct) / c if c > 0 else 0.0
-            engine.set_position_limit(
+            strategy.set_position_limit(
                 long_position=long_qty, short_position=short_qty, max_position_qty=max_qty,
             )
 
-            fills = engine.check_fills(balance)
+            fills = strategy.check_fills(balance)
             for f in fills:
                 if f and f.get("completed_cycle"):
                     result.completed_cycles += 1
@@ -642,39 +702,47 @@ def _run(ohlcv, *, symbol, starting_balance, grid_count, capital_per_grid_pct,
 
             # Stop-loss enforcement.
             if ex.position_qty > 0:
-                engine.update_trailing_sl(c)
-                sl = engine.get_stop_loss_price()
+                strategy.update_trailing_sl(c)
+                sl = strategy.get_stop_loss_price()
                 if sl and l <= sl:
                     ex.price = sl
                     ex.close_position(symbol)
-                    engine.reset_trailing()
+                    strategy.reset_trailing()
                     result.stop_loss_hits += 1
             elif ex.position_qty < 0:
-                engine.update_trailing_sl_short(c)
-                sl = engine.get_short_stop_loss_price()
+                strategy.update_trailing_sl_short(c)
+                sl = strategy.get_short_stop_loss_price()
                 if sl and h >= sl:
                     ex.price = sl
                     ex.close_position(symbol)
-                    engine.reset_trailing()
+                    strategy.reset_trailing()
                     result.stop_loss_hits += 1
 
             # Trend gating, mirroring main.py: a confirmed trend pauses the grid
             # (cancelling resting orders) but does NOT close the open position -- only
             # the stop-loss protects it from there.
             if regimes is not None:
-                trending = regimes[i] in ("uptrend", "downtrend")
-                if trending and engine.active:
-                    engine.pause()
-                elif not trending and not engine.active:
-                    engine.active = True
-                if not engine.active:
+                if use_router:
+                    # The router owns pause/activate: a trend hands over to the trend
+                    # follower rather than stopping. Feeding it the regime is the whole
+                    # interface -- place_initial_orders below drives any handoff.
+                    strategy.update_regime(regimes[i])
+                else:
+                    trending = regimes[i] in ("uptrend", "downtrend")
+                    if trending and engine.active:
+                        engine.pause()
+                    elif not trending and not engine.active:
+                        engine.active = True
+                if not strategy.active:
                     paused_candles += 1
 
-            if engine.active:
-                if engine.recenter(c, balance, margin_pct=recenter_margin_pct):
+            if strategy.active:
+                # recenter is grid-specific; the router forwards it to whichever
+                # strategy is live and the trend follower answers False.
+                if strategy.recenter(c, balance, margin_pct=recenter_margin_pct):
                     result.recenters += 1
                 # Re-arm any level left unplaced (crossing, cooldown, min-notional).
-                engine.place_initial_orders(balance)
+                strategy.place_initial_orders(balance)
 
             if ex.position_qty != 0:
                 in_position_candles += 1
@@ -694,7 +762,7 @@ def _run(ohlcv, *, symbol, starting_balance, grid_count, capital_per_grid_pct,
         result.gross_realized = ex.realized_pnl
         result.fees_paid = ex.fees_paid
         result.net_pnl = ex.realized_pnl - ex.fees_paid
-        result.engine_reported_pnl = engine.total_pnl - engine.total_fees
+        result.engine_reported_pnl = strategy.total_pnl - strategy.total_fees
         result.fills = len(ex.fill_log)
         result.maker_fills = ex.maker_fills
         result.taker_fills = ex.taker_fills
@@ -703,6 +771,9 @@ def _run(ohlcv, *, symbol, starting_balance, grid_count, capital_per_grid_pct,
         result.rejected_min_notional = ex.rejected_min_notional
         result.time_in_position_pct = in_position_candles / max(1, result.candles)
         result.time_paused_pct = paused_candles / max(1, result.candles)
+        if use_router:
+            result.strategy_switches = strategy.switches
+            result.failed_handoffs = strategy.failed_handoffs
 
     return result
 

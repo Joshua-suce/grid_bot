@@ -145,7 +145,10 @@ def test_incoming_strategy_is_not_activated_while_a_position_remains():
 
     assert r.active_name == "grid", "handed over on top of an open position"
     assert trend.activated == 0
-    assert r.failed_handoffs == 1
+    # >=1 not ==1: the handoff is retried from update_regime as well as from
+    # place_initial_orders (AUDIT #28), so the counter tracks attempts, not events.
+    # What matters is that none of them handed over.
+    assert r.failed_handoffs >= 1
 
 
 def test_failed_handoff_retries_and_completes_once_flat():
@@ -330,3 +333,51 @@ def test_router_state_carries_grid_bounds_for_mains_restore_path(monkeypatch):
     for key in ("grid_lower", "grid_upper", "grid_count"):
         assert key in state, f"router state lost '{key}' -- main.py could not restore it"
     assert "router" in state and "strategies" in state
+
+
+# --- #28: the handoff must not depend on place_initial_orders --------------
+
+def test_handoff_completes_without_place_initial_orders_ever_being_called():
+    """main.py calls place_initial_orders once, at startup, before the loop.
+
+    Every other strategy call in its loop sits behind `if grid.active:`, and
+    _begin_handoff pauses the outgoing strategy -- so active goes False and none of
+    them run. A handoff driven only from place_initial_orders could never advance:
+    the bot would pause the grid on the first confirmed trend and stop trading
+    permanently. update_regime is the one unconditional per-iteration call, so it
+    must be able to carry a handoff to completion on its own.
+    """
+    r, grid, trend, ex = make(position=5000.0)
+
+    r.update_regime("uptrend")   # the ONLY call -- no place_initial_orders anywhere
+
+    assert r.active_name == "trend", "handoff stalled without place_initial_orders"
+    assert not r.handoff_in_progress
+    assert trend.active
+    assert ex.closes == 1, "position was not flattened before handing over"
+
+
+def test_update_regime_driven_handoff_still_refuses_to_hand_over_dirty():
+    """Driving from update_regime must not weaken the flat-before-handover rule."""
+    r, grid, trend, ex = make(position=5000.0)
+    ex.close_fails = True
+
+    r.update_regime("uptrend")
+
+    assert r.active_name == "grid"
+    assert trend.activated == 0
+    assert r.handoff_in_progress, "should still be pending, not abandoned"
+
+
+def test_update_regime_handoff_survives_an_unreadable_balance():
+    """_current_balance falls back to 0.0 rather than aborting the handoff."""
+    class NoBalance(FakeExchange):
+        def get_balance(self):
+            raise RuntimeError("balance endpoint down")
+
+    r, grid, trend, _ = make()
+    r.exchange = NoBalance()
+    r.update_regime("uptrend")
+
+    assert r.active_name == "trend"
+    assert trend.active
