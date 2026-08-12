@@ -18,6 +18,9 @@ state/*.empty
 # Cached OHLCV for backtests (regenerable via backtest.fetch_ohlcv)
 data/
 
+# pytest tmp_path scratch (see pyproject addopts)
+.pytest_tmp/
+
 # Logs (contains trade history and events)
 logs/*.csv
 logs/*.csv.*

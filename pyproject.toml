@@ -22,6 +22,11 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Keep tmp_path inside the repo. The default base (%TEMP%\pytest-of-<user>) had its
+# ACLs broken on this machine -- the directory exists but cannot be listed or written,
+# so every test using tmp_path errored at setup with WinError 5. A project-local
+# basetemp sidesteps the system temp dir entirely and is portable.
+addopts = "--basetemp=.pytest_tmp"
 
 [build-system]
 requires = ["setuptools>=68"]
