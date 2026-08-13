@@ -362,13 +362,41 @@ def run_bot() -> None:
 
     exchange.set_leverage(settings.symbol, settings.leverage)
 
-    logger.info("STARTUP CLEANUP | cancelling all orders and closing orphan positions...")
+    # Read the state file BEFORE deciding what to do with any open position.
+    #
+    # This used to cancel orders and market-close every position unconditionally, then
+    # load state 60 lines later -- so a position the bot had deliberately left open at
+    # shutdown (CLOSE_ON_EXIT defaults to false, precisely so the grid can unwind it
+    # through its own levels) was dumped at market by housekeeping before anything
+    # asked whether it was an orphan. Measured on the 2026-08-12 23:18 restart: 6274
+    # DOGE closed at market, verified PnL -1.83 -> -3.26, so that one restart cost more
+    # than the session that preceded it. It also made the restore-with-position branch
+    # below unreachable, because cleanup had always just flattened.
+    #
+    # Orders are still cancelled unconditionally -- untracked resting orders from a dead
+    # session are genuinely dangerous and the grid re-places its own. A POSITION is
+    # different: with saved state it is inventory with a ladder to unwind through, and
+    # the same rule as AUDIT #32 applies -- do not book a loss to tidy up (AUDIT #37).
+    state_mgr = StateManager(settings.state_dir, settings.symbol)
+    saved_state = state_mgr.load()
+    has_saved_grid = bool(saved_state and "grid" in saved_state)
+
+    logger.info("STARTUP CLEANUP | cancelling all orders...")
     cancelled = exchange.cancel_everything(settings.symbol)
     if cancelled:
         logger.warning("Cancelled {} leftover orders (limits + stops) from previous sessions", cancelled)
-    closed = exchange.close_all_positions(settings.symbol)
-    if closed:
-        logger.warning("Closed {} orphan positions from previous sessions", closed)
+    if has_saved_grid:
+        logger.info(
+            "STARTUP | saved grid state found — keeping any open position for the "
+            "restored grid to unwind rather than closing it at market"
+        )
+    else:
+        closed = exchange.close_all_positions(settings.symbol)
+        if closed:
+            logger.warning(
+                "Closed {} orphan positions from previous sessions (no saved grid state "
+                "to unwind them with)", closed,
+            )
 
     try:
         leftover = exchange.get_open_orders(settings.symbol)
@@ -422,11 +450,7 @@ def run_bot() -> None:
     )
 
     grid = None
-    state_mgr = None
-
-    state_mgr = StateManager(settings.state_dir, settings.symbol)
     journal = TradeJournal(settings.log_dir)
-    saved_state = state_mgr.load()
 
     # PnL reconciler: reports cumulative PnL sourced from Binance's own income
     # ledger (realized PnL + commission + funding) rather than the grid engine's

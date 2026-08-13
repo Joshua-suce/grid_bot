@@ -254,3 +254,45 @@ def test_build_scale_out_orders_returns_nothing_when_no_stop_is_available():
 def test_build_scale_out_orders_still_works_with_real_prices():
     orders = build_scale_out_orders("long", 5000.0, 0.5, trail_price=0.0700, hard_price=0.0680)
     assert [k for k, _, _ in orders] == ["trail", "hard"]
+
+
+# --- #37: startup must not market-dump the bot's own inventory -------------
+
+def _main_source():
+    import pathlib
+    return (pathlib.Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
+
+
+def test_state_is_read_before_any_position_is_closed():
+    """AUDIT #37. Startup cancelled orders and market-closed every position, then read
+    the state file 60 lines later. CLOSE_ON_EXIT defaults to false precisely so the grid
+    can keep inventory and unwind it through its own levels -- and then housekeeping
+    dumped it on the next start. Measured on the 2026-08-12 23:18 restart: 6274 DOGE
+    closed at market, verified PnL -1.83 -> -3.26.
+    """
+    src = _main_source()
+    load_at = src.index("saved_state = state_mgr.load()")
+    close_at = src.index("exchange.close_all_positions(settings.symbol)")
+    assert load_at < close_at, (
+        "positions are closed before the state file is read, so the bot cannot tell "
+        "its own inventory from an orphan"
+    )
+
+
+def test_positions_are_only_closed_without_saved_state():
+    src = _main_source()
+    close_at = src.index("exchange.close_all_positions(settings.symbol)")
+    guard = src.rindex("if has_saved_grid:", 0, close_at)
+    between = src[guard:close_at]
+    assert "else:" in between, (
+        "close_all_positions is no longer gated on there being no saved grid state"
+    )
+
+
+def test_orders_are_still_cancelled_unconditionally():
+    """Untracked resting orders from a dead session are dangerous and the grid re-places
+    its own -- only the POSITION decision became conditional."""
+    src = _main_source()
+    cancel_at = src.index("cancelled = exchange.cancel_everything(settings.symbol)")
+    guard_at = src.index("if has_saved_grid:")
+    assert cancel_at < guard_at, "order cancellation was moved behind the state check"

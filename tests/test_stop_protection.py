@@ -336,3 +336,50 @@ def test_main_stops_with_the_shutdown_reason():
     assert any(c.strip() == "" for c in calls), (
         "the kill-switch path must keep the default reason and stay an ERROR"
     )
+
+
+# --- #36: the cause of the deformity, not just the symptom -----------------
+
+def test_refill_lands_in_the_gap_not_beside_an_existing_level():
+    """AUDIT #36. The refill walked a uniform template (grid_lower + i*spacing) while
+    _initialize_dynamic builds a deliberately non-uniform ladder. The template never
+    lines up, so every refill landed a few ticks from a real level: 0.06800 beside
+    0.06797 (0.04% apart), 0.06829 beside 0.06823 (0.09%) -- neither pair able to clear
+    the 0.12% fee floor, while the middle of the range stayed empty. That is the ladder
+    AUDIT #34 had to rebuild.
+    """
+    from grid import GridLevel
+
+    engine = _ladder_engine()
+    # the real 2026-08-12 dynamic ladder with the two merged duplicates removed
+    kept = [0.06771, 0.06823, 0.06850, 0.06876, 0.06928, 0.06954, 0.07007, 0.07033]
+    engine.levels = [
+        GridLevel(price=p, side="buy" if p < 0.06945 else "sell") for p in kept
+    ]
+
+    engine._refill_missing_grid_lines(0.06945)
+
+    prices = sorted(l.price for l in engine.levels)
+    assert len(prices) == 10, f"refill did not restore the ladder: {prices}"
+    floor = 2 * engine.maker_fee_pct * engine._min_profit_multiplier
+    tight = [(a, b) for a, b in zip(prices, prices[1:]) if (b - a) / a < floor]
+    assert tight == [], f"refill created pairs below the fee floor: {tight}"
+    assert engine.ladder_defects(0.06945) == []
+
+
+def test_refill_stops_rather_than_wedging_a_level_into_a_full_ladder():
+    """When the widest remaining gap is too narrow to split, fewer levels is correct.
+    Wedging one in is exactly the defect above."""
+    from grid import GridLevel
+
+    engine = _ladder_engine()
+    engine.levels = [
+        GridLevel(price=round(0.06900 + i * 0.00002, 5), side="buy") for i in range(4)
+    ]
+    before = len(engine.levels)
+
+    engine._refill_missing_grid_lines(0.06945)
+
+    # The seeded levels are already tighter than the fee floor; what matters is that
+    # the refill declines to make it worse rather than filling up to grid_count.
+    assert len(engine.levels) == before, "wedged a level into a ladder with no room"

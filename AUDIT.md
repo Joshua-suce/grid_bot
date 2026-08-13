@@ -894,6 +894,71 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 36. The refill deformed the ladder it was repairing -- HIGH
+
+AUDIT #34 detected and rebuilt deformed ladders. This is what was deforming them.
+
+`_refill_missing_grid_lines` re-adds levels after the duplicate merge, and it walked a
+**uniform** template -- `grid_lower + i * grid_spacing` -- adding any template price not
+already occupied. But `_initialize_dynamic` builds a deliberately **non-uniform** ladder,
+concentrated near the price. The two never line up, so every template price lands a few
+ticks off a real level and gets inserted beside it.
+
+Reproduced exactly against the 2026-08-12 range:
+
+```
+uniform template : 0.06771 0.06800 0.06829 0.06858 0.06887 0.06917 0.06946 0.06975 0.07004 0.07033
+actual ladder    : 0.06771 0.06797 0.06823 0.06850 0.06876 0.06928 0.06954 0.06981 0.07007 0.07033
+
+0.06800 -> nearest existing 0.06797, 0.04% apart
+0.06829 -> nearest existing 0.06823, 0.09% apart
+```
+
+Those are precisely the two sub-fee-floor pairs found in the saved state. Neither pair can
+clear the 0.12% round-trip cost, so both levels were dead weight, while the middle of the
+range -- where the price actually was -- stayed empty.
+
+The refill now inserts at the midpoint of the ladder's **widest actual gap**, repeatedly,
+and refuses to split a gap that would leave either neighbour closer than the fee floor.
+When the widest remaining gap is too narrow, it stops and runs with fewer levels: a grid
+with nine good levels beats one with ten where two can never profit.
+
+Verified by replaying the real ladder minus its two merged duplicates -- the refill
+reconstructs 0.06797 and 0.06981 exactly where they belong, and `ladder_defects` comes
+back clean.
+
+## 37. Startup market-dumped the bot's own inventory -- HIGH
+
+`CLOSE_ON_EXIT` defaults to false, deliberately: a position left open at shutdown stays
+under exchange-side stop protection so the grid can unwind it through its own levels on
+the next run. Then startup did this, unconditionally, before reading anything:
+
+```
+STARTUP CLEANUP | cancelling all orders and closing orphan positions...
+POSITION CLOSED | SELL 6274.0 DOGEUSDT
+Closed 1 orphan positions from previous sessions
+```
+
+The state file was not read until 60 lines later. So the bot could not tell an orphan
+from its own inventory, and housekeeping liquidated at market exactly what the previous
+session had deliberately preserved. Measured on the 23:18 restart: 6274 DOGE closed at
+market, verified PnL **-1.83 -> -3.26**. That single restart cost more than the entire
+session before it.
+
+It also made the restore-with-position branch unreachable: `has_exchange_positions` is
+evaluated after cleanup, so it was always False, and `reconcile_positions()` never ran on
+a real position.
+
+The state file is now read first. Orders are still cancelled unconditionally -- untracked
+resting orders from a dead session are genuinely dangerous and the grid re-places its own.
+The *position* decision became conditional: with saved grid state, keep it and let the
+restored ladder work it down; with no state to unwind it, it is a true orphan and still
+gets closed.
+
+Same principle as #32, one layer out: do not book a loss to tidy up.
+
+---
+
 ## 35. Clean shutdowns logged as crashes -- LOW (but it hid everything else)
 
 Every normal Ctrl+C ended like this:

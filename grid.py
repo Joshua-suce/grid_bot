@@ -1890,20 +1890,45 @@ class GridEngine:
         levels were merged. A fill whose replacement parked on an occupied slot
         leaves a hole in the grid; refilling it preserves fill/cycle bookkeeping
         instead of rebuilding every level from the grid bounds."""
-        occupied = {self._round_price(l.price) for l in self.levels}
+        # Refill into the ladder's ACTUAL gaps, widest first.
+        #
+        # This used to walk a uniform template -- grid_lower + i * grid_spacing -- and
+        # add any template price not already occupied. But _initialize_dynamic builds a
+        # deliberately NON-uniform ladder, concentrated near the price, so the template
+        # never lines up with it: every template price lands a few ticks off a real one
+        # and gets inserted as a near-duplicate. That is where the 0.04% and 0.09% level
+        # pairs in the 2026-08-12 state file came from -- 0.06800 beside 0.06797,
+        # 0.06829 beside 0.06823 -- neither pair able to clear the 0.12% fee floor, and
+        # the levels that should have covered the middle of the range never placed at
+        # all. AUDIT #34 rebuilt ladders deformed this way; this is the deformity
+        # itself (AUDIT #36).
+        floor_pct = 2 * self.maker_fee_pct * self._min_profit_multiplier
         missing = 0
-        for i in range(self.grid_count):
-            if len(self.levels) >= self.grid_count:
+        while len(self.levels) < self.grid_count:
+            prices = sorted(self._round_price(l.price) for l in self.levels)
+            if len(prices) < 2:
                 break
-            price = self._round_price(self.grid_lower + i * self.grid_spacing)
-            if price in occupied:
-                continue
+            gap, pair = 0.0, None
+            for a, b in zip(prices, prices[1:]):
+                if b - a > gap:
+                    gap, pair = b - a, (a, b)
+            if pair is None:
+                break
+            a, b = pair
+            price = self._round_price((a + b) / 2)
+            # A refill must never manufacture a pair that cannot clear its own fees --
+            # that is the defect being fixed, not a side effect of it. When the widest
+            # remaining gap is too narrow to split, the ladder is simply full: stop and
+            # run with fewer levels rather than wedge one in.
+            if price <= a or price >= b:
+                break
+            if (price - a) / a < floor_pct or (b - price) / price < floor_pct:
+                break
             side = "buy" if current_price is not None and price < current_price else "sell"
             lvl = GridLevel(price=price, side=side)
             if side == "buy":
                 lvl.entry_price = price
             self.levels.append(lvl)
-            occupied.add(price)
             missing += 1
         self.levels.sort(key=lambda x: x.price)
         if missing:
