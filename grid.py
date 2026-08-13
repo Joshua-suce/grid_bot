@@ -447,10 +447,33 @@ class GridEngine:
             self._initialize_uniform(current_price)
             return
 
-        buy_prices = np.linspace(self.grid_lower, current_price, half_count, endpoint=False)
-        sell_prices = np.linspace(current_price, self.grid_upper, self.grid_count - half_count + 1)[1:]
+        # Offset each side by HALF a step so the price sits in the middle of one
+        # spacing, not two.
+        #
+        # AUDIT #44. The old construction was
+        #     buys  = linspace(lower, price, n, endpoint=False)   -> step (price-lower)/n
+        #     sells = linspace(price, upper, m+1)[1:]             -> step (upper-price)/m
+        # which puts the last buy one FULL step below the price and the first sell one
+        # full step above it. The gap straddling the price was therefore always exactly
+        # twice the spacing everywhere else -- the widest hole in the ladder, parked
+        # permanently where the price actually is.
+        #
+        # Measured on the 2026-08-13 17:00 run: levels ... 0.06954 | 0.07006 ... a 0.748%
+        # centre gap against 0.37-0.39% everywhere else. The price spent 77 minutes
+        # inside it, ranging 0.06973-0.06994, and the bot recorded zero fills. It needed
+        # a full spacing of movement to trade when it should have needed half.
+        sell_count = self.grid_count - half_count
+        if half_count < 1 or sell_count < 1:
+            # A one-level "grid" has no two sides to balance. grid_count can shrink to
+            # this after tick-rounding dedup, and dividing by half_count would raise.
+            self._initialize_uniform(current_price)
+            return
+        buy_step = (current_price - self.grid_lower) / half_count
+        sell_step = (self.grid_upper - current_price) / sell_count
+        buy_prices = [current_price - buy_step * (i + 0.5) for i in range(half_count)][::-1]
+        sell_prices = [current_price + sell_step * (i + 0.5) for i in range(sell_count)]
 
-        raw_prices = [self._round_price(p) for p in np.concatenate([buy_prices, sell_prices])]
+        raw_prices = [self._round_price(p) for p in buy_prices + sell_prices]
 
         seen = {}
         prices = []

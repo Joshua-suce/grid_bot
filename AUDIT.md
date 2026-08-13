@@ -894,6 +894,70 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 44. The price sat in the widest hole in the ladder, by construction -- HIGH
+
+The 2026-08-13 16:58 run placed all ten orders cleanly, ran for 77 minutes, and filled
+**nothing**. Not a dead level this time (#42 had already fixed that) -- the ladder was
+healthy. The geometry was wrong.
+
+```
+0.06849  0.06875  0.06901  0.06928  0.06954  |  0.07006  0.07032  0.07059  0.07085  0.07111
+   0.380%   0.378%   0.391%   0.375%   0.748%     0.371%   0.384%   0.368%   0.367%
+                                        ^^^^^^
+                          price traded 0.06973-0.06994 for 77 minutes, entirely inside here
+```
+
+Every gap is ~0.38% except the one straddling the price, which is 0.748% -- exactly
+double. That is not bad luck, it is the construction:
+
+```python
+buy_prices  = linspace(lower, price, n, endpoint=False)   # step (price-lower)/n
+sell_prices = linspace(price, upper, m+1)[1:]             # step (upper-price)/m
+```
+
+The last buy lands one FULL step below the price and the first sell one full step above
+it, so the centre gap is always the sum of two half-ladders' steps -- 2x the spacing
+everywhere else, for every `grid_count`. **The widest hole in the ladder is parked
+permanently wherever the price is**, which is the one place a grid needs levels most. It
+doubled the movement required before the bot could trade at all.
+
+The fix offsets each side by half a step, so the price sits in the middle of one spacing
+instead of two:
+
+```python
+buy_prices  = [price - buy_step  * (i + 0.5) for i in range(half_count)][::-1]
+sell_prices = [price + sell_step * (i + 0.5) for i in range(sell_count)]
+```
+
+Rebuilt on the identical inputs, the centre gap becomes 0.373% against 0.377% elsewhere
+-- 0.99x, and the nearest level moves from 0.37% away to 0.186%. Against the range the
+price actually traded in those 77 minutes:
+
+```
+BEFORE  levels inside 0.06973-0.06994 : NONE        -> zero fills, as observed
+AFTER   levels inside 0.06973-0.06994 : 0.06993     -> would have filled
+```
+
+Two smaller things fell out of writing the tests:
+
+- The old construction put a level exactly at `grid_lower`, and tick-rounding then
+  pushed it *below* the configured range (0.06849107 -> 0.06849). Every level now sits
+  strictly inside. `test_every_level_stays_inside_the_grid` fails on the old code for
+  all six grid counts.
+- `grid_count` can shrink to 1 via tick-rounding dedup, which makes `half_count` zero
+  and the new step arithmetic a division by zero. It falls back to the uniform ladder.
+
+Reverting the construction fails 14 of the 21 tests in `tests/test_grid_geometry.py`.
+
+### What this does NOT fix
+
+Spacing *width* is a separate question from where the gap sits. At 0.382% the live grid
+is 3.2x the 0.120% fee floor, and the same 3.82% range could hold 31 levels rather than
+10. Whether tightening actually earns more -- or just pays more fees and hits
+`MAX_POSITION_PCT` sooner -- is being measured separately; it is not assumed here.
+
+---
+
 ## 43. The kill switch counted the grid's opinion, not the account -- HIGH
 
 Recorded at the end of #42 as "still open", then fixed here. It needed one correction
