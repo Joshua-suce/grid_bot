@@ -894,6 +894,86 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 45. Why the bot is not profitable -- measurement, not a fix
+
+#42 and #44 were both real defects and both are fixed. Neither makes the bot money, and
+saying otherwise would be dishonest. This entry records what the numbers actually say.
+
+Method: `run_backtest` on 180 days of real DOGE 1h data, split into two non-overlapping
+90-day windows, 12 overlapping starts each, `STRATEGY_MODE=grid` with the trend filter.
+Paired differences on identical windows.
+
+### The centre-gap fix trades more, but does not earn more
+
+```
+EARLIER 90d              mean     sem   fills   paired diff vs BEFORE   sem     t
+BEFORE  10 levels       -9.33   19.44  1049.3            --
+AFTER   10 levels       +4.99   19.03  1244.9         +14.32          25.30   0.6
+AFTER   14 levels      -45.34   20.07  1517.6         -36.01          30.00   1.2
+AFTER   20 levels      -41.11   43.26  1830.9         -31.78          44.83   0.7
+
+RECENT 90d
+BEFORE  10 levels      +42.86   12.31   613.9            --
+AFTER   10 levels      +35.49   11.68   721.7          -7.37          19.19   0.4
+AFTER   14 levels      +36.53   21.56   959.5          -6.33          24.12   0.3
+AFTER   20 levels       +7.93   23.99  1160.5         -34.93          27.79   1.3
+```
+
+Fills rise ~18-19% in both windows -- that part is consistent and mechanical. **The PnL
+effect is not distinguishable from noise** (t=0.6 and t=0.4, and the two windows
+disagree on sign). #44 is justified as a correctness fix, not as an edge.
+
+### Tightening the spacing is measurably WORSE
+
+The obvious inference from "0.382% spacing is 3.2x the 0.120% fee floor, so the same
+range could hold 31 levels" is wrong. 14 and 20 levels both lose ground, and 20 levels
+loses in *both* windows. The fee floor is a lower bound on viability, not a target.
+
+### Where the money actually goes
+
+```
+                              EARLIER 90d    RECENT 90d
+  completed cycles                  731.4         454.6
+  winners                           91.2%         91.8%
+  what the GRID thinks it made     407.94        295.91
+  what was actually realized        33.70         53.39
+  fees paid                        -28.71        -17.90
+  net PnL                            4.99         35.49
+                                  (+0.10%)      (+0.71%)   of 5000 over 90 days
+```
+
+Two things stand out.
+
+**Fees consume most of the real gross.** 28.71 of 33.70 in the earlier window -- 85%.
+17.90 of 53.39 in the recent one -- 34%. This is the direct explanation for why adding
+levels loses money: the marginal cycle earns less than it costs to trade. It is not a
+tuning oversight, it is the binding constraint.
+
+**The engine's own PnL is inflated roughly twelvefold.** 407.94 booked against 33.70
+realized; 0.56 per cycle claimed against 0.046 actually banked. Same root cause as #43 --
+the grid credits each sell against the buy level it was paired with, Binance nets
+everything at one blended average entry. 91% of cycles are "winners" by the ladder's own
+arithmetic while the account is roughly flat. This is why the live status line reads
+`net=12.42` next to `verified_net=-1.20`: the left number is fiction and always was.
+
+Note the equity drawdown stays at 0.01-0.02%, and `ex.equity` does include unrealized
+PnL, so this is not a hidden bag of inventory quietly bleeding. The account is genuinely
+close to flat. There is no large loss to find -- there is barely any profit to begin
+with.
+
+### What this means
+
+Over 180 days the configuration nets roughly +0.8% total, with a per-window standard
+error larger than the mean. The strategy as configured is noise-dominated: the per-cycle
+edge after fees is too thin for the fill rate it achieves. Trading *more* makes it worse;
+that has now been measured twice.
+
+Nothing here is a bug to fix. The remaining levers are structural -- fee tier, a wider
+spacing with fewer but larger cycles, or a different instrument -- and each needs
+measuring before it is believed, not after.
+
+---
+
 ## 44. The price sat in the widest hole in the ladder, by construction -- HIGH
 
 The 2026-08-13 16:58 run placed all ten orders cleanly, ran for 77 minutes, and filled
