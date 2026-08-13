@@ -819,10 +819,10 @@ lines of live-tested logic with real state files behind it; reparenting it would
 touching its constructor and MRO for no behavioural gain. Duck-typed conformance
 asserts the same contract while modifying nothing.
 
-The protocol covers 19 members -- lifecycle (`initialize`/`activate`/`pause`/
+The protocol covers 20 members -- lifecycle (`initialize`/`activate`/`pause`/
 `emergency_stop`), trading (`place_initial_orders`/`check_fills`), the risk interface
-(`set_position_limit`/`get_exposure_pct`/`update_volatility`), stops, reconciliation,
-persistence and metrics.
+(`set_position_limit`/`block_side`/`get_exposure_pct`/`update_volatility`), stops,
+reconciliation, persistence and metrics.
 
 **Ten members are deliberately excluded** as ladder-of-orders specific, and they are
 the remaining step 3/4 work queue:
@@ -891,6 +891,99 @@ router was designed to be driven. Only replaying against main.py's actual call p
 exposed it, and `STRATEGY_MODE=router` was already enabled in `.env` at the time.
 
 Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
+
+---
+
+## 50. Three safety nets that were not there -- CRITICAL
+
+#49 closed the mechanism that let the position reach 31,761 DOGE against a 17,467 cap.
+This entry covers why that position was also running **naked** -- and two other places
+where a safety net reported success it had not achieved. One family, one failure mode:
+**a risk control that cannot tell you it failed is not a risk control.**
+
+### 50a. `_refresh_sl_stops` cancelled first and hoped -- CRITICAL
+
+The sequence was: cancel every existing stop, then place the replacements inside a
+`try/except` that only logged. It returned `None` either way, so no caller could
+distinguish "protected" from "the cancels went through and every placement raised".
+
+That is exactly the 2026-08-08 sequence. The cancels succeeded, the placements hit the
+`TypeError` that #47's contract test now catches, each was swallowed one line at a
+time, and a position 1.8x through its cap sat with no stop for the rest of the day.
+-50.49, 60% of the entire 15-day loss, on six closes.
+
+It now returns coverage as a `bool`. On total failure it logs `POSITION UNPROTECTED`
+and emits a `risk_check` event, and main.py acts on the answer:
+
+```python
+sl_covered = _refresh_sl_stops("long", position_qty)
+...
+if not sl_covered:
+    grid.block_side("buy", "stop-loss missing")
+```
+
+**An unprotected position may be closed and may be held. It may not grow.** That is the
+rule the -50.49 day needed and did not have. `block_side` gates only orders that ADD
+exposure -- `_exit_order_params` never consults it, because trapping inventory behind a
+safety check is its own bug (#42).
+
+The block is deliberately **not sticky**: `set_position_limit` clears it at the top of
+every iteration and main.py re-blocks below if the position is still uncovered, so it
+lasts exactly as long as the condition and lifts by itself when the stops come back.
+
+### The gap this opened, and the test that caught it
+
+Adding `block_side` broke `test_strategy.py` -- **as designed**. main.py calls whatever
+strategy is live, and in `STRATEGY_MODE=router` that is a `StrategyRouter` delegating to
+a `TrendFollower`, neither of which had the method. A fix that protects only the grid
+would have been an `AttributeError` every iteration in router mode.
+
+This is the boundary test from #22 doing precisely the job it was written for: it fails
+the suite until someone decides which side of the line a new coupling belongs on. So
+`block_side` is now on the `Strategy` protocol, the router **broadcasts** it to every
+strategy (the position is NET and shared -- an unprotected long is unprotected no matter
+which strategy would add to it), and `TrendFollower` withholds blocked entries while
+leaving `_close_position` untouched.
+
+### 50b. The hard-stop ratchets were not persisted -- HIGH
+
+`_hard_sl_price` and `_hard_sl_price_short` are ratchets: a long's stop may only rise, a
+short's only fall. They have to be, because `recenter()` moves the bounds the stop is
+derived from, so without the ratchet a recenter downward would quietly widen the stop on
+an open position (#15, again).
+
+Checked against a real state backup: `_peak_price`, `_trough_price`,
+`_trailing_sl_price` and `_trailing_sl_price_short` are all saved. **These two were
+not.** A restart with an open position re-derived the stop from the new bounds and
+silently loosened it -- the ratchet held perfectly right up until the process bounced.
+
+Both are now in `to_dict`/`load_from_dict`.
+
+### 50c. "CLEANUP VERIFIED" was printed when nothing had been verified -- MEDIUM-HIGH
+
+`cancel_everything`'s `_fetch_regular()` returns `None` when the read fails. The check
+was `if remaining:` ... `else: "CLEANUP VERIFIED | book clean"`. `None` is falsy, so a
+verification that could not read the book announced the book was clean.
+
+Startup runs this before laying a fresh ladder. A false all-clear means a new grid on
+top of live orders -- the duplicate-level pile-up `cancel_everything` was written to
+prevent in the first place.
+
+Now three-way: incomplete / **UNVERIFIED** / verified.
+
+### Verified adversarially
+
+`tests/test_safety_nets.py` -- 9 tests. With all three fixes reverted, 4 fail, and the
+cleanup test reproduces the defect verbatim: after the book read raises
+`ConnectionError`, the log still reads `CLEANUP VERIFIED | book clean for DOGEUSDT`.
+
+The cleanup test drives the real `cancel_everything` against a stubbed book and asserts
+on captured log output, not on source text -- the first version asserted on the order of
+two string literals in the source and was simply wrong, because there is an earlier
+`CLEANUP VERIFIED` in the same function. A companion test pins that a genuinely empty
+book is still reported clean, so the fix cannot pass by crying wolf.
+
+Full suite: 480 passed, 5 skipped.
 
 ---
 

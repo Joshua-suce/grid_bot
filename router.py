@@ -435,6 +435,13 @@ class StrategyRouter:
         for s in self.strategies.values():
             s.set_position_limit(long_position, short_position, max_position_qty)
 
+    def block_side(self, side: str, reason: str) -> None:
+        # Broadcast, for the same reason set_position_limit does: the position is NET
+        # and shared, so an unprotected long is unprotected no matter which strategy
+        # would be the one to add to it.
+        for s in self.strategies.values():
+            s.block_side(side, reason)
+
     def get_exposure_pct(self, balance: float) -> float:
         return self.strategy.get_exposure_pct(balance)
 

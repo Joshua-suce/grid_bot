@@ -1732,6 +1732,21 @@ class GridEngine:
             self._hard_sl_price = max(self._hard_sl_price, candidate)
         return self._hard_sl_price
 
+    def block_side(self, side: str, reason: str) -> None:
+        """Refuse to OPEN exposure on `side` until the next set_position_limit().
+
+        AUDIT #50. Used when the position has no live stop-loss: an unprotected
+        position must not also be a growing one. Exits are unaffected -- the block
+        flags only gate orders that add exposure (see #49) -- so inventory can still
+        unwind while uncovered.
+        """
+        if side == "buy" and not self._block_buys:
+            self._block_buys = True
+            logger.warning("SIDE BLOCKED | buy — {} (AUDIT #50)", reason)
+        elif side == "sell" and not self._block_sells:
+            self._block_sells = True
+            logger.warning("SIDE BLOCKED | sell — {} (AUDIT #50)", reason)
+
     def get_short_hard_stop_loss_price(self) -> float:
         """Mirror of get_hard_stop_loss_price for a short: may fall, never rise."""
         candidate = self.grid_upper * (1 + self.stop_loss_pct)
@@ -1871,6 +1886,16 @@ class GridEngine:
             "_peak_price": self._peak_price,
             "_trough_price": self._trough_price,
             "_trailing_sl_price_short": self._trailing_sl_price_short,
+            # AUDIT #50. These are RATCHETS -- a long's hard stop may only rise, a
+            # short's may only fall -- and they exist because recenter() moves
+            # grid_lower/grid_upper, which would otherwise drag the stop away from an
+            # open position. Every other stop anchor was persisted; these two were not,
+            # so each restart reset them to None and the next call re-derived the stop
+            # from the CURRENT grid bounds. Restarting with a position open therefore
+            # loosened its stop, silently, which is the one direction a ratchet exists
+            # to forbid.
+            "_hard_sl_price": self._hard_sl_price,
+            "_hard_sl_price_short": self._hard_sl_price_short,
             "_volatility_mult": self._volatility_mult,
             "_block_buys": self._block_buys,
             "_block_sells": self._block_sells,
@@ -2039,6 +2064,8 @@ class GridEngine:
         self._peak_price = data.get("_peak_price", 0.0)
         self._trough_price = data.get("_trough_price", 0.0)
         self._trailing_sl_price_short = data.get("_trailing_sl_price_short", None)
+        self._hard_sl_price = data.get("_hard_sl_price", None)
+        self._hard_sl_price_short = data.get("_hard_sl_price_short", None)
         self._volatility_mult = data.get("_volatility_mult", 1.0)
         self._block_buys = data.get("_block_buys", False)
         self._block_sells = data.get("_block_sells", False)

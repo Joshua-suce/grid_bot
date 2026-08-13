@@ -107,6 +107,15 @@ class Strategy(Protocol):
         """
         ...
 
+    def block_side(self, side: str, reason: str) -> None:
+        """Refuse orders that would ADD exposure on `side` until the next recenter.
+
+        Exits are never gated by this -- trapping inventory is its own bug (AUDIT #42).
+        main.py calls it when a position is confirmed to have no stop-loss covering it:
+        an unprotected position may be closed and may be held, but it may not grow.
+        """
+        ...
+
     def get_exposure_pct(self, balance: float) -> float:
         """Committed notional as a fraction of equity."""
         ...

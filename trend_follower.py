@@ -98,6 +98,7 @@ class TrendFollower:
         self._net_long_qty = 0.0
         self._net_short_qty = 0.0
         self._max_position_qty = 0.0
+        self._blocked_sides: dict[str, str] = {}
         self._event_journal = event_journal
         self._notifier = notifier
 
@@ -225,6 +226,12 @@ class TrendFollower:
             return 0
 
         side = "buy" if want == "long" else "sell"
+        if side in self._blocked_sides:
+            logger.warning(
+                "TREND ENTRY BLOCKED | {} entry withheld — {} (AUDIT #50)",
+                side.upper(), self._blocked_sides[side],
+            )
+            return 0
         try:
             order = self.exchange.place_limit_order(
                 self.symbol, side, self._round_price(price), qty,
@@ -401,6 +408,17 @@ class TrendFollower:
         self._net_long_qty = max(0.0, long_position)
         self._net_short_qty = max(0.0, short_position)
         self._max_position_qty = max(0.0, max_position_qty)
+        # Cleared every iteration, exactly as the grid recomputes _block_buys/_block_sells
+        # here: main.py re-blocks below if the position is STILL unprotected, so the block
+        # lasts precisely as long as the condition and lifts on its own when stops return.
+        self._blocked_sides.clear()
+
+    def block_side(self, side: str, reason: str) -> None:
+        """Withhold ENTRIES on `side`. Exits run through _close_position, which never
+        consults this -- an unprotected position must still be closable (AUDIT #50)."""
+        if side in ("buy", "sell") and side not in self._blocked_sides:
+            self._blocked_sides[side] = reason
+            logger.warning("SIDE BLOCKED | {} — {} (AUDIT #50)", side, reason)
 
     def get_exposure_pct(self, balance: float) -> float:
         if balance <= 0 or self._side is None:

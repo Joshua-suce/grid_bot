@@ -782,6 +782,17 @@ class Exchange:
                 "CLEANUP INCOMPLETE | {} orders still open for {} after {}s of retries "
                 "(backend unreachable for writes)", len(remaining), symbol, timeout_seconds,
             )
+        elif remaining is None:
+            # AUDIT #50. _fetch_regular returns None when the READ failed, and `if
+            # remaining:` treated that identically to an empty book -- so a cleanup that
+            # could not verify anything logged "CLEANUP VERIFIED | book clean". Startup
+            # runs this before building a fresh ladder; believing a false all-clear means
+            # laying a new grid on top of orders that were never cancelled, i.e. double
+            # exposure with no record of it. Unknown is not clean.
+            logger.warning(
+                "CLEANUP UNVERIFIED | could not read the order book for {} — cancels "
+                "were sent but the result is UNKNOWN, not confirmed clean", symbol,
+            )
         else:
             logger.info("CLEANUP VERIFIED | book clean for {}", symbol)
         logger.info("CANCEL EVERYTHING | {} total orders confirmed cancelled for {}", cancelled, symbol)

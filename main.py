@@ -611,12 +611,30 @@ def run_bot() -> None:
             startup_trail_price=grid.get_scale_out_trail_price(side),
         )
 
-    def _refresh_sl_stops(side: str, qty: float) -> None:
+    def _refresh_sl_stops(side: str, qty: float) -> bool:
+        """Re-arm the stop-loss legs. Returns True only if the position ends up covered.
+
+        AUDIT #50. This cancels every stop FIRST and then places replacements inside a
+        try/except that only logs. Any failure in between leaves an open position with
+        no stop at all, and the caller could not tell -- it returned None either way.
+
+        That is the 2026-08-08 sequence exactly: the cancel succeeded, four consecutive
+        placements raised `Exchange.amount_to_precision() missing 1 required positional
+        argument` (#47), each was logged and swallowed, and a position already 1.8x
+        through its cap (#49) ran completely unprotected until EMERGENCY STOP. That day
+        was -50.49, 60% of the fortnight's loss.
+
+        The window cannot be closed entirely -- Binance has no atomic replace for stop
+        orders -- but it can be made loud and it can be made to stop the bleeding: the
+        caller blocks new exposure while uncovered, so an unprotected position can no
+        longer also be a growing one.
+        """
         nonlocal sl_orders
         exchange.cancel_all_stop_orders(settings.symbol)
         sl_orders = {}
         close_side = "sell" if side == "long" else "buy"
-        for kind, oqty, oprice in _desired_sl_orders(side, qty):
+        desired = list(_desired_sl_orders(side, qty))
+        for kind, oqty, oprice in desired:
             try:
                 order = exchange.place_stop_market(settings.symbol, close_side, oqty, oprice)
                 sl_orders[kind] = {"id": order["id"], "side": close_side, "qty": oqty, "price": oprice}
@@ -626,6 +644,16 @@ def run_bot() -> None:
                 )
             except Exception as e:
                 logger.error("Failed to place {} stop-loss: {}", kind, e)
+
+        covered = bool(sl_orders) or not desired
+        if not covered:
+            logger.error(
+                "POSITION UNPROTECTED | {} {} has NO stop-loss on the exchange — every "
+                "leg failed to place. Blocking new exposure until a stop is live "
+                "(AUDIT #50)", side, qty,
+            )
+            events.risk_check("stop_loss_coverage", 0.0, float(len(desired)), "UNPROTECTED")
+        return covered
 
     def _detect_trail_fill() -> None:
         """Mark the scale-out done only when the trailing stop actually triggered.
@@ -1095,24 +1123,36 @@ def run_bot() -> None:
                             _scale_out_done = False
                             sl_orders = {}
 
+                    # AUDIT #50. An unprotected position must not also be a growing one.
+                    # On 08-08 the stop legs all failed to place and the grid kept
+                    # adding to a position already through its cap. Whichever side would
+                    # ADD exposure is blocked until a stop is live again; the exit side
+                    # stays open so inventory can still unwind (#42).
+                    sl_covered = True
                     if position_side == "long":
                         grid.update_trailing_sl(price)
                         _detect_trail_fill()
                         if _sl_needs_update("long", position_qty):
                             try:
-                                _refresh_sl_stops("long", position_qty)
+                                sl_covered = _refresh_sl_stops("long", position_qty)
                                 grid.log_sl_status("long")
                             except Exception as e:
+                                sl_covered = False
                                 logger.error("Failed to place/update stop-loss: {}", e)
+                        if not sl_covered:
+                            grid.block_side("buy", "stop-loss missing")
                     elif position_side == "short":
                         grid.update_trailing_sl_short(price)
                         _detect_trail_fill()
                         if _sl_needs_update("short", position_qty):
                             try:
-                                _refresh_sl_stops("short", position_qty)
+                                sl_covered = _refresh_sl_stops("short", position_qty)
                                 grid.log_sl_status("short")
                             except Exception as e:
+                                sl_covered = False
                                 logger.error("Failed to place/update stop-loss: {}", e)
+                        if not sl_covered:
+                            grid.block_side("sell", "stop-loss missing")
                     else:
                         if sl_orders:
                             exchange.cancel_all_stop_orders(settings.symbol)
