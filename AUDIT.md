@@ -894,6 +894,100 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 47. The single worst day, and the guard that was meant to prevent it -- CRITICAL
+
+Pulling Binance's income ledger directly (not the reconciler, which had been
+re-baselined and was reporting a truncated window) gives the real 15-day scoreboard:
+
+```
+date          realized  commission  funding      NET   closes
+2026-07-31      +13.74      -4.51    -0.00    +9.23     192
+2026-08-01       -6.91      -2.74    -0.60   -10.25      22
+2026-08-02      -10.18      -1.61    +0.01   -11.77      13
+2026-08-03       +3.98      -1.96    +3.62    +5.65      37
+2026-08-04       -3.54      -1.78    +0.12    -5.20      92
+2026-08-05      -13.25      -1.60    -0.10   -14.96      53
+2026-08-06       -2.78      -3.33    +0.17    -5.93      43
+2026-08-07       -1.03      -2.69    +0.21    -3.50     205
+2026-08-08      -48.92      -2.08    +0.51   -50.49       6   <-- 60% of all losses
+2026-08-09      +11.09      -1.73    -0.35    +9.02      43
+2026-08-10       +5.52      -3.88    +0.08    +1.71     240
+2026-08-11       -1.95      -3.89    +0.02    -5.82      93
+2026-08-12       -3.16      -1.09    -0.07    -4.32      29
+2026-08-13       +2.42      -0.40    +0.04    +2.07       5
+                                            -84.59  = -1.72% of the account
+```
+
+**One day is 60% of the total loss, on six closing trades.** -8.15 per close against a
+typical -0.06. This corrects #45, which claimed the loss was essentially all commission
+-- that was read off a re-baselined reconciler covering only hours.
+
+What happened on 08-08:
+
+```
+18:18:11  Closed existing SHORT position: 31,761 DOGEUSDT     (~2,220 USDT notional)
+18:20:38  Failed to place/update stop-loss:
+          Exchange.amount_to_precision() missing 1 required positional argument: 'amount'
+18:20:52  (same)
+18:21:07  (same)
+18:21:21  (same)
+18:21:30  EMERGENCY STOP
+```
+
+A position roughly **3.7x MAX_POSITION_PCT** ran with **no stop-loss**, because stop
+placement raised a TypeError inside `except Exception` at main.py:837 and logged a
+generic failure. Identical in shape to #38 -- a call that could never bind, swallowed --
+one file over.
+
+### The guard existed and did not cover it
+
+`tests/test_exchange_contract.py` was written for exactly this after #38. It checked
+`grid.py`, `trend_follower.py` and `router.py`. **It did not check `main.py`** -- the
+module that owns stop-loss placement. Widening the parametrize list was the obvious fix
+and it was not sufficient: injecting the 08-08 call shape still passed, because of
+
+```python
+real = getattr(Exchange, name, None)
+if not callable(real):
+    continue        # ccxt passthrough or helper
+```
+
+A call to a method that **does not exist on Exchange at all** is an AttributeError --
+strictly worse than the TypeError the file was written to catch -- and this waved it
+through silently. `amount_to_precision` lives on the ccxt object
+(`exchange.exchange.…`), not on the wrapper, so `getattr` returned None and the check
+skipped it.
+
+Both are fixed: the matcher now also recognises main.py's bare `exchange.<method>(...)`
+spelling, and a missing or non-callable attribute is a failure with the correction
+suggested. All 27 methods currently called on the wrapper resolve correctly, so the
+codebase is clean today -- it is the guard that was not.
+
+Verified both ways: passes on current code, and injecting
+`exchange.amount_to_precision(q)` into main.py fails with
+
+```
+main.py:609 exchange.amount_to_precision(...) does not exist on Exchange
+-- AttributeError at runtime (did you mean exchange.exchange.amount_to_precision?)
+```
+
+### Fee assumption checked while here
+
+A separate scare turned out to be my own arithmetic error. The `fee` column in
+trades.csv is a ROUND-TRIP estimate, `(buy+sell) * qty * rate`; dividing it by a single
+side's notional doubles it and makes maker look like taker. Binance's own user-trade
+records over 7 days:
+
+```
+maker fills 882 (88.2%)   taker fills 118 (11.8%)
+actual commission per side: median 0.0200%, mean 0.0224%
+real round trip 0.0447% vs the 0.0400% the backtest models -- understated 1.12x
+```
+
+Fees are close to modelled. They are not the problem.
+
+---
+
 ## 46. The grid is too narrow for the asset, and RECENTER_MARGIN_PCT is a dead knob
 
 Following #45. The question was where 87% of the per-cycle capture goes. It is not fees.

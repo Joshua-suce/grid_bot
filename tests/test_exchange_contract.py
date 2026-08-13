@@ -109,7 +109,25 @@ def test_fake_close_position_accepts_the_real_call(case):
 
 
 def _calls_on_exchange_attr(path: pathlib.Path):
-    """Every `self.exchange.<method>(...)` call in a module, with its arity."""
+    """Every call on the Exchange wrapper in a module, with its arity.
+
+    Matches two spellings, because the modules differ:
+      `self.exchange.<method>(...)`  -- the strategy layer
+      `exchange.<method>(...)`       -- main.py, which holds a bare local
+
+    AUDIT #47. Only the first was checked, so main.py -- which owns stop-loss placement
+    -- was never covered. On 2026-08-08 that gap cost more than every other day of this
+    account's history combined:
+
+        18:18:11  Closed existing SHORT position: 31,761 DOGEUSDT   (~3.7x MAX_POSITION_PCT)
+        18:20:38  Failed to place/update stop-loss:
+                  Exchange.amount_to_precision() missing 1 required positional argument
+        (x4, then EMERGENCY STOP)
+
+    A TypeError inside `except Exception` at main.py:837 meant the stop-loss silently
+    never existed, and an oversized position ran unprotected. Realised -48.92 on six
+    closes -- 60% of the 15-day loss, in one day. Same shape as #38, one file over.
+    """
     tree = ast.parse(path.read_text(encoding="utf-8"))
     out = []
     for node in ast.walk(tree):
@@ -119,27 +137,46 @@ def _calls_on_exchange_attr(path: pathlib.Path):
         if not isinstance(f, ast.Attribute):
             continue
         v = f.value
-        if not (isinstance(v, ast.Attribute) and v.attr == "exchange"
-                and isinstance(v.value, ast.Name) and v.value.id == "self"):
+        is_self_exchange = (isinstance(v, ast.Attribute) and v.attr == "exchange"
+                            and isinstance(v.value, ast.Name) and v.value.id == "self")
+        is_bare_exchange = isinstance(v, ast.Name) and v.id == "exchange"
+        if not (is_self_exchange or is_bare_exchange):
             continue
         out.append((f.attr, len(node.args), tuple(sorted(k.arg for k in node.keywords if k.arg)),
                     node.lineno))
     return out
 
 
-@pytest.mark.parametrize("module", ["grid.py", "trend_follower.py", "router.py"])
+@pytest.mark.parametrize(
+    "module", ["grid.py", "trend_follower.py", "router.py", "main.py"]
+)
 def test_every_exchange_call_binds_against_the_real_class(module):
-    """The check that would have caught #38 on the day it was written.
+    """The check that would have caught #38 on the day it was written -- and #47.
 
-    Each `self.exchange.<method>(...)` in the strategy layer is bound against the real
-    Exchange signature. A call that cannot bind is a guaranteed runtime TypeError --
-    and both offenders sat inside `except Exception`, so nothing would have surfaced it.
+    Each call on the Exchange wrapper is bound against the real signature. A call that
+    cannot bind is a guaranteed runtime TypeError, and these all sit inside
+    `except Exception`, so nothing surfaces them until money is gone.
     """
     failures = []
     for name, nargs, kwnames, lineno in _calls_on_exchange_attr(REPO / module):
         real = getattr(Exchange, name, None)
+        if real is None:
+            # The original hole. `if not callable(real): continue` skipped calls to
+            # methods that DO NOT EXIST on Exchange -- an AttributeError at runtime,
+            # strictly worse than the TypeError this file was written to catch, and
+            # silently waved through. That is precisely the 08-08 shape:
+            # `exchange.amount_to_precision(q)` where the method lives on the ccxt
+            # object (`exchange.exchange.…`), not on the wrapper.
+            failures.append(
+                f"{module}:{lineno} exchange.{name}(...) does not exist on Exchange "
+                f"-- AttributeError at runtime (did you mean exchange.exchange.{name}?)"
+            )
+            continue
         if not callable(real):
-            continue        # ccxt passthrough (self.exchange.exchange...) or helper
+            failures.append(
+                f"{module}:{lineno} exchange.{name} is not callable ({type(real).__name__})"
+            )
+            continue
         try:
             inspect.signature(real).bind(
                 None, *[object()] * nargs, **{k: object() for k in kwnames}
