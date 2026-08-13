@@ -79,6 +79,14 @@ class Exchange:
         self._open_order_count: int = 0
         self._last_order_count_time: float = 0.0
         self._balance_cache: dict[str, float] = {}
+        # Per-KEY timestamps. A single shared timestamp meant whichever getter ran
+        # first refreshed it for all of them, so the next getter saw "fresh" and
+        # returned its own stale value. get_balance_cached() runs at main.py:990 and
+        # get_total_equity_cached() at :991, back to back -- so equity was fetched once
+        # and then served from cache for the rest of the run, while free balance updated
+        # every iteration. That equity feeds risk.check_all's drawdown check, which is
+        # the kill switch (AUDIT #39).
+        self._balance_cache_at: dict[str, float] = {}
         self._balance_cache_time: float = 0.0
         self._balance_cache_ttl: float = 5.0
 
@@ -138,7 +146,16 @@ class Exchange:
     def _invalidate_balance_cache(self) -> None:
         """Clear the balance cache to force a fresh fetch."""
         self._balance_cache = {}
+        self._balance_cache_at = {}
         self._balance_cache_time = 0.0
+
+    def _cache_fresh(self, key: str) -> bool:
+        return (time.time() - self._balance_cache_at.get(key, 0.0)) < self._balance_cache_ttl
+
+    def _cache_put(self, key: str, value: float) -> None:
+        self._balance_cache[key] = value
+        self._balance_cache_at[key] = time.time()
+        self._balance_cache_time = self._balance_cache_at[key]
 
     def set_leverage(self, symbol: str, leverage: int) -> None:
         try:
@@ -195,8 +212,13 @@ class Exchange:
                     # check of an order we had just cancelled printed a red line. Three
                     # of them appeared right after the 22:04 recenter, which cancels
                     # everything and then checks what it cancelled (AUDIT #35).
+                    # Deliberately NOT a circuit-breaker failure. The exchange answered;
+                    # it just said the order is gone. Counting these tripped the breaker
+                    # on routine probing -- a recenter cancels every order and then checks
+                    # what it cancelled, which is five -2013 replies in a row against a
+                    # threshold of five, and an open breaker refuses EVERY request for
+                    # 120s including stop-loss placement (AUDIT #39).
                     logger.debug("{}: {}", label, e)
-                    self._circuit_breaker.record_failure()
                     raise
                 else:
                     logger.error("{} failed: {}", label, e)
@@ -264,13 +286,11 @@ class Exchange:
 
     def get_balance_cached(self, asset: str = "USDT") -> float:
         """Return cached free balance, fetching only if stale (>5s old)."""
-        now = time.time()
         cache_key = f"free_{asset}"
-        if (now - self._balance_cache_time) < self._balance_cache_ttl and cache_key in self._balance_cache:
+        if cache_key in self._balance_cache and self._cache_fresh(cache_key):
             return self._balance_cache[cache_key]
         value = self.get_balance(asset)
-        self._balance_cache[cache_key] = value
-        self._balance_cache_time = now
+        self._cache_put(cache_key, value)
         return value
 
     def get_total_equity(self, asset: str = "USDT") -> float:
@@ -293,13 +313,11 @@ class Exchange:
 
     def get_total_equity_cached(self, asset: str = "USDT") -> float:
         """Return cached total equity, fetching only if stale."""
-        now = time.time()
         cache_key = f"total_{asset}"
-        if (now - self._balance_cache_time) < self._balance_cache_ttl and cache_key in self._balance_cache:
+        if cache_key in self._balance_cache and self._cache_fresh(cache_key):
             return self._balance_cache[cache_key]
         value = self.get_total_equity(asset)
-        self._balance_cache[cache_key] = value
-        self._balance_cache_time = now
+        self._cache_put(cache_key, value)
         return value
 
     def get_balance_info(self, asset: str = "USDT") -> dict[str, float]:
@@ -312,10 +330,9 @@ class Exchange:
                 "total": float(asset_bal.get("total", 0)),
                 "used": float(asset_bal.get("used", 0)),
             }
-            self._balance_cache[f"free_{asset}"] = result["free"]
-            self._balance_cache[f"total_{asset}"] = result["total"]
-            self._balance_cache[f"used_{asset}"] = result["used"]
-            self._balance_cache_time = time.time()
+            self._cache_put(f"free_{asset}", result["free"])
+            self._cache_put(f"total_{asset}", result["total"])
+            self._cache_put(f"used_{asset}", result["used"])
             return result
         except Exception as e:
             if self._is_timestamp_error(e):
@@ -332,7 +349,7 @@ class Exchange:
     def get_balance_info_cached(self, asset: str = "USDT") -> dict[str, float]:
         """Return cached balance info, fetching only if stale."""
         now = time.time()
-        if (now - self._balance_cache_time) < self._balance_cache_ttl:
+        if self._cache_fresh(f"free_{asset}") and self._cache_fresh(f"total_{asset}"):
             if f"free_{asset}" in self._balance_cache:
                 return {
                     "free": self._balance_cache[f"free_{asset}"],

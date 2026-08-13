@@ -894,6 +894,58 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 39. The kill switch measured a frozen equity, and routine probes tripped the breaker
+
+Two defects in `exchange.py`, both found by the same sweep as #38 and verified by hand
+after its verifiers died.
+
+### The equity feeding the drawdown kill switch was fetched once
+
+`get_balance_cached` and `get_total_equity_cached` shared a single `_balance_cache_time`.
+Whichever ran first refreshed it for both, so the second saw "fresh" and returned its own
+stale value. main.py calls them back to back:
+
+```
+main.py:990   balance = exchange.get_balance_cached()
+main.py:991   equity  = exchange.get_total_equity_cached()
+```
+
+Replaying that exact pattern against the real caching code, with an account losing 25 per
+iteration:
+
+```
+iter  true equity  equity used by risk       lag
+   1      4875.00              4875.00      0.00
+   4      4800.00              4875.00    -75.00
+   7      4725.00              4875.00   -150.00
+
+real fetches: get_balance=7  get_total_equity=1
+```
+
+Equity was fetched **once** and served from cache for the rest of the run, while free
+balance updated every iteration. That `equity` is what `risk.check_all` uses for the
+drawdown check -- so `MAX_DRAWDOWN_PCT` was being evaluated against a number that could
+not fall, and the drawdown kill switch could not fire.
+
+Each cache key now carries its own timestamp. Same replay after the fix: seven fetches,
+zero lag.
+
+### "Order does not exist" counted as a circuit-breaker failure
+
+Introduced by #35's own fix. Downgrading the log was right; keeping
+`record_failure()` was not. The exchange **answered** -- it just said the order is gone.
+
+The breaker opens after 5 consecutive failures and then refuses **every** request for
+120 seconds, stop-loss placement included. A recenter cancels every order and then checks
+what it cancelled, which is five `-2013` replies in a row against a threshold of five.
+The 22:05 log shows three of them back to back; two more and the bot would have gone
+blind for two minutes while holding 10,456 DOGE.
+
+`OrderNotFound`/`InvalidOrder` no longer record a failure. A test pins that genuine
+`NetworkError`s still open the breaker -- #39 narrowed what counts, not whether.
+
+---
+
 ## 38. The trend follower could never close a position -- CRITICAL
 
 `Exchange.close_position` takes three required arguments:

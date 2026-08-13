@@ -151,3 +151,101 @@ def test_every_exchange_call_binds_against_the_real_class(module):
         "these calls cannot bind against the real Exchange and are runtime TypeErrors:\n"
         + "\n".join(failures)
     )
+
+
+# --- #39: cache freshness and breaker accounting ---------------------------
+
+def _bare_exchange():
+    """An Exchange with cache state but no network, for pure cache-logic tests."""
+    ex = Exchange.__new__(Exchange)
+    ex._balance_cache = {}
+    ex._balance_cache_at = {}
+    ex._balance_cache_time = 0.0
+    ex._balance_cache_ttl = 5.0
+    return ex
+
+
+def test_equity_is_not_kept_stale_by_the_free_balance_getter():
+    """AUDIT #39. Both caches shared one timestamp, so whichever getter ran first
+    refreshed it for all of them and the next one returned its own stale value.
+
+    main.py calls get_balance_cached() at :990 and get_total_equity_cached() at :991,
+    back to back -- so equity was fetched once at startup and served from cache for the
+    rest of the run. That equity feeds risk.check_all's drawdown check, i.e. the kill
+    switch, so a falling account was measured against a number that never fell.
+    """
+    import types
+
+    ex = _bare_exchange()
+    truth = {"free": 4800.0, "total": 4900.0}
+    fetches = {"total": 0}
+    ex.get_balance = types.MethodType(lambda self, a="USDT": truth["free"], ex)
+
+    def total(self, a="USDT"):
+        fetches["total"] += 1
+        return truth["total"]
+
+    ex.get_total_equity = types.MethodType(total, ex)
+
+    seen = []
+    for i in range(1, 5):
+        truth["total"] = 4900.0 - i * 25
+        truth["free"] = 4800.0 - i * 25
+        ex.get_balance_cached()          # main.py:990 -- must not mask the next line
+        seen.append(ex.get_total_equity_cached())
+        ex._balance_cache_at = {k: v - 10.0 for k, v in ex._balance_cache_at.items()}
+
+    assert fetches["total"] == 4, (
+        f"equity fetched {fetches['total']} times in 4 iterations -- the free-balance "
+        f"getter is still refreshing equity's freshness for it"
+    )
+    assert seen == [4875.0, 4850.0, 4825.0, 4800.0], seen
+
+
+def test_a_missing_order_does_not_trip_the_circuit_breaker():
+    """AUDIT #39. "Order does not exist" means the exchange ANSWERED. Counting it as a
+    failure let routine probing open the breaker: a recenter cancels every order and
+    then checks what it cancelled, which is five -2013 replies against a threshold of
+    five -- and an open breaker refuses every request for 120s, stop-loss placement
+    included."""
+    import ccxt
+
+    from exchange import CircuitBreaker
+
+    ex = Exchange.__new__(Exchange)
+    ex._circuit_breaker = CircuitBreaker()
+    ex.max_retries = 1
+    ex.retry_delay = 0
+    ex._is_timestamp_error = lambda e: False
+
+    def missing(*a, **k):
+        raise ccxt.OrderNotFound("-2013 Order does not exist")
+
+    for _ in range(ex._circuit_breaker.failure_threshold + 1):
+        with pytest.raises(ccxt.OrderNotFound):
+            ex._retry(missing, label="fetch_order")
+
+    assert not ex._circuit_breaker.open, "routine order probes opened the circuit breaker"
+    assert ex._circuit_breaker.failures == 0
+
+
+def test_a_real_network_failure_still_trips_the_breaker():
+    """The breaker must still do its job -- #39 narrowed what counts, not whether."""
+    import ccxt
+
+    from exchange import CircuitBreaker
+
+    ex = Exchange.__new__(Exchange)
+    ex._circuit_breaker = CircuitBreaker()
+    ex.max_retries = 1
+    ex.retry_delay = 0
+    ex._is_timestamp_error = lambda e: False
+
+    def down(*a, **k):
+        raise ccxt.NetworkError("connection reset")
+
+    for _ in range(ex._circuit_breaker.failure_threshold):
+        with pytest.raises(Exception):
+            ex._retry(down, label="fetch_positions")
+
+    assert ex._circuit_breaker.open, "a genuinely unreachable exchange no longer trips the breaker"
