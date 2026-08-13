@@ -894,6 +894,58 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 40. The flat override contradicted the log without explaining itself
+
+From the 2026-08-13 01:49 run:
+
+```
+01:54:58 REGIME CHANGE (confirmed after 312s) | uncertain -> ranging | ADX=31.1
+01:54:59 REGIME | 1h=downtrend(adx=31.1) 30m=downtrend(adx=45.2) 1d=uncertain(adx=27.6)
+                | bands: range<=15 trend>=30 | needs 2 of 3 to agree -> ranging
+```
+
+Two timeframes agree on downtrend, the stated rule is "2 of 3 to agree", and the answer
+is *ranging*. Read literally it is nonsense.
+
+It was actually correct. `_merge_timeframes` did return DOWNTREND, and then
+`_apply_flat_override` replaced it: DOGE's last 6 candles spanned under 1%, so ADX was
+reading trend strength in a market that was not going anywhere. Range beats ADX, and
+that is the right call -- a grid should keep trading a flat market whatever ADX says.
+
+The defect was that the override only logged when the *previous* regime was already
+trending, so in this case it fired silently. #33 added `explain()` precisely so a
+regime could not be unexplainable; this was the same hole one layer down.
+
+The override now always logs, and `explain()` appends the reason when it is active:
+
+```
+... | needs 2 of 3 to agree | FLAT OVERRIDE: last 6 candles span 0.74% <= 1.00%,
+so a trending ADX reads as ranging
+```
+
+No behaviour changed -- only whether the log can be believed.
+
+### What else that run showed
+
+Three earlier fixes fired correctly in production for the first time:
+
+- **#34** -- `RESET LEVELS | restored ladder is deformed (2 level pair(s) closer than the
+  0.12% fee floor (tightest 0.04%)) — rebuilding it` at startup. The deformed ladder
+  from the previous session was detected and rebuilt instead of traded.
+- **#37** -- `STARTUP | saved grid state found — keeping any open position for the
+  restored grid to unwind rather than closing it at market`. No market dump.
+- **#35** -- shutdown logged `SHUTDOWN | cancelling all orders` and
+  `TREND FOLLOWER STOPPED | shutdown` at INFO. No phantom ERROR lines.
+
+And #32 earned its keep in the other direction: the 03:19 recenter unwound a 9,564 DOGE
+**short** through buy levels at 0.06902-0.07007, all below the 0.07014576 entry -- which
+for a short is profit, so the guard correctly allowed them. Both completed cycles that
+followed were positive (+0.144847 and +0.994240).
+
+Net over the 6.5-hour session: -0.0036 realised. Effectively flat, on 7 fills.
+
+---
+
 ## 39. The kill switch measured a frozen equity, and routine probes tripped the breaker
 
 Two defects in `exchange.py`, both found by the same sweep as #38 and verified by hand

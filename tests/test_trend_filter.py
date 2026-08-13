@@ -358,3 +358,74 @@ def test_legit_signal_still_confirms_after_window(monkeypatch):
     tf.update(fake_ohlcv, "1h")
     assert tf.regime == MarketRegime.RANGING
     assert tf._pending_regime is None
+
+
+# --- #40: the flat override must explain itself ----------------------------
+
+def _flat_filter():
+    from trend_filter import TrendFilter
+
+    return TrendFilter(trend_threshold=30.0, range_threshold=15.0,
+                       flat_range_window=6, flat_range_pct=0.01,
+                       confirmation_seconds=0)
+
+
+def _flat_candles(n=60, price=0.0700):
+    """Candles whose last 6 span well under 1% -- a genuinely flat market."""
+    import pandas as pd
+
+    return pd.DataFrame({
+        "open": [price] * n,
+        "high": [price * 1.001] * n,
+        "low": [price * 0.999] * n,
+        "close": [price] * n,
+    })
+
+
+def test_the_flat_override_says_so_in_the_explanation():
+    """AUDIT #40. On 2026-08-13 the log read
+
+        1h=downtrend(31.1) 30m=downtrend(45.2) 1d=uncertain(27.6)
+        | needs 2 of 3 to agree -> ranging
+
+    Two timeframes agreed on downtrend, the merge returned downtrend, and the flat
+    override silently turned it into ranging. The override is correct -- ADX can read
+    as trending while price goes nowhere -- but a log line that contradicts itself with
+    no reason given is exactly what #33 existed to stop.
+    """
+    from trend_filter import MarketRegime
+
+    tf = _flat_filter()
+    tf._last_ohlcv = _flat_candles()
+    tf._ohlcv["1h"] = tf._last_ohlcv
+
+    out = tf._apply_flat_override(MarketRegime.DOWNTREND)
+
+    assert out is MarketRegime.RANGING
+    assert tf._flat_override_active is True
+    tf._timeframes["1h"] = MarketRegime.DOWNTREND
+    tf._adx_by_timeframe["1h"] = 31.1
+    assert "FLAT OVERRIDE" in tf.explain()
+
+
+def test_no_override_note_when_the_market_is_actually_moving():
+    from trend_filter import MarketRegime
+    import pandas as pd
+
+    tf = _flat_filter()
+    moving = pd.DataFrame({
+        "open": [0.070, 0.071, 0.072, 0.073, 0.074, 0.075],
+        "high": [0.0705, 0.0715, 0.0725, 0.0735, 0.0745, 0.0755],
+        "low": [0.0695, 0.0705, 0.0715, 0.0725, 0.0735, 0.0745],
+        "close": [0.0701, 0.0711, 0.0721, 0.0731, 0.0741, 0.0751],
+    })
+    tf._last_ohlcv = moving
+    tf._ohlcv["1h"] = moving
+
+    out = tf._apply_flat_override(MarketRegime.DOWNTREND)
+
+    assert out is MarketRegime.DOWNTREND
+    assert tf._flat_override_active is False
+    tf._timeframes["1h"] = MarketRegime.DOWNTREND
+    tf._adx_by_timeframe["1h"] = 31.1
+    assert "FLAT OVERRIDE" not in tf.explain()

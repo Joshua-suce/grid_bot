@@ -96,6 +96,8 @@ class TrendFilter:
         self.adx_value = 0.0
         self._timeframes: dict[str, MarketRegime] = {}
         self._adx_by_timeframe: dict[str, float] = {}
+        self._flat_override_active = False
+        self._flat_override_pct = 0.0
         self._ohlcv: dict[str, pd.DataFrame] = {}
         self._pending_regime: MarketRegime | None = None
         self._pending_since: float = 0.0
@@ -163,13 +165,26 @@ class TrendFilter:
         return pct is not None and pct <= self.flat_range_pct
 
     def _apply_flat_override(self, regime: MarketRegime) -> MarketRegime:
+        """ADX can read as trending while price goes nowhere. Range beats ADX.
+
+        The override itself is right and stays. What changed is that it used to be
+        SILENT unless the previous regime was already trending -- so on 2026-08-13 the
+        log read `1h=downtrend 30m=downtrend 1d=uncertain | needs 2 of 3 to agree ->
+        ranging`, which is self-contradicting nonsense to anyone reading it. Two
+        timeframes agreed on downtrend, the merge returned downtrend, and the override
+        quietly turned it into ranging with no line explaining why (AUDIT #40).
+        """
+        self._flat_override_active = False
         if regime in (MarketRegime.UPTREND, MarketRegime.DOWNTREND) and self._is_flat_range():
-            if self.regime in (MarketRegime.UPTREND, MarketRegime.DOWNTREND):
-                pct = self._recent_range_pct()
-                logger.info(
-                    "FLAT OVERRIDE | ADX says {} but recent range {:.2f}% <= {:.2f}% — forcing RANGING",
-                    regime.value, (pct or 0.0) * 100, self.flat_range_pct * 100,
-                )
+            pct = self._recent_range_pct()
+            self._flat_override_active = True
+            self._flat_override_pct = pct or 0.0
+            logger.info(
+                "FLAT OVERRIDE | ADX says {} but the last {} candles span {:.2f}% "
+                "<= {:.2f}% — treating as RANGING",
+                regime.value, self.flat_range_window,
+                (pct or 0.0) * 100, self.flat_range_pct * 100,
+            )
             return MarketRegime.RANGING
         return regime
 
@@ -241,10 +256,17 @@ class TrendFilter:
             f"{tf}={regime.value}(adx={self._adx_by_timeframe.get(tf, 0.0):.1f})"
             for tf, regime in self._timeframes.items()
         ]
-        return (
+        line = (
             f"{' '.join(parts)} | bands: range<={self.range_threshold:g} "
             f"trend>={self.trend_threshold:g} | needs 2 of {len(self._timeframes)} to agree"
         )
+        if self._flat_override_active:
+            line += (
+                f" | FLAT OVERRIDE: last {self.flat_range_window} candles span "
+                f"{self._flat_override_pct * 100:.2f}% <= {self.flat_range_pct * 100:.2f}%, "
+                f"so a trending ADX reads as ranging"
+            )
+        return line
 
     def _merge_timeframes(self) -> MarketRegime:
         if not self._timeframes:
