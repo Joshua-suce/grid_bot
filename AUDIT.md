@@ -894,6 +894,58 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 43. The kill switch counted the grid's opinion, not the account -- HIGH
+
+Recorded at the end of #42 as "still open", then fixed here. It needed one correction
+first: I had said the daily-loss kill switch was fed the inflated number. **It was not.**
+`main.py:1134` already passes `daily_realized_pnl=pnl_reconciler.daily_net_pnl`, the
+exchange-verified figure, and has done since the reconciler landed. That check was fine.
+
+What was still wrong is a *different* kill switch. `risk.record_trade(profit)` was fed
+`fill["profit"]` -- the grid engine's per-level cycle estimate -- and that number drives
+`state.consecutive_losses`, which `_check_consecutive_losses` kills on.
+
+The estimate is not the account. The grid credits each sell against the particular buy
+level it was paired with; Binance nets everything into one position at one blended
+average entry. In the 2026-08-13 run, fills #24-#26 booked +2.37, +1.29 and +3.89
+(=+7.55) while the reconciler moved -2.568140 -> -2.247978: a realized **+0.32**. Twenty-
+three times out.
+
+Magnitude is the lesser problem. **The estimate can carry the wrong sign, and it does so
+exactly when it matters.** Buy 1,000 at 0.0690 and 1,000 at 0.0710 -- blended entry
+0.0700. Sell 1,000 at 0.0695 paired with the 0.0690 level: the grid books +5, the account
+realises -5. A falling market fills both levels, so this is not a contrived case, it is
+the ordinary shape of a grid bleeding into a downtrend.
+
+Which means a grid losing steadily in a trend reports a **run of wins**, and
+`consecutive_losses` -- the switch whose entire purpose is "this strategy is repeatedly
+wrong" -- never increments. It could not fire in the one situation it exists for.
+
+`record_cycles(completed, verified_pnl, estimated_pnl)` replaces it. `main.py` captures
+`net_realized_pnl` before the sync and passes the delta across the batch, so both the
+losing streak and `state.daily_realized_pnl` now track the exchange. The grid's estimate
+is kept for the log line, where the divergence stays visible instead of driving anything:
+
+```
+CYCLES RECORDED | 3 cycle(s) | verified pnl=+0.32 | grid estimated +7.55
+                | daily_total=0.32 | trades_today=3 | consec_losses=0
+```
+
+One deliberate subtlety: a verified delta of **exactly 0.0** means Binance's income
+ledger has not settled yet, not that the batch broke even. Treating that as a win would
+clear a genuine losing streak on nothing but API lag, so the streak is *held* -- neither
+reset nor incremented -- and the log says so. The cycle still counts toward
+`trades_today`.
+
+`verified_pnl=None` falls back to the estimate: worse than the account, better than
+nothing, and it keeps the method usable without a reconciler.
+
+Reverting the wiring fails five of the seven new tests in
+`tests/test_killswitch_accounting.py`; the two that still pass cover the None-fallback
+and the no-completed-cycles no-op, which the revert does not change. 442 pass.
+
+---
+
 ## 42. The break-even guard went dormant instead of re-quoting -- HIGH
 
 The 2026-08-13 09:11 run traded **seven times in seven hours**, six of them inside a

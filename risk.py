@@ -265,6 +265,57 @@ class RiskManager:
             pnl, self.state.daily_realized_pnl, self.state.trades_today, self.state.consecutive_losses,
         )
 
+    def record_cycles(
+        self, completed: int, verified_pnl: float | None, estimated_pnl: float,
+    ) -> None:
+        """Record a batch of completed grid cycles against the EXCHANGE's realized PnL.
+
+        AUDIT #43. `record_trade()` was fed the grid engine's own per-level cycle
+        estimate, and that estimate is not the account. The grid credits each sell
+        against the particular buy level it is paired with; Binance nets everything into
+        one position at one blended average entry. The two only agree by coincidence --
+        in the 2026-08-13 run, fills #24-#26 booked +2.37, +1.29 and +3.89 (=+7.55)
+        while the reconciler moved -2.568140 -> -2.247978, a realized **+0.32**.
+
+        Magnitude is the lesser problem. The estimate can carry the wrong SIGN, and it
+        does so exactly when it matters. Buy 1,000 at 0.0690 and 1,000 at 0.0710 and the
+        blended entry is 0.0700; sell 1,000 at 0.0695 paired with the 0.0690 level and
+        the grid books +5 while the account realises -5. A falling market fills both
+        levels, so a grid bleeding into a downtrend reports a *run of wins*.
+
+        `consecutive_losses` is the kill switch meant to catch "this strategy is
+        repeatedly wrong". Feeding it the per-level estimate meant it could not fire in
+        the one situation it exists for.
+
+        A verified delta of exactly 0.0 means Binance's income ledger has not caught up
+        yet, not that the batch broke even -- so the streak is left ALONE rather than
+        reset. Guessing "win" there would clear a real losing streak on ledger lag.
+        """
+        if completed <= 0:
+            return
+        self.state.trades_today += completed
+        pnl = estimated_pnl if verified_pnl is None else verified_pnl
+        self.state.daily_realized_pnl += pnl
+
+        if verified_pnl is None or verified_pnl != 0.0:
+            if pnl >= 0:
+                self.state.consecutive_losses = 0
+            else:
+                self.state.consecutive_losses += 1
+            streak = str(self.state.consecutive_losses)
+        else:
+            streak = f"{self.state.consecutive_losses} (held: ledger not settled)"
+
+        drift = ""
+        if verified_pnl is not None and abs(estimated_pnl - verified_pnl) > 0.01:
+            drift = f" | grid estimated {estimated_pnl:+.2f}"
+        logger.info(
+            "CYCLES RECORDED | {} cycle(s) | verified pnl={:+.2f}{} | daily_total={:.2f} "
+            "| trades_today={} | consec_losses={}",
+            completed, pnl, drift, self.state.daily_realized_pnl,
+            self.state.trades_today, streak,
+        )
+
     def update_unrealized(self, unrealized: float) -> None:
         self.state.daily_unrealized_pnl = unrealized
 

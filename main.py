@@ -1003,12 +1003,21 @@ def run_bot() -> None:
                         # Pull Binance's actual income ledger once per batch of fills so the
                         # PnL figures below reflect the exchange's own accounting rather than
                         # the grid engine's internal per-level estimate.
+                        verified_before = pnl_reconciler.net_realized_pnl
                         pnl_reconciler.sync(exchange, settings.symbol)
+                        # The account's own realized change across this batch. This, not
+                        # the grid's per-level sum, is what the risk manager is told --
+                        # the two diverge by ~20x in magnitude and can differ in SIGN
+                        # when a falling market leaves the blended entry worse than the
+                        # level a sell is paired against (AUDIT #43).
+                        risk.record_cycles(
+                            sum(1 for f in fills if f["completed_cycle"]),
+                            pnl_reconciler.net_realized_pnl - verified_before,
+                            sum(f["profit"] for f in fills if f["completed_cycle"]),
+                        )
                     for fill in fills:
                         profit = fill["profit"]
                         fee = fill["fee"]
-                        if fill["completed_cycle"]:
-                            risk.record_trade(profit)
                         notifier.on_fill(
                             fill["side"], fill["price"], profit, grid.total_fills, pnl_reconciler.daily_net_pnl,
                             total_pnl_verified=pnl_reconciler.net_realized_pnl,
