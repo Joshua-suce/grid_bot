@@ -894,6 +894,57 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 49. The position cap was advisory -- the replacement path bypassed it -- CRITICAL
+
+The mechanism behind #47's -50.49 day, now found and closed.
+
+`_handle_fill` places the paired replacement order by calling `place_limit_order`
+**directly**. Every guard lives in `_place_order_for_level`, which that path skips
+entirely:
+
+- `_block_buys` / `_block_sells` -- the position cap
+- `_buy_scale` / `_sell_scale` -- the size taper as the cap is approached
+- the minimum-notional check
+
+So the cap never capped. Each fill immediately armed another order regardless of it;
+that order filled; its replacement did the same. In a trend the position ratchets
+upward with nothing to stop it. On 2026-08-08 it reached **31,761 DOGE against a 17,467
+cap** -- 1.8x through a limit the log was simultaneously reporting as enforced:
+
+```
+23:00:14  BUY SCALE | long=10465.0/17467.8 | scale=0.80
+23:03:12  BUY SCALE | long=11812.0/17476.7 | scale=0.65
+...
+18:18:11  Closed existing SHORT position: 31,761 DOGEUSDT
+```
+
+Combined with the stop-loss TypeError from #47, that is the whole disaster: an
+unbounded position running unprotected. -48.92 realised on six closes, 60% of the
+fortnight's loss.
+
+### The fix, and the line it must not cross
+
+`_exit_order_params` already distinguishes the two cases: `params is None` means it
+found nothing to reduce, i.e. **this order opens exposure**. Opening orders now respect
+the block flags and the taper; **reduce-only exits stay unconditional**, because
+refusing those traps inventory -- that is #42, and re-introducing it here would trade
+one failure mode for a worse one. The min-notional check was added for the same reason
+it exists in the other path: a sub-minimum order is a guaranteed -4164.
+
+Reverting the guard fails 4 of the 5 tests in `tests/test_position_cap.py`; the fifth
+covers exits, which the revert does not affect. 470 tests pass.
+
+### A note on how this was nearly missed twice
+
+The first version of the regression test blocked buys and then filled a *buy* level.
+It passed against the broken code, because a buy fill produces a **sell** replacement --
+the sides flip across a fill. A second test looked correct and was vacuous: level
+quantities start at 0.0, so the assertion compared against a fallback size and could
+never fail. Both were caught by running the tests against the *unfixed* code first,
+which is the only reason they mean anything.
+
+---
+
 ## 48. The parameter search does not generalise -- and the trend filter does
 
 32 configurations (grid_count 4/6/8/10 x range_atr 3.0/4.0/5.0/6.0 x trend filter

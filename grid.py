@@ -1427,9 +1427,47 @@ class GridEngine:
             # rejected with -2022, so the sell side could never re-arm and the grid
             # decayed into a one-sided book (265 such rejections in one session).
             params, adj_qty = self._exit_order_params(new_side, float(quantity))
+
+            # AUDIT #49. This path called place_limit_order DIRECTLY, so it never saw
+            # _block_buys/_block_sells or the size taper -- every one of those lives in
+            # _place_order_for_level, which the replacement path skips entirely.
+            #
+            # The position cap is therefore advisory here: each fill immediately arms
+            # another order regardless of it, that order fills, and the next replacement
+            # does the same. In a trend the position ratchets past the cap without limit.
+            # On 2026-08-08 it reached 31,761 DOGE against a 17,467 cap -- 1.8x through
+            # a limit the logs were simultaneously reporting as enforced -- and the day
+            # closed -50.49, 60% of that fortnight's entire loss.
+            #
+            # `params is None` means _exit_order_params found nothing to reduce, i.e.
+            # this order OPENS exposure. Exits stay unconditional: refusing those would
+            # trap inventory, which is the #42 mistake.
+            if params is None:
+                blocked = ((new_side == "buy" and self._block_buys)
+                           or (new_side == "sell" and self._block_sells))
+                if blocked:
+                    logger.warning(
+                        "REPLACEMENT BLOCKED | {} @ {} would add exposure past the "
+                        "position cap — level left pending (AUDIT #49)",
+                        new_side.upper(), new_price,
+                    )
+                    level.order_id = None
+                    level.status = "pending"
+                    return fill_record
+                # Same taper _place_order_for_level applies as the cap is approached.
+                adj_qty *= self._buy_scale if new_side == "buy" else self._sell_scale
+
             if adj_qty <= 0:
                 raise ValueError("replacement quantity resolved to zero")
             quantity = self.exchange.exchange.amount_to_precision(self.symbol, adj_qty)
+            if float(quantity) * new_price < MIN_NOTIONAL_USDT:
+                logger.debug(
+                    "SKIP REPLACEMENT | {} @ {} notional {:.2f} < {:.2f} minimum",
+                    new_side, new_price, float(quantity) * new_price, MIN_NOTIONAL_USDT,
+                )
+                level.order_id = None
+                level.status = "pending"
+                return fill_record
             level.quantity = float(quantity)
             order = self.exchange.place_limit_order(self.symbol, new_side, new_price, float(quantity), params=params)
             if "id" not in order:
