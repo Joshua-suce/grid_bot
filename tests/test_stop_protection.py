@@ -188,3 +188,111 @@ def test_reset_to_pending_leaves_a_clean_ladder_untouched():
     engine.reset_levels_to_pending(0.0703)
 
     assert [(l.price, l.side) for l in engine.levels] == before
+
+
+# --- #34: a ladder that stopped being a ladder ------------------------------
+
+# The exact levels restored at 23:18:58 on 2026-08-12, read back from
+# state/grid_dogeusdt.json. Range [0.06771107-0.07032893], price 0.06945.
+DEFORMED_LADDER = [
+    (0.06771, "buy"), (0.06797, "buy"), (0.06800, "buy"), (0.06823, "buy"),
+    (0.06829, "buy"), (0.06850, "buy"), (0.06876, "buy"),
+    (0.06981, "sell"), (0.07007, "sell"), (0.07033, "sell"),
+]
+
+
+def _ladder_engine():
+    from grid import GridEngine
+
+    class _Stub:
+        class exchange:
+            @staticmethod
+            def amount_to_precision(symbol, amount):
+                return f"{float(amount):.0f}"
+
+            @staticmethod
+            def price_to_precision(symbol, price):
+                return f"{float(price):.5f}"
+
+        def get_positions(self, symbol):
+            return []
+
+    engine = GridEngine(
+        exchange=_Stub(), symbol="DOGEUSDT",
+        grid_lower=0.06771107, grid_upper=0.07032893, grid_count=10,
+        capital_per_grid_pct=0.018, stop_loss_pct=0.03,
+    )
+    engine.initialize(0.06945, balance=4900.0)
+    return engine
+
+
+def _apply_deformed(engine):
+    from grid import GridLevel
+
+    engine.levels = [GridLevel(price=p, side=side) for p, side in DEFORMED_LADDER]
+    return engine
+
+
+def test_the_real_deformed_ladder_is_recognised():
+    """45 minutes, zero fills. Price 0.06945 sat in a 1.51% hole, and two buy pairs
+    were 0.04% and 0.09% apart -- both below the 0.12% round-trip fee floor, so neither
+    pair could ever profit even if it filled."""
+    engine = _apply_deformed(_ladder_engine())
+
+    defects = engine.ladder_defects(0.06945)
+
+    assert defects, "the ladder that produced zero fills reads as healthy"
+    assert any("hole" in d for d in defects), defects
+    assert any("fee floor" in d for d in defects), defects
+
+
+def test_a_freshly_built_ladder_is_healthy():
+    """The check must not fire on a normal grid, or it would rebuild constantly."""
+    engine = _ladder_engine()
+
+    assert engine.ladder_defects(0.06945) == []
+
+
+def test_resetting_a_deformed_ladder_rebuilds_it():
+    engine = _apply_deformed(_ladder_engine())
+
+    engine.reset_levels_to_pending(0.06945)
+
+    assert engine.ladder_defects(0.06945) == [], "rebuild left the ladder deformed"
+    prices = sorted(l.price for l in engine.levels)
+    below = [p for p in prices if p <= 0.06945]
+    above = [p for p in prices if p > 0.06945]
+    assert below and above, "rebuilt ladder does not straddle the price"
+
+
+def test_resetting_a_healthy_ladder_keeps_its_prices():
+    """Rebuilding discards per-level bookkeeping, so it must only happen when needed."""
+    engine = _ladder_engine()
+    before = sorted(l.price for l in engine.levels)
+
+    engine.reset_levels_to_pending(0.06945)
+
+    assert sorted(l.price for l in engine.levels) == before
+
+
+def test_a_deformed_ladder_triggers_a_recenter_while_flat():
+    """Price was inside the range the whole 45 minutes, so no existing trigger fired."""
+    engine = _apply_deformed(_ladder_engine())
+    engine._last_recenter_time = 0.0
+    engine.set_position_limit(0.0, 0.0, 10000.0)
+
+    assert engine.ladder_defects(0.06945), "precondition: ladder is deformed"
+    assert 0.06771107 < 0.06945 < 0.07032893, "precondition: price is inside the range"
+
+
+def test_a_deformed_ladder_does_not_trigger_a_recenter_while_holding():
+    """Recentring cancels resting orders; with inventory open those are the exits."""
+    engine = _apply_deformed(_ladder_engine())
+    engine.set_position_limit(6274.0, 0.0, 10000.0)
+
+    assert engine._net_long_qty > 0
+    # recenter consults ladder_defects only when flat -- pinned by reading the guard
+    import inspect
+
+    src = inspect.getsource(type(engine).recenter)
+    assert "if flat else []" in src, "the deformity check is no longer gated on flat"

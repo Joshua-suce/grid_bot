@@ -894,6 +894,65 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 34. The ladder stopped being a ladder -- HIGH
+
+45 minutes of the 2026-08-12 23:18 run, zero fills. The restored grid, read back from
+`state/grid_dogeusdt.json`, at a price of 0.06945:
+
+```
+0.06771  0.06797  0.06800  0.06823  0.06829  0.06850  0.06876   ...   0.06981  0.07007  0.07033
+            \____/            \____/                          1.51% hole
+            0.04%             0.09%                        (3.6x the spacing)
+```
+
+Seven buys crammed into the bottom of the range and three sells at the top, with
+nothing at all where the price actually was. Two of those buy pairs sit 0.04% and 0.09%
+apart -- below the 0.12% round-trip fee floor -- so neither pair could turn a profit
+even if both legs filled.
+
+**How much it cost, concretely.** Nominal spacing is 0.42%. On an even ladder the
+nearest sell would have been ~0.42% above price. It was 0.52% away, because the hole
+had pushed it out. DOGE travelled 0.446% during the run. That is a fill the bot should
+have had and didn't.
+
+The ladder deforms through ordinary operation: fills convert a level to the other side
+and move it, replacements land on new prices, recentring rebuilds around a different
+centre, and the duplicate merge plus `_refill_missing_grid_lines` re-add levels wherever
+there is space. Each step is individually reasonable. The composition is not a grid.
+
+Nothing looked for it. `recenter` has three triggers -- price outside the range, price
+outside the margin band, and a one-sided grid with no fillable side -- and all three ask
+*is a whole side missing*. This grid had seven buys and three sells and price sat
+comfortably inside the range for the entire 45 minutes, so none of them fired.
+
+`ladder_defects(price)` now names the two failure modes: adjacent levels closer than
+the fee floor, and a gap straddling the price wider than 2x the nominal spacing. It is
+consulted in two places:
+
+- `reset_levels_to_pending` -- the startup path when the exchange reports no position.
+  Restoring level *prices* is only worth doing while they still form a ladder; nothing
+  is at risk on this path, so a deformed one is rebuilt instead of resurrected. Running
+  it against the real state file above turns that ladder into an even one with the
+  nearest levels 0.50% and 0.26% from price.
+- `recenter` -- **only while flat**. Recentring cancels resting orders, and with
+  inventory open those orders are the exits; firing this with a position open is the
+  mistake that made recenter run 89 times in one session and stopped a position ever
+  unwinding.
+
+Per-level fill counts are discarded by a rebuild. They are statistics. A grid with a
+hole where the price sits does not trade.
+
+### Not a defect: the fill rate itself
+
+Worth separating, because it looks like the same problem. Spacing is 0.42% by design --
+`MIN_PROFIT_MULTIPLIER=3.0` requires every level to clear 3x the round-trip fee before
+it may be placed. DOGE moved 0.446% across those 45 minutes. A handful of fills per day
+is the arithmetic of that setting, not a fault, and the sweep in the activity section
+above shows what tightening it costs: gc=10 gives 6.5 fills/day at +6.52, gc=28 gives
+17 fills/day at -146.11. Activity and margin are the same dial.
+
+---
+
 ## Where the bot stands after #29-#33
 
 Full walk-forward at HEAD, driven from the live `.env` (`STRATEGY_MODE=router`,

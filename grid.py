@@ -1380,8 +1380,29 @@ class GridEngine:
             )
         )
 
-        if in_margin_band and not stranded_above and not stranded_below and not dead_inside:
+        # A two-sided grid can be just as dead as a one-sided one. The checks above all
+        # ask "is a whole side missing"; none of them notices a ladder that still has
+        # buys and sells but has deformed so badly that the levels near the price are
+        # gone. That is what a restored grid looked like on 2026-08-12 23:18 -- seven
+        # buys crammed into the bottom, three sells at the top, a 1.51% hole where the
+        # price actually was, and no recenter trigger for 45 minutes because price was
+        # comfortably inside the range the whole time (AUDIT #34).
+        #
+        # Only while flat. Recentring cancels resting orders, and with inventory open
+        # those orders are the exits -- the same mistake that made recenter fire 89
+        # times in one session and prevented a position from ever unwinding.
+        flat = self._net_long_qty <= 0 and self._net_short_qty <= 0
+        deformed = self.ladder_defects(current_price) if flat else []
+
+        if (in_margin_band and not stranded_above and not stranded_below
+                and not dead_inside and not deformed):
             return False
+
+        if deformed:
+            logger.warning(
+                "DEFORMED LADDER | {} — the grid is no longer evenly spaced around {}, "
+                "rebuilding it", "; ".join(deformed), round(current_price, 8),
+            )
 
         if stranded_above or stranded_below:
             logger.warning(
@@ -1651,6 +1672,57 @@ class GridEngine:
             "levels": [l.to_dict() for l in self.levels],
         }
 
+    def ladder_defects(self, current_price: float) -> list[str]:
+        """Ways the ladder has stopped being a ladder. Empty list means healthy.
+
+        A grid only works if its levels are evenly spaced around the price: price sits
+        between two adjacent levels, one spacing away from each. Fills, replacements,
+        recentres and the duplicate merge each move levels independently, and over a
+        session they can deform the ladder into something that is still ten levels but
+        no longer a grid.
+
+        Measured on the 2026-08-12 23:18 restart -- 45 minutes, zero fills, from a
+        restored ladder that looked like this at a price of 0.06945:
+
+            0.06771 0.06797 0.06800 0.06823 0.06829 0.06850 0.06876  ...  0.06981 ...
+                      ^ 0.04% apart      ^ 0.09% apart        ^--- 1.51% hole ---^
+
+        Seven buys crammed into the bottom with two pairs closer together than the fee
+        floor (so neither pair can ever profit), and a hole five times the nominal
+        spacing exactly where the price was. DOGE moved 0.446% during that run and the
+        nearest sell was 0.52% away; on an even ladder it would have been 0.42% away and
+        that move would have filled it. The deformation cost a real fill (AUDIT #34).
+        """
+        if len(self.levels) < 2 or self.grid_spacing <= 0 or current_price <= 0:
+            return []
+
+        prices = sorted(l.price for l in self.levels)
+        defects: list[str] = []
+
+        floor = 2 * self.maker_fee_pct * self._min_profit_multiplier
+        too_close = [
+            (a, b) for a, b in zip(prices, prices[1:])
+            if a > 0 and (b - a) / a < floor
+        ]
+        if too_close:
+            defects.append(
+                f"{len(too_close)} level pair(s) closer than the "
+                f"{floor * 100:.2f}% fee floor (tightest "
+                f"{min((b - a) / a for a, b in too_close) * 100:.2f}%)"
+            )
+
+        below = [p for p in prices if p <= current_price]
+        above = [p for p in prices if p > current_price]
+        if below and above:
+            gap = min(above) - max(below)
+            if gap > 2 * self.grid_spacing:
+                defects.append(
+                    f"a {gap / current_price * 100:.2f}% hole around the price "
+                    f"({gap / self.grid_spacing:.1f}x the {self.grid_spacing:.8f} spacing)"
+                )
+
+        return defects
+
     def reset_levels_to_pending(self, current_price: float | None = None) -> int:
         """Clear every level's order id and return it to a pending buy at its own price.
 
@@ -1689,6 +1761,23 @@ class GridEngine:
             )
             self._refill_missing_grid_lines(current_price)
         self.levels.sort(key=lambda l: l.price)
+
+        # Restoring level *prices* is only worth doing while they still form a ladder.
+        # Nothing is at risk here -- this path runs when the exchange reports no
+        # position -- so a deformed ladder is rebuilt rather than resurrected. Per-level
+        # fill counts are lost; they are statistics, and a grid with a hole where the
+        # price sits does not trade (AUDIT #34).
+        if current_price and current_price > 0:
+            defects = self.ladder_defects(current_price)
+            if defects:
+                logger.warning(
+                    "RESET LEVELS | restored ladder is deformed ({}) — rebuilding it "
+                    "around {} instead of trading a broken grid",
+                    "; ".join(defects), current_price,
+                )
+                self.initialize(current_price, balance=0.0)
+                return len(self.levels)
+
         return reset
 
     def _dedupe_levels(self) -> None:
