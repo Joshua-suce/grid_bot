@@ -298,7 +298,10 @@ class SimulatedExchange:
         )
         return {"id": oid, "side": side, "price": price, "amount": amount}
 
-    def close_position(self, symbol: str) -> bool:
+    def close_position(self, symbol: str, side: str = "long", amount: float = 0.0,
+                       max_attempts: int | None = None) -> bool:
+        """Signature mirrors the real Exchange -- the one-argument form here is what
+        hid AUDIT #38 from both the suite and the backtester."""
         """Market close at the current price, charged at the taker rate."""
         if self.position_qty == 0:
             return True

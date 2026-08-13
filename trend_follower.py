@@ -349,7 +349,22 @@ class TrendFollower:
             return None
         entry, qty, side = self._entry_price, self._qty, self._side
         try:
-            self.exchange.close_position(self.symbol)
+            # Exchange.close_position(symbol, side, amount) -- `side` is the POSITION
+            # side ("long"/"short"), which it converts to the closing order side.
+            #
+            # This used to pass the symbol alone, which is a TypeError against the real
+            # Exchange: side and amount have no defaults. The `except Exception` below
+            # swallowed it, so every exit this strategy has -- the trailing stop and the
+            # regime-change exit -- logged "close failed" and returned None, and the
+            # early return here happens BEFORE _side is cleared, so the follower stayed
+            # wedged believing it still held the position: place_initial_orders returns
+            # 0 while _side is set, so it never exited and never re-entered again.
+            #
+            # No test caught it because every fake exchange in the suite and in
+            # backtest.py declared close_position(self, symbol) -- only the real class
+            # has the three-argument form. test_exchange_contract.py now pins the fakes
+            # to the real signature (AUDIT #38).
+            self.exchange.close_position(self.symbol, side, abs(qty))
         except Exception as e:
             logger.error("TREND FOLLOWER | close failed: {}", e)
             return None

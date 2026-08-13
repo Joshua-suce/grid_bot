@@ -1338,7 +1338,7 @@ def test_recenter_unwinds_position_through_reduceonly_sells():
                 self.buy_params.append({"side": side, "price": price, "amount": amount, "params": params})
             return {"id": f"ORDER-{self._order_id}"}
 
-        def close_position(self, symbol, side=None):
+        def close_position(self, symbol, side, amount, max_attempts=None):
             self.closed = (symbol, side)
 
     ex = FakeExchange()

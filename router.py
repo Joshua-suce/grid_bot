@@ -251,6 +251,26 @@ class StrategyRouter:
         self._handoff_target = target
         self._handoff_started = time.time()
 
+    def _close_live_position(self) -> bool:
+        """Market-close whatever the exchange reports open. True if a close was sent.
+
+        The router tracks no position of its own, so side and size come from the
+        exchange -- which is the authority the flat check already trusts.
+        """
+        if self.exchange is None:
+            return False
+        for p in self.exchange.get_positions(self.symbol):
+            qty = float(p.get("contracts", 0) or 0)
+            if qty == 0:
+                continue
+            side = p.get("side", "")
+            if qty < 0:
+                side = "short" if side == "long" else "long"
+                qty = abs(qty)
+            self.exchange.close_position(self.symbol, side, abs(qty))
+            return True
+        return False
+
     def _flat_on_exchange(self) -> bool:
         """Re-read the exchange rather than trusting internal bookkeeping.
 
@@ -299,7 +319,17 @@ class StrategyRouter:
             self.forced_flattens += 1
             self.strategy.pause()
             try:
-                self.exchange.close_position(self.symbol)
+                # Same signature defect as trend_follower (AUDIT #38): this passed the
+                # symbol alone, so the forced flatten raised TypeError every time, was
+                # caught below, and the handoff deferred forever -- the grace period
+                # would expire and then never actually resolve. The router holds no
+                # position bookkeeping of its own, so read the side and size off the
+                # exchange, which is the source of truth here anyway.
+                closed = self._close_live_position()
+                if not closed:
+                    self.failed_handoffs += 1
+                    logger.error("ROUTER | nothing to flatten or close failed -- handoff deferred")
+                    return
                 logger.info("ROUTER | flattening before handoff to {}", target)
             except Exception as e:
                 self.failed_handoffs += 1

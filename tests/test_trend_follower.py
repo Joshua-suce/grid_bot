@@ -16,6 +16,7 @@ class FakeExchange:
         self.placed: list[dict] = []
         self.cancelled: list[str] = []
         self.closed = 0
+        self.close_args = []
         self._orders: dict[str, dict] = {}
         self._next = 0
         self._positions: list[dict] = []
@@ -53,8 +54,10 @@ class FakeExchange:
     def cancel_everything(self, symbol, timeout_seconds=300.0):
         return 0
 
-    def close_position(self, symbol):
+    def close_position(self, symbol, side, amount, max_attempts=None):
+        """Signature mirrors the real Exchange exactly -- see AUDIT #38."""
         self.closed += 1
+        self.close_args.append((symbol, side, amount))
         self._positions = []
         return True
 

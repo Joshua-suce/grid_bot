@@ -894,6 +894,68 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 38. The trend follower could never close a position -- CRITICAL
+
+`Exchange.close_position` takes three required arguments:
+
+```python
+def close_position(self, symbol: str, side: str, amount: float, max_attempts=None) -> dict:
+```
+
+Two call sites passed one:
+
+```
+trend_follower.py:352   self.exchange.close_position(self.symbol)
+router.py:302           self.exchange.close_position(self.symbol)
+```
+
+Both sit inside `except Exception`, so the `TypeError: missing 2 required positional
+arguments` was caught, logged as a generic "close failed", and discarded.
+
+Every exit the trend follower has runs through `_close_position`: the trailing stop, and
+the regime-change exit. **Neither could ever fire.** And the early return happens before
+`_side` is cleared, so the strategy stayed wedged believing it still held the position --
+`place_initial_orders` returns 0 while `_side` is set, so it never exited and never
+re-entered. One position, then permanently dead.
+
+Reproduced against a stub carrying the real signature:
+
+```
+before      : side=long qty=7000  stop=0.06720
+price -> 0.0600   (14% below entry, far past the stop)
+close calls : []
+fills       : []
+side after  : long        qty after: 7000
+regime -> downtrend, place_initial_orders() -> 0, side still long
+```
+
+The router's forced flatten was broken identically, so an expired grace period could
+never resolve: it paused the outgoing strategy, failed to close, and deferred forever.
+
+### Why 410 passing tests missed it
+
+Every fake exchange in the suite -- and in `backtest.py` -- declared
+`close_position(self, symbol)`. The doubles were **more permissive than the real class**,
+so the tests proved the code worked against a signature production does not have. Same
+shape as #31, where main.py called a method the router could not forward.
+
+`tests/test_exchange_contract.py` now closes that hole structurally:
+
+- every fake that defines `close_position` must accept what the real one requires;
+- every `self.exchange.<method>(...)` call in grid.py, trend_follower.py and router.py is
+  bound against the real `Exchange` signature, so an unbindable call fails the suite
+  instead of hiding inside an `except Exception` in production.
+
+Verified by binding the pre-fix call against the real class: `missing a required
+argument: 'side'`. Both exits now work -- the trailing stop closes 7000 @ 0.0600 and
+books -70.00, and the regime-change exit closes and clears the side.
+
+Found by a six-lens agent sweep; four lenses reported it independently. It is the only
+finding of that sweep that completed adversarial verification -- the rest lost their
+verifiers to a session limit and remain unverified, neither confirmed nor refuted.
+
+---
+
 ## 36. The refill deformed the ladder it was repairing -- HIGH
 
 AUDIT #34 detected and rebuilt deformed ladders. This is what was deforming them.

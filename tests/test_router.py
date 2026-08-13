@@ -69,6 +69,7 @@ class FakeExchange:
     def __init__(self, position=0.0):
         self.position = position
         self.closes = 0
+        self.close_args = []
         self.close_fails = False
 
     def get_positions(self, symbol):
@@ -77,10 +78,15 @@ class FakeExchange:
         return [{"side": "long" if self.position > 0 else "short",
                  "contracts": abs(self.position), "entryPrice": 0.072}]
 
-    def close_position(self, symbol):
+    def get_price(self, symbol):
+        return 0.072
+
+    def close_position(self, symbol, side, amount, max_attempts=None):
+        """Signature mirrors the real Exchange exactly -- see AUDIT #38."""
         if self.close_fails:
             raise RuntimeError("exchange unreachable")
         self.closes += 1
+        self.close_args.append((symbol, side, amount))
         self.position = 0.0
         return True
 
