@@ -894,6 +894,59 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 41. reconcile_positions had its own order path, outside every guard -- HIGH
+
+Found by replaying the real `state/grid_dogeusdt.json` through the restore sequence
+after switching to `STRATEGY_MODE=grid`. The account holds a **short of 9,916 DOGE at
+0.07024719**, and #37 had just made the restore-with-position branch reachable for the
+first time -- so this would have run on the next start.
+
+Three defects, all in the same function:
+
+**It covered the short at a loss.** The hedge price is one grid spacing in the
+favourable direction *from the nearest level*, which is not the same as profitable. The
+nearest sell level was 0.07059, so the cover landed at 0.07030 -- above the entry, and
+covering a short above its entry is a loss. On 9,916 DOGE, **-0.52**. The AUDIT #32
+break-even guard lives in `_place_order_for_level` and `_unwind_position_through_grid`;
+this path reaches `place_limit_order` directly and never consulted it. The hedge is now
+clamped to break-even on both sides.
+
+**The cover was not reduceOnly.** `params = {...} if hedge_side == "sell" else None` --
+set only when hedging a long. Covering a *short* went out as a plain buy, so if the
+position had closed between reading it and placing the order, that opens a fresh 9,916
+long instead of closing anything. Now reduceOnly on both sides.
+
+**It placed reduce-only SELLs against a short.** The trailing orphan-sell loop fires for
+any sell level carrying a quantity, regardless of what is actually open. A reduceOnly
+sell can only reduce a *long*; with a short open all three were guaranteed -2022
+rejections -- the same failure AUDIT #11 fixed elsewhere. Now gated on a long existing.
+
+### And a rounding bug underneath it
+
+The first fix did not work. Break-even for the cover is 0.07021909, which **rounds to
+0.07022** at five decimals -- above break-even. The "safe" price was still a loss, by
+0.0000009 per unit. Trivial per unit; on 9,916 DOGE it is the difference between a
+winning exit and a losing one, and no amount of guard logic helps if the last step
+rounds across the line.
+
+`_round_price_toward(value, direction)` rounds to exchange precision without crossing
+`value`, backing off by a doubling step until the rounded result lands on the safe side
+(the tick size is not exposed, and a fixed epsilon is either too small to move a coarse
+tick or needlessly wide on a fine one).
+
+Verified against the real state, before and after:
+
+```
+short 9916 @ 0.07024719 | break-even cover = 0.07021909
+before:  BUY 9916 @ 0.07030  reduceOnly=False   -> -0.52, and can open a long
+after :  BUY 9916 @ 0.07021  reduceOnly=True    -> +0.09 vs break-even
+plus 3 reduce-only sells against a short, all -2022, now not placed
+```
+
+Reverting all three fixes fails exactly the three new tests. 428 tests pass.
+
+---
+
 ## 40. The flat override contradicted the log without explaining itself
 
 From the 2026-08-13 01:49 run:

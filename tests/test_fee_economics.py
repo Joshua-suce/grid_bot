@@ -396,3 +396,94 @@ def test_the_stop_loss_path_is_untouched_by_the_guard():
         assert "_would_realise_a_loss" not in src and "_position_break_even" not in src, (
             f"{name} consults the break-even guard -- protection must not depend on it"
         )
+
+
+# --- #41: reconcile_positions bypassed the break-even rule -----------------
+
+class _ShortExchange(_PositionExchange):
+    """The 2026-08-13 account: short 9916 DOGE @ 0.07024719."""
+
+    def get_positions(self, symbol):
+        if self.qty == 0:
+            return []
+        return [{"side": "short", "contracts": self.qty, "entryPrice": self.entry}]
+
+    def place_limit_order(self, symbol, side, price, amount, max_attempts=3,
+                          params=None, post_only=True, allow_taker_fallback=False):
+        self._next += 1
+        order = {"id": f"o{self._next}", "side": side, "price": price, "amount": amount,
+                 "reduceOnly": (params or {}).get("reduceOnly", False)}
+        self.placed.append(order)
+        return order
+
+
+def _short_engine():
+    ex = _ShortExchange(qty=9916.0, entry=0.07024719)
+    from grid import GridEngine
+
+    engine = GridEngine(
+        exchange=ex, symbol="DOGEUSDT",
+        grid_lower=0.06902107, grid_upper=0.07163893, grid_count=10,
+        capital_per_grid_pct=0.018, stop_loss_pct=0.03,
+    )
+    engine.initialize(0.07060, balance=4783.0)
+    return engine, ex
+
+
+def test_covering_a_short_never_buys_above_break_even():
+    """AUDIT #41. reconcile_positions picked the level nearest the entry and stepped one
+    spacing toward profit -- but from the LEVEL, not from the entry. With the real saved
+    state (short @ 0.07024719, nearest sell level 0.07059) that produced a cover at
+    0.07030, above break-even, booking -0.52 on 9,916 DOGE. The #32 guard lives in
+    _place_order_for_level and the unwind; this path reached the exchange directly.
+    """
+    engine, ex = _short_engine()
+
+    engine.reconcile_positions()
+
+    covers = [o for o in ex.placed if o["side"] == "buy" and o["amount"] >= 5000]
+    assert covers, "no cover order placed for the open short"
+    break_even = ex.entry * (1 - 2 * engine.maker_fee_pct)
+    for o in covers:
+        assert o["price"] <= break_even, (
+            f"cover at {o['price']:.8f} is above break-even {break_even:.8f} -- a loss"
+        )
+
+
+def test_the_cover_is_reduce_only_on_the_short_side_too():
+    """reduceOnly was set only when hedging a long. Covering a short went out as a plain
+    buy, so if the position had already closed it would open a fresh long instead."""
+    engine, ex = _short_engine()
+
+    engine.reconcile_positions()
+
+    covers = [o for o in ex.placed if o["side"] == "buy" and o["amount"] >= 5000]
+    assert covers and all(o["reduceOnly"] for o in covers), (
+        "cover order is not reduceOnly -- it can open a position rather than close one"
+    )
+
+
+def test_no_reduce_only_sells_are_placed_while_short():
+    """A reduceOnly SELL can only reduce a LONG; with a short open every one is a
+    guaranteed -2022 rejection."""
+    engine, ex = _short_engine()
+    for level in engine.levels:
+        if level.side == "sell":
+            level.quantity = 300.0
+
+    engine.reconcile_positions()
+
+    bad = [o for o in ex.placed if o["side"] == "sell" and o["reduceOnly"]]
+    assert bad == [], f"placed reduce-only sells against a short: {bad}"
+
+
+def test_rounding_never_crosses_the_break_even_boundary():
+    """0.07021909 rounds to 0.07022 at five decimals -- above break-even, so the 'safe'
+    price was a loss by 0.0000009. Small per unit; on 9,916 DOGE it flips the sign."""
+    engine, _ = _short_engine()
+
+    for value in (0.07021909, 0.0702, 0.070215, 0.07019999):
+        down = engine._round_price_toward(value, -1)
+        up = engine._round_price_toward(value, +1)
+        assert down <= value, f"{down} > {value}"
+        assert up >= value, f"{up} < {value}"

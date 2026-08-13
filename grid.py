@@ -189,6 +189,32 @@ class GridEngine:
         self._open_orders_map: dict[tuple[float, str], dict] = {}
         self._warned_small_fixed_allocation = False
 
+    def _round_price_toward(self, value: float, direction: int) -> float:
+        """Round to exchange precision WITHOUT crossing `value`.
+
+        `direction` -1 means the result must not end up above `value`; +1 means it must
+        not end up below. Ordinary round-to-nearest crosses profitability boundaries: a
+        short's break-even of 0.07021909 rounds to 0.07022 at five decimals, which is
+        above it, so covering there is a loss by 0.0000009 -- small per unit, and on
+        9,916 DOGE it is the difference between a winning exit and a losing one
+        (AUDIT #41).
+        """
+        price = self._round_price(value)
+        if (direction < 0 and price <= value) or (direction > 0 and price >= value):
+            return price
+
+        # Rounding crossed the boundary. Back off by a step that DOUBLES until the
+        # rounded result lands on the safe side -- the exchange's tick size is not
+        # exposed, and a fixed epsilon is either too small to move a coarse tick or
+        # needlessly wide on a fine one.
+        step = max(abs(value) * 1e-9, 1e-12)
+        for _ in range(60):
+            candidate = self._round_price(value - step if direction < 0 else value + step)
+            if (direction < 0 and candidate <= value) or (direction > 0 and candidate >= value):
+                return candidate
+            step *= 2
+        return price
+
     def _round_price(self, price: float) -> float:
         """Round price to exchange tick size."""
         return float(self.exchange.exchange.price_to_precision(self.symbol, price))
@@ -809,10 +835,20 @@ class GridEngine:
                 logger.warning("RECONCILE | no {} level found for {} position @ {}", target_side, side, round(entry, 8))
                 continue
 
+            # One spacing in the favourable direction FROM THE NEAREST LEVEL -- which is
+            # not the same as "profitable". The nearest level can sit the wrong side of
+            # the entry, and then one step still lands at a loss. Replaying the real
+            # 2026-08-13 state: a short entered at 0.07024719, nearest sell level
+            # 0.07059, hedge 0.07030 -- above break-even, so covering there books -0.52.
+            # Clamp to break-even, the same rule the ordinary ladder follows since
+            # AUDIT #32, and bounds-check the clamped price rather than the raw one.
+            fees = 2 * self.maker_fee_pct
             if side == "long":
                 hedge_price = self._round_price(best_level.price + self.grid_spacing)
+                hedge_price = max(hedge_price, self._round_price_toward(entry * (1 + fees), +1))
             else:
                 hedge_price = self._round_price(best_level.price - self.grid_spacing)
+                hedge_price = min(hedge_price, self._round_price_toward(entry * (1 - fees), -1))
 
             if hedge_price < self.grid_lower or hedge_price > self.grid_upper:
                 logger.warning(
@@ -859,7 +895,11 @@ class GridEngine:
                             continue
                     except Exception as e:
                         logger.warning("RECONCILE | market close failed, falling back to limit: {}", e)
-                params = {"reduceOnly": True, "postOnly": False} if hedge_side == "sell" else None
+                # reduceOnly on BOTH sides. This used to set it only when hedging a
+                # long, so covering a SHORT went out as a plain buy: if the position had
+                # already closed between the read and the order, that opens a fresh
+                # long of the same size instead of closing anything (AUDIT #41).
+                params = {"reduceOnly": True, "postOnly": False}
                 order = self.exchange.place_limit_order(self.symbol, hedge_side, hedge_price, float(qty), params=params)
                 if "id" not in order:
                     raise ValueError("Order response missing 'id'")
@@ -876,10 +916,34 @@ class GridEngine:
 
         self.levels.sort(key=lambda l: l.price)
 
+        # A reduceOnly SELL can only reduce a LONG. Placing one while the account is
+        # flat or short is rejected outright (-2022) -- the exact failure AUDIT #11
+        # fixed elsewhere. With the 2026-08-13 short open this loop fired three
+        # guaranteed rejections on every reconcile (AUDIT #41).
+        long_open = 0.0
+        try:
+            for pos in self.exchange.get_positions(self.symbol):
+                qty_p = float(pos.get("contracts", 0) or 0)
+                side_p = pos.get("side", "")
+                if qty_p < 0:
+                    side_p = "short" if side_p == "long" else "long"
+                    qty_p = abs(qty_p)
+                if side_p == "long":
+                    long_open += qty_p
+        except Exception as e:
+            logger.debug("RECONCILE | could not read positions for orphan sells ({})", e)
+            long_open = 0.0
+
         for level in self.levels:
             if level.side != "sell" or level.order_id is not None:
                 continue
             if level.quantity <= 0 or level.price <= 0:
+                continue
+            if long_open <= 0:
+                logger.debug(
+                    "RECONCILE | skipping reduce-only sell @ {} — no long open to reduce",
+                    level.price,
+                )
                 continue
             qty = self.exchange.exchange.amount_to_precision(self.symbol, level.quantity)
             if float(qty) <= 0:
