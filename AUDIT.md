@@ -894,6 +894,82 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 46. The grid is too narrow for the asset, and RECENTER_MARGIN_PCT is a dead knob
+
+Following #45. The question was where 87% of the per-cycle capture goes. It is not fees.
+
+### The mechanism, measured
+
+`recenter()` has four triggers: price outside the margin band, `stranded` (one side
+consumed and price outside the grid), `dead_inside`, and `deformed`. Counting which one
+actually fires, over 1,570 recenters across four test cells:
+
+```
+                          recenters/90d   stranded  deformed  dead-inside  outside-band
+current 10 / 2.5 earlier         112        74.5%     16.9%       8.7%          0%
+wider    6 / 4.0 earlier          60        60.9%     33.0%       6.1%          0%
+current 10 / 2.5 recent           57        67.9%     25.1%       7.0%          0%
+wider    6 / 4.0 recent           29        42.4%     50.6%       7.0%          0%
+```
+
+**"price outside margin band" never fires -- not once.** `RECENTER_MARGIN_PCT` is wired
+correctly (backtest.py:750, main.py:952) and is nonetheless inert: setting it to 2%, 5%
+or 10% produced byte-identical PnL, cycle counts and recenter counts. One of the other
+three conditions always fires first. It is a knob that looks meaningful and is not.
+
+The dominant trigger is `stranded`: price runs out of the grid, consumes every level on
+that side, and the ladder must be rebuilt. That is the chain:
+
+  grid too narrow -> price blows through one side -> forced rebuild -> half-finished
+  cycles stranded -> realised capture collapses to 13% of geometry
+
+Widening halves the rebuild rate (112->60, 57->29) and triples per-cycle capture
+(0.046->0.151, 0.117->0.419). Those two moving together is what makes it a mechanism
+rather than a coincidence.
+
+### The parameter surface
+
+16 configurations, grid_count {6,8,10,12} x range_atr_multiplier {2.5,3.0,3.5,4.0},
+two non-overlapping 90-day windows, 12 overlapping starts each. Totals summed over both
+windows, then averaged along each axis:
+
+```
+range_atr_multiplier          grid_count
+  2.5   mean 16.52  <- current    6   mean 40.88
+  3.0   mean 48.88              8   mean 36.69
+  3.5   mean 47.78             10   mean 51.76  <- current
+  4.0   mean 39.92             12   mean 23.78
+```
+
+**The grid COUNT is already right at 10. The RANGE is too tight at 2.5**, which is the
+worst of the four values by a factor of three, averaged across every count. The best
+single cell (10 / 3.5 = 68.25) sits at the intersection of the best row and the best
+column -- what a real effect looks like, rather than a spike.
+
+### The honest caveat
+
+**No individual paired comparison reaches significance.** Every |t| is below 2.1 and most
+are below 1.0. The ranking is unstable cell to cell: 10/4.0 is the best config in the
+earlier window (+30.00 paired) and among the worst in the recent one (-15.31); 8/4.0
+flips sign entirely (+27.56 / -28.56). What carries weight here is the marginal
+structure plus the independently measured mechanism, not any single number.
+
+And the size of the prize is small:
+
+```
+current 10 / 2.5   +40.48 over 180 days   = +0.81% of 5000
+best    10 / 3.5   +68.25 over 180 days   = +1.36% of 5000
+```
+
+Roughly doubling a very small number. This is a real improvement to a strategy that is
+still noise-dominated -- the per-window standard error (12-26) remains comparable to the
+means. It does not make the bot profitable in any meaningful sense; it makes it less
+badly configured.
+
+No config was changed. `RANGE_ATR_MULTIPLIER` is the user's call.
+
+---
+
 ## 45. Why the bot is not profitable -- measurement, not a fix
 
 #42 and #44 were both real defects and both are fixed. Neither makes the bot money, and
