@@ -894,6 +894,79 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 42. The break-even guard went dormant instead of re-quoting -- HIGH
+
+The 2026-08-13 09:11 run traded **seven times in seven hours**, six of them inside a
+single 90-second burst at 10:45. Between 10:46 and 15:29 -- four hours and forty-three
+minutes -- there was not one fill, and the log carried this line every fifteen seconds:
+
+```
+SKIP BUY @ 0.07034 | below break-even 0.07021909 on the open short - would book a
+loss to close inventory the grid is meant to wait out (AUDIT #32)
+```
+
+Roughly 1,300 identical lines. The guard was mine, from #32, and its economics are
+right: a short entered at 0.07024719 cannot be covered at 0.07034 without booking a
+loss. What was wrong is what it did about it -- `return False`, and nothing else.
+Nothing re-sited the level, nothing replaced it, so the ladder kept a permanent hole
+exactly where trading happens: next to the price.
+
+That hole was the entire strategy. After the 10:46 cascade the nearest sell was 0.07086,
+1.2% above a market sitting at 0.0702, and the only level anywhere nearer was the
+blocked one. The grid had nothing quoting within reach of the price for the rest of the
+session. It was not waiting out a bad position -- it was not trading at all.
+
+**Waiting out inventory does not require refusing to quote. It requires quoting at a
+price that does not lose.** A blocked level now moves to break-even instead of dying:
+
+```
+MOVED BUY 0.07034 -> 0.0702 | the open short makes the original price a loss;
+quoting at break-even instead of leaving the level dead (AUDIT #42)
+```
+
+Three constraints on the move, because #42 must not undo the fixes around it:
+
+- **Never into a loss (#32).** The target is break-even, rounded *away* from the loss
+  with `_round_price_toward` -- rounding to nearest crosses the line, which is #41.
+- **Never across the book.** A buy above the market is post-only rejected and retried
+  forever at debug level: the same dormancy, silent. The target is the stricter of "does
+  not lose" and "is a valid maker price", so it actually rests.
+- **Never onto a neighbour (#34).** If break-even sits inside the fee floor of another
+  level, the level stays put rather than deforming the ladder.
+
+When no legal price exists the level does stay idle -- but it says so **once**, not
+1,300 times. A log that repeats itself every poll buries the fills between the repeats.
+
+Reverting the change fails five of the six new tests in `tests/test_dormancy.py`.
+
+### What this run does NOT show
+
+The session was not a loss. `net_realized_pnl` went -3.2680 -> -1.1988: **+2.07 for the
+day**, on 7 fills. The problem was never that the trades lost -- of the six completed
+cycles, every one was positive. The problem is that six trades in seven hours is not a
+grid, and the reason was one dead level.
+
+### Still open: the internal PnL is roughly 6x reality
+
+Worth recording because it is not fixed here. The status line reports both numbers and
+they disagree badly:
+
+```
+gross=13.29 fees=0.87 net=12.42 | verified_net=-2.25 verified_daily=1.02
+```
+
+`risk:record_trade` accumulated `daily_total=11.04` while the exchange-verified figure
+for the same moment was `1.02`. The grid credits each level's cycle against its own
+paired entry, but Binance nets everything into one position at one blended entry, so
+several levels claim profit against the same inventory -- fills #24, #25 and #26 booked
++2.37, +1.29 and +3.89 within one second while the account realised a fraction of it.
+
+The `verified_*` figures are exchange truth and are correct. The concern is that
+`risk.record_trade` is fed the inflated number, so the daily-loss kill switch is
+measuring something that is not the account.
+
+---
+
 ## 41. reconcile_positions had its own order path, outside every guard -- HIGH
 
 Found by replaying the real `state/grid_dogeusdt.json` through the restore sequence

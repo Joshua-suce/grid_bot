@@ -147,6 +147,7 @@ class GridEngine:
         self._peak_price = 0.0
         self._break_even_cache: tuple[str, float] | None = None
         self._break_even_time = 0.0
+        self._be_block_logged: set[tuple[str, float]] = set()
         self._trough_price = 0.0
         self._trailing_sl_price_short: float | None = None
         # Ratcheted static stop levels. See get_hard_stop_loss_price -- recenter moves
@@ -598,6 +599,61 @@ class GridEngine:
             return price > break_even
         return False
 
+    def _nearest_legal_exit(self, level: "GridLevel") -> float | None:
+        """The closest price this level can sit at without booking a loss, or None.
+
+        AUDIT #42. The #32 guard was right about the economics and catastrophic about
+        the consequence: it returned False and left the level DEAD. Nothing re-sited it,
+        nothing replaced it, so the ladder kept a permanent hole exactly where trading
+        happens -- next to the price.
+
+        On 2026-08-13 that hole was the whole strategy. A short at 0.07024719 left the
+        buy level at 0.07034 permanently blocked; it was the only level within 1.2% of
+        the price, so from 10:46 to 15:29 -- four hours and forty-three minutes -- the
+        bot logged the same skip every fifteen seconds and did not trade once. Seven
+        fills in seven hours, six of them inside one 90-second burst.
+
+        Waiting out inventory does not require refusing to quote. It requires quoting at
+        a price that does not lose: break-even. So the level moves there instead of
+        dying, provided the move stays inside the grid and does not crowd a neighbour
+        past the fee floor.
+        """
+        be = self._position_break_even()
+        if be is None:
+            return None
+        pos_side, break_even = be
+
+        # Break-even alone is not enough: the level also has to REST. A buy above the
+        # market crosses, post-only rejects it, and _place_order_for_level retries it
+        # forever at debug level -- the same silent dormancy in a different disguise.
+        # So take the stricter of "does not lose" and "is a valid maker price".
+        try:
+            price_now = float(self.exchange.get_price(self.symbol))
+        except Exception:
+            price_now = None
+
+        # Round AWAY from the loss: a short's cover must land at or below break-even,
+        # a long's exit at or above it. Rounding to nearest crosses the line (#41).
+        if pos_side == "short" and level.side == "buy":
+            limit = break_even if price_now is None else min(break_even, price_now)
+            target = self._round_price_toward(limit, -1)
+        elif pos_side == "long" and level.side == "sell":
+            limit = break_even if price_now is None else max(break_even, price_now)
+            target = self._round_price_toward(limit, +1)
+        else:
+            return None
+
+        if target <= 0 or not (self.grid_lower <= target <= self.grid_upper):
+            return None
+
+        floor = target * 2 * self.maker_fee_pct * self._min_profit_multiplier
+        for other in self.levels:
+            if other is level:
+                continue
+            if abs(other.price - target) < floor:
+                return None                     # would deform the ladder (#34)
+        return target
+
     def _existing_open_order(self, price: float, side: str) -> dict | None:
         """Return an open exchange order already resting at the same price+side, if any.
 
@@ -632,13 +688,30 @@ class GridEngine:
             return False
         if self._would_realise_a_loss(level.side, level.price):
             be = self._position_break_even()
-            logger.info(
-                "SKIP {} @ {} | below break-even {} on the open {} — would book a loss "
-                "to close inventory the grid is meant to wait out (AUDIT #32)",
-                level.side.upper(), level.price,
-                round(be[1], 8) if be else None, be[0] if be else None,
-            )
-            return False
+            moved = self._nearest_legal_exit(level)
+            if moved is not None and moved != level.price:
+                logger.info(
+                    "MOVED {} {} -> {} | the open {} makes the original price a loss; "
+                    "quoting at break-even instead of leaving the level dead (AUDIT #42)",
+                    level.side.upper(), level.price, moved, be[0] if be else None,
+                )
+                self._be_block_logged.discard((level.side, level.price))
+                level.price = moved
+            else:
+                # Genuinely nowhere legal to sit. Say so ONCE -- this used to repeat
+                # every poll: ~1,300 identical lines in one session (AUDIT #42).
+                key = (level.side, level.price)
+                if key not in self._be_block_logged:
+                    self._be_block_logged.add(key)
+                    logger.info(
+                        "SKIP {} @ {} | below break-even {} on the open {} and nowhere "
+                        "legal to move it — level idle until the position resolves "
+                        "(AUDIT #32/#42)",
+                        level.side.upper(), level.price,
+                        round(be[1], 8) if be else None, be[0] if be else None,
+                    )
+                return False
+        self._be_block_logged.discard((level.side, level.price))
         if not self._is_level_profitable(level.price):
             logger.info(
                 "SKIP ORDER @ {} | spacing={:.8f} < min_profit={:.8f} ({}x fees)",
