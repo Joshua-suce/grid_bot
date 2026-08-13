@@ -894,6 +894,59 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 48. The parameter search does not generalise -- and the trend filter does
+
+32 configurations (grid_count 4/6/8/10 x range_atr 3.0/4.0/5.0/6.0 x trend filter
+on/off), selected on the EARLIER 90 days, validated on the RECENT 90 days which the
+search never saw. Every previous sweep in this file picked its winner after looking at
+both windows; this one did not, and the difference is the whole point.
+
+### The winner failed out of sample, decisively
+
+```
+SELECTED on earlier window: 8 levels / atr 6.0 / filter on  ->  +41.66
+
+VALIDATION -- RECENT 90d, never used for selection
+  old default        10 / 2.5 / on      +35.49   sem 11.68   455 cycles
+  currently deployed 10 / 3.5 / on      +46.12   sem 17.29   283 cycles
+  SELECTED            8 / 6.0 / on      -13.59   sem  4.14    57 cycles
+
+selected vs deployed, paired on the holdout: -59.71 (sem 16.11, t=3.7)
+```
+
+**t=3.7 is the largest statistic anywhere in this audit, and it points against the
+optimised configuration.** +41.66 in-sample became -13.59 out-of-sample. Had the winner
+been shipped -- which is exactly what the earlier sweeps in #44 and #46 invited -- the
+account would have been materially worse off.
+
+The practical conclusion is not "8/6.0 is a bad cell". It is that **this parameter
+surface is noise**: optimising against it produces configurations that do not survive
+contact with an unseen period. Further tuning is not a route to profitability, and the
+strength of this result is the best evidence in the file for stopping.
+
+The currently deployed 10 / 3.5 was positive in both windows (+22.13 earlier, +46.12
+recent) and is left alone.
+
+### The trend filter, by contrast, is completely robust
+
+```
+                     mean      min       max
+  filter on       +21.77    +5.33    +41.66
+  filter off       -9.84   -50.25    +25.30
+```
+
+**Filter on beats filter off in 16 of 16 geometries**, mean difference +31.6, and it is
+the only variable tested all session that behaves consistently across the whole surface.
+It is already enabled (`STRATEGY_MODE=grid` runs the grid behind the filter), so this
+changes nothing -- but it settles a question never previously isolated, and it says the
+single most valuable component of the system is the one that decides *not* to trade.
+
+Per-cycle capture does keep rising with width (0.085 at atr 3.0 to 0.277 at atr 6.0),
+confirming the #46 mechanism. It simply stops converting into PnL past ~3.5, because the
+cycles become too few to matter.
+
+---
+
 ## 47. The single worst day, and the guard that was meant to prevent it -- CRITICAL
 
 Pulling Binance's income ledger directly (not the reconciler, which had been
