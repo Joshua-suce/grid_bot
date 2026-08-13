@@ -35,7 +35,7 @@ class FakeStrategy:
     def pause(self):
         self.active = False
         self.paused += 1
-    def emergency_stop(self): self.active = False
+    def emergency_stop(self, reason="emergency"): self.active = False
     def place_initial_orders(self, balance):
         self.orders_placed += 1
         return 1

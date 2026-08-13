@@ -1240,7 +1240,7 @@ def run_bot() -> None:
     finally:
         try:
             if grid is not None:
-                grid.emergency_stop()
+                grid.emergency_stop(reason="shutdown")
                 _reset_sl()
                 if settings.close_on_exit:
                     closed = exchange.close_all_positions(settings.symbol)

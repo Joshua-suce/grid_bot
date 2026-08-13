@@ -296,3 +296,43 @@ def test_a_deformed_ladder_does_not_trigger_a_recenter_while_holding():
 
     src = inspect.getsource(type(engine).recenter)
     assert "if flat else []" in src, "the deformity check is no longer gated on flat"
+
+
+# --- #35: a clean shutdown must not read as a crash ------------------------
+
+def test_shutdown_and_kill_switch_cancel_identically():
+    """`reason` is presentational only. If it ever changed WHAT gets cancelled, a
+    quiet-looking shutdown would leave orders resting on the exchange."""
+    import inspect
+
+    import grid as grid_module
+    import trend_follower as tf_module
+
+    for fn in (grid_module.GridEngine.emergency_stop, tf_module.TrendFollower.emergency_stop):
+        src = inspect.getsource(fn)
+        body = src.split('"""')[-1] if '"""' in src else src
+        # the only thing `reason` may gate is a logger call
+        for line in body.splitlines():
+            if "reason" in line and "def " not in line:
+                assert "logger" in line or line.strip().startswith(("if", "else", "#")), (
+                    f"`reason` gates something other than logging in "
+                    f"{fn.__qualname__}: {line.strip()}"
+                )
+
+
+def test_main_stops_with_the_shutdown_reason():
+    """AUDIT #35. main.py's `finally:` block runs emergency_stop on every clean Ctrl+C.
+    It logged at ERROR either way, so a normal exit ended in two red EMERGENCY STOP
+    lines and read as a crash -- which is what made real faults hard to spot in a log."""
+    import pathlib
+    import re
+
+    source = (pathlib.Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
+    calls = re.findall(r"grid\.emergency_stop\(([^)]*)\)", source)
+    assert calls, "main.py no longer calls emergency_stop"
+    assert any('reason="shutdown"' in c for c in calls), (
+        "the shutdown path must say so, or a clean exit logs as an emergency"
+    )
+    assert any(c.strip() == "" for c in calls), (
+        "the kill-switch path must keep the default reason and stay an ERROR"
+    )

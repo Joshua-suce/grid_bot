@@ -155,14 +155,18 @@ class TrendFollower:
         self.active = False
         logger.info("TREND FOLLOWER PAUSED | position={} qty={}", self._side, self._qty)
 
-    def emergency_stop(self) -> None:
+    def emergency_stop(self, reason: str = "emergency") -> None:
+        """`reason` only picks the log level -- see GridEngine.emergency_stop."""
         self._cancel_entry("emergency_stop")
         try:
             self.exchange.cancel_everything(self.symbol, timeout_seconds=30)
         except Exception as e:
             logger.error("TREND FOLLOWER | cancel_everything failed: {}", e)
         self.active = False
-        logger.error("TREND FOLLOWER EMERGENCY STOP")
+        if reason == "shutdown":
+            logger.info("TREND FOLLOWER STOPPED | shutdown")
+        else:
+            logger.error("TREND FOLLOWER EMERGENCY STOP ({})", reason)
 
     def get_spread_pct(self) -> float:
         """No orderbook depth is read by this strategy, so there is nothing to report.

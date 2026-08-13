@@ -1319,8 +1319,18 @@ class GridEngine:
         else:
             logger.warning("GRID NOT ACTIVATED | no orders could be placed or restored")
 
-    def emergency_stop(self) -> None:
-        logger.error("EMERGENCY STOP | cancelling all orders")
+    def emergency_stop(self, reason: str = "emergency") -> None:
+        """Cancel everything. `reason` only picks the log level.
+
+        This runs on the kill switch AND from main.py's `finally:` block on a normal
+        Ctrl+C, and it logged ERROR either way -- so every clean shutdown ended in two
+        red EMERGENCY STOP lines and looked like a crash. Real faults have to stand out
+        from routine ones or the log stops being readable (AUDIT #35).
+        """
+        if reason == "shutdown":
+            logger.info("SHUTDOWN | cancelling all orders")
+        else:
+            logger.error("EMERGENCY STOP | cancelling all orders ({})", reason)
         cancelled = self.exchange.cancel_everything(self.symbol)
         for level in self.levels:
             if level.order_id is not None:

@@ -67,8 +67,12 @@ class Strategy(Protocol):
         """
         ...
 
-    def emergency_stop(self) -> None:
-        """Cancel everything immediately. Called on shutdown and kill-switch trips."""
+    def emergency_stop(self, reason: str = "emergency") -> None:
+        """Cancel everything immediately. Called on shutdown and kill-switch trips.
+
+        `reason` is presentational only -- it selects the log level so a clean shutdown
+        does not read as a crash. It must never change what gets cancelled.
+        """
         ...
 
     # --- trading -----------------------------------------------------------

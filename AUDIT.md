@@ -894,6 +894,44 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 35. Clean shutdowns logged as crashes -- LOW (but it hid everything else)
+
+Every normal Ctrl+C ended like this:
+
+```
+00:04:28 | INFO  | Shutting down...
+00:04:28 | ERROR | grid:emergency_stop | EMERGENCY STOP | cancelling all orders
+00:04:34 | ERROR | trend_follower:emergency_stop | TREND FOLLOWER EMERGENCY STOP
+00:04:34 | INFO  | Bot stopped. State saved.
+```
+
+Nothing was wrong. `emergency_stop()` is called from exactly two places -- the
+kill-switch trip at main.py:1114, and the `finally:` block at main.py:1243 that runs on
+every clean exit -- and it logged ERROR for both. So the routine path produced two red
+lines that mean "this bot crashed".
+
+The same miscalibration one layer down: `Exchange._retry` logged every non-retryable
+exception at ERROR, including `OrderNotFound`. But "that order does not exist" is a
+legitimate *answer* to a probe, not a fault -- `fetch_order` already catches it, logs at
+debug, and returns None. The inner ERROR fired first and defeated that. Three of them
+appeared right after the 22:04 recenter, which cancels everything and then checks what
+it cancelled.
+
+Both are now level-calibrated: `emergency_stop(reason=...)` picks INFO for `"shutdown"`
+and keeps ERROR for the kill switch, and `OrderNotFound`/`InvalidOrder` drop to debug in
+`_retry` while still raising exactly as before.
+
+`reason` is presentational only, and a test enforces that -- it inspects the function
+source and fails if `reason` gates anything but a logger call. A shutdown that logged
+quietly while skipping the cancel would be far worse than one that shouts.
+
+This is the lowest-severity entry in this file and it is here for a reason: for four
+sessions the log's ERROR lines were mostly noise, which is exactly the condition under
+which a real one -- `Loop error (consecutive=1): _last_orderbook`, 27 minutes of it --
+gets read as normal.
+
+---
+
 ## 34. The ladder stopped being a ladder -- HIGH
 
 45 minutes of the 2026-08-12 23:18 run, zero fills. The restored grid, read back from

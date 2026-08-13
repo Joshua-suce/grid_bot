@@ -364,9 +364,9 @@ class StrategyRouter:
         for s in self.strategies.values():
             s.pause()
 
-    def emergency_stop(self) -> None:
+    def emergency_stop(self, reason: str = "emergency") -> None:
         for s in self.strategies.values():
-            s.emergency_stop()
+            s.emergency_stop(reason)
         self._handoff_target = None
 
     def place_initial_orders(self, balance: float) -> int:

@@ -188,6 +188,16 @@ class Exchange:
                         label, attempt, attempts, e, delay,
                     )
                     time.sleep(delay)
+                elif isinstance(e, (ccxt.OrderNotFound, ccxt.InvalidOrder)):
+                    # "That order does not exist" is a legitimate ANSWER to a probe, not
+                    # a failure. fetch_order already catches these, logs at debug and
+                    # returns None -- but this logged ERROR first, so every routine
+                    # check of an order we had just cancelled printed a red line. Three
+                    # of them appeared right after the 22:04 recenter, which cancels
+                    # everything and then checks what it cancelled (AUDIT #35).
+                    logger.debug("{}: {}", label, e)
+                    self._circuit_breaker.record_failure()
+                    raise
                 else:
                     logger.error("{} failed: {}", label, e)
                     self._circuit_breaker.record_failure()
