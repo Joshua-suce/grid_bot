@@ -792,10 +792,19 @@ class GridEngine:
         existing = self._existing_open_order(level.price, level.side)
         if existing and existing.get("id"):
             if any(l is not level and l.order_id == existing["id"] for l in self.levels):
-                logger.debug(
-                    "SKIP ADOPT | order {} @ {} {} already tracked by another level",
-                    existing["id"], level.price, level.side,
-                )
+                # This level can never place while it sits here, so it is dead weight in
+                # the ladder -- one fewer rung earning. It was logged at DEBUG, invisible
+                # at the bot's own level, which is how a grid ran 57 minutes on 9 of 10
+                # orders without a word (AUDIT #58). Throttled per slot: the same #42
+                # mistake of 1,300 identical lines is not worth repeating.
+                key = ("dup", level.side, level.price)
+                if key not in self._be_block_logged:
+                    self._be_block_logged.add(key)
+                    logger.warning(
+                        "LEVEL STRANDED | {} @ {} duplicates order {} already tracked by "
+                        "another level — this rung cannot place and is idle",
+                        level.side.upper(), level.price, existing["id"],
+                    )
                 return False
             logger.warning(
                 "ADOPTED existing open order {} @ {} {} — avoiding duplicate placement",
@@ -1449,11 +1458,25 @@ class GridEngine:
             for l in self.levels
         )
         if occupied:
+            # Do NOT move this level onto the occupied price. That is a one-way trip:
+            # the orphan loop then calls _place_order_for_level, which finds an order
+            # already tracked by another level, returns False and logs it at DEBUG. The
+            # level retries forever and never places again.
+            #
+            # Observed live on 2026-08-14: a buy filled at 0.07017, its replacement sell
+            # targeted the already-occupied 0.07035, and the ladder ran the next 57
+            # minutes on 9 orders with a permanent hole at 0.07017 -- the rung NEAREST
+            # the price. _refill_missing_grid_lines would repair it, but that only runs
+            # on state-load and reset, never in the live loop.
+            #
+            # The occupying order is already the exit this fill needs, so a second one
+            # there would be redundant even if it were placeable. Keep the rung instead:
+            # leave side and price alone and let it re-arm where it is (AUDIT #58).
             logger.info(
-                "SKIP REPLACEMENT | level at {} already occupied by active order — will retry", new_price,
+                "REPLACEMENT SLOT TAKEN | {} @ {} is already live — re-arming this level "
+                "at its own rung {} {} instead of stranding it on top",
+                new_side.upper(), new_price, level.side.upper(), level.price,
             )
-            level.side = new_side
-            level.price = new_price
             level.order_id = None
             level.status = "pending"
             return fill_record
