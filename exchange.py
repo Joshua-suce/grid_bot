@@ -670,8 +670,15 @@ class Exchange:
         logger.info("Cancelled {} open orders for {}", cancelled, symbol)
         return cancelled
 
-    def get_stop_orders(self, symbol: str) -> list[dict]:
-        """Fetch all open stop/conditional orders (stop-market, take-profit, etc)."""
+    def get_stop_orders(self, symbol: str) -> list[dict] | None:
+        """Fetch all open stop/conditional orders (stop-market, take-profit, etc).
+
+        Returns None when the book could not be READ. That is an unknown state, and it
+        is not the same as an empty one: returning [] on failure told every caller "this
+        position has no stops", which is the single most dangerous lie this class can
+        tell. Reconciling stops against a fabricated empty book either tears down live
+        protection or double-places it (AUDIT #54, same family as #50c).
+        """
         try:
             return self._retry(
                 self.exchange.fetch_open_orders, symbol,
@@ -679,12 +686,23 @@ class Exchange:
                 label="fetch_stop_orders",
             )
         except Exception as e:
-            logger.warning("Failed to fetch stop orders: {}", e)
-            return []
+            logger.warning("Failed to fetch stop orders: {} — status UNKNOWN, not empty", e)
+            return None
 
-    def cancel_all_stop_orders(self, symbol: str) -> int:
-        """Cancel every stop/conditional (algo) order for the symbol."""
+    def cancel_all_stop_orders(self, symbol: str) -> int | None:
+        """Cancel every stop/conditional (algo) order for the symbol.
+
+        Returns the number cancelled, or None if the stop book could not be read -- in
+        which case nothing is known to have been cancelled and the caller must not treat
+        the result as a clean sweep (AUDIT #54).
+        """
         stop_orders = self.get_stop_orders(symbol)
+        if stop_orders is None:
+            logger.warning(
+                "STOP CANCEL UNVERIFIED | could not read stop orders for {} — no cancel "
+                "was attempted and the book state is UNKNOWN", symbol,
+            )
+            return None
         if not stop_orders:
             return 0
         cancelled = 0
@@ -743,7 +761,16 @@ class Exchange:
                 logger.warning("Batch cancel failed ({}); will retry individually", e)
 
         # 2) Stop/conditional (algo) orders — attempt once each.
-        for order in self.get_stop_orders(symbol):
+        stop_book = self.get_stop_orders(symbol)
+        if stop_book is None:
+            # Unreadable, not empty. The regular-order verification below still runs;
+            # this just must not be mistaken for "there were no stops" (AUDIT #54).
+            logger.warning(
+                "CLEANUP | stop/conditional book for {} could not be read — any algo "
+                "orders there are NOT known to be cancelled", symbol,
+            )
+            stop_book = []
+        for order in stop_book:
             algo_id = order.get("id")
             if not algo_id or algo_id in seen_ids:
                 continue

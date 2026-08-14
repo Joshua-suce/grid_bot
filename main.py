@@ -102,6 +102,92 @@ def candles_for_lookback(timeframe: str, days: int) -> int:
     return days * mult + 100
 
 
+def _stop_price_of(order: dict) -> float:
+    """Trigger price of a stop order, however this ccxt version chose to spell it."""
+    for key in ("triggerPrice", "stopPrice"):
+        value = order.get(key)
+        if value:
+            return float(value)
+    info = order.get("info") or {}
+    for key in ("stopPrice", "triggerPrice"):
+        value = info.get(key)
+        if value:
+            return float(value)
+    return 0.0
+
+
+def _stop_qty_of(order: dict) -> float:
+    """Quantity a stop order would close. `remaining` is preferred over `amount` so a
+    partially-filled stop is not counted as still covering the whole position."""
+    for key in ("remaining", "amount"):
+        value = order.get(key)
+        if value:
+            return float(value)
+    info = order.get("info") or {}
+    for key in ("origQty", "quantity"):
+        value = info.get(key)
+        if value:
+            return float(value)
+    return 0.0
+
+
+def reconcile_stop_orders(
+    exchange,
+    symbol: str,
+    close_side: str,
+    desired: list[tuple[str, float, float]],
+    live: list[dict],
+) -> tuple[dict[str, dict], float, float]:
+    """Bring the exchange's stop book in line with `desired`, touching only what differs.
+
+    Returns `(kept, covered_qty, desired_qty)` where `kept` maps leg kind -> order record.
+
+    This replaces a cancel-everything-then-place-everything refresh. That version tore
+    down an unchanged hard stop every time the trailing leg ratcheted, opening two extra
+    unprotected round trips on the exact code path behind the -50.49 day. Binance has no
+    atomic replace for stop orders, so the only way to shrink that window is to stop
+    opening it when nothing changed (AUDIT #54).
+
+    Live orders are matched to desired legs by trigger price and quantity. Whatever the
+    exchange holds that no desired leg claims is cancelled -- that covers both stale legs
+    and strays from an earlier crash.
+    """
+    unmatched = list(live)
+    kept: dict[str, dict] = {}
+    for kind, oqty, oprice in desired:
+        for order in unmatched:
+            if (abs(_stop_price_of(order) - oprice) <= max(oprice * 1e-4, 1e-9)
+                    and _stop_qty_of(order) >= oqty - max(1e-8, oqty * 1e-6)):
+                unmatched.remove(order)
+                kept[kind] = {"id": order.get("id"), "side": close_side,
+                              "qty": _stop_qty_of(order), "price": oprice}
+                break
+
+    for order in unmatched:
+        order_id = order.get("id")
+        if order_id and not exchange.cancel_order(order_id, symbol):
+            logger.warning("STOP REFRESH | stale stop {} not confirmed cancelled", order_id)
+
+    for kind, oqty, oprice in desired:
+        if kind in kept:
+            continue
+        try:
+            placed = exchange.place_stop_market(symbol, close_side, oqty, oprice)
+            kept[kind] = {"id": placed["id"], "side": close_side, "qty": oqty, "price": oprice}
+            logger.info(
+                "STOP-LOSS ORDER PLACED | kind={} side={} qty={} @ {}",
+                kind, close_side, oqty, oprice,
+            )
+        except Exception as e:
+            logger.error("Failed to place {} stop-loss: {}", kind, e)
+
+    # Coverage is a QUANTITY question, not a boolean one. The scale-out splits the
+    # position across a trail leg and a hard leg, so the previous `bool(sl_orders)` test
+    # called a position covered when one leg placed and the other did not -- half the
+    # position naked, reported as protected (AUDIT #54).
+    return kept, sum(o["qty"] for o in kept.values()), sum(q for _, q, _ in desired)
+
+
 def build_scale_out_orders(
     side: str,
     qty: float,
@@ -590,11 +676,18 @@ def run_bot() -> None:
 
     sl_orders: dict[str, dict] = {}
     _scale_out_done = False
+    # _sl_needs_update compares desired stops against `sl_orders`, which is a BELIEF.
+    # If reality drifts from it -- a leg cancelled out of band, an exchange-side
+    # expiry -- the belief still matches and the position silently stops being
+    # covered. So verification is forced on a timer regardless of belief (AUDIT #54).
+    _sl_last_verified = 0.0
+    SL_VERIFY_INTERVAL_SECONDS = 120.0
 
     def _reset_sl():
-        nonlocal sl_orders, _scale_out_done
+        nonlocal sl_orders, _scale_out_done, _sl_last_verified
         sl_orders = {}
         _scale_out_done = False
+        _sl_last_verified = 0.0
 
     def _desired_sl_orders(side: str, qty: float) -> list[tuple[str, float, float]]:
         """Return list of (kind, qty, price) stop-market orders for the open position.
@@ -637,30 +730,38 @@ def run_bot() -> None:
         caller blocks new exposure while uncovered, so an unprotected position can no
         longer also be a growing one.
         """
-        nonlocal sl_orders
-        exchange.cancel_all_stop_orders(settings.symbol)
-        sl_orders = {}
+        nonlocal sl_orders, _sl_last_verified
         close_side = "sell" if side == "long" else "buy"
         desired = list(_desired_sl_orders(side, qty))
-        for kind, oqty, oprice in desired:
-            try:
-                order = exchange.place_stop_market(settings.symbol, close_side, oqty, oprice)
-                sl_orders[kind] = {"id": order["id"], "side": close_side, "qty": oqty, "price": oprice}
-                logger.info(
-                    "STOP-LOSS ORDER PLACED | kind={} side={} qty={} @ {}",
-                    kind, close_side, oqty, oprice,
-                )
-            except Exception as e:
-                logger.error("Failed to place {} stop-loss: {}", kind, e)
+        if not desired:
+            sl_orders = {}
+            return True
 
-        covered = bool(sl_orders) or not desired
+        live = exchange.get_stop_orders(settings.symbol)
+        if live is None:
+            # Unknown state. Tearing down protection we cannot see is precisely how a
+            # position ends up naked, so change NOTHING and report uncovered: the caller
+            # stops adding exposure and the next pass tries again (AUDIT #54).
+            logger.error(
+                "STOP REFRESH ABORTED | stop book unreadable — existing stops left in "
+                "place, new exposure blocked until it can be verified",
+            )
+            return False
+
+        sl_orders, covered_qty, desired_qty = reconcile_stop_orders(
+            exchange, settings.symbol, close_side, desired, live,
+        )
+        _sl_last_verified = time.time()
+
+        covered = covered_qty >= desired_qty - max(1e-8, desired_qty * 1e-6)
         if not covered:
             logger.error(
-                "POSITION UNPROTECTED | {} {} has NO stop-loss on the exchange — every "
-                "leg failed to place. Blocking new exposure until a stop is live "
-                "(AUDIT #50)", side, qty,
+                "POSITION UNDER-PROTECTED | {} {} — stops cover {:.8g} of {:.8g} "
+                "({:.0f}%). Blocking new exposure until fully covered (AUDIT #54)",
+                side, qty, covered_qty, desired_qty,
+                100.0 * covered_qty / desired_qty if desired_qty else 0.0,
             )
-            events.risk_check("stop_loss_coverage", 0.0, float(len(desired)), "UNPROTECTED")
+            events.risk_check("stop_loss_coverage", covered_qty, desired_qty, "UNPROTECTED")
         return covered
 
     def _detect_trail_fill() -> None:
@@ -682,7 +783,13 @@ def run_bot() -> None:
         if exchange.demo and not exchange.has_credentials:
             return
         trail_id = sl_orders["trail"]["id"]
-        open_ids = {o.get("id") for o in exchange.get_stop_orders(settings.symbol)}
+        live_stops = exchange.get_stop_orders(settings.symbol)
+        if live_stops is None:
+            # Unreadable book. "Absent" cannot be concluded from a failed read, and
+            # concluding it here would latch _scale_out_done permanently (AUDIT #54).
+            logger.debug("SCALE-OUT CHECK | stop book unreadable — deferring")
+            return
+        open_ids = {o.get("id") for o in live_stops}
         if trail_id in open_ids:
             return
 
@@ -719,6 +826,8 @@ def run_bot() -> None:
     def _sl_needs_update(side: str, qty: float) -> bool:
         if not sl_orders:
             return True
+        if time.time() - _sl_last_verified >= SL_VERIFY_INTERVAL_SECONDS:
+            return True                      # periodic trust-but-verify (AUDIT #54)
         desired = _desired_sl_orders(side, qty)
         if len(desired) != len(sl_orders):
             return True
@@ -1172,8 +1281,17 @@ def run_bot() -> None:
                             grid.block_side("sell", "stop-loss missing")
                     else:
                         if sl_orders:
-                            exchange.cancel_all_stop_orders(settings.symbol)
-                            _reset_sl()
+                            # Flat: drop the stops. Only forget them if the sweep was
+                            # actually confirmed -- None means the book was unreadable,
+                            # and clearing belief there strands live stop orders that
+                            # would arm against the NEXT position (AUDIT #54).
+                            if exchange.cancel_all_stop_orders(settings.symbol) is None:
+                                logger.warning(
+                                    "STOP SWEEP UNVERIFIED | flat but the stop book could "
+                                    "not be read — retrying next iteration",
+                                )
+                            else:
+                                _reset_sl()
 
                     was_in_recovery = risk.is_in_recovery()
                     # grid_stop_loss_price must match position_side: get_stop_loss_price()

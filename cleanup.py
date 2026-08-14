@@ -31,7 +31,26 @@ def main() -> None:
     positions = exchange.get_positions(settings.symbol)
     has_positions = any(float(p.get("contracts", 0) or 0) != 0 for p in positions)
 
-    if remaining_orders or remaining_stops or has_positions:
+    # Unreadable is not clean. Announcing "exchange is clean" when the stop book could
+    # not be READ would be a lie about the one thing this script exists to confirm
+    # (AUDIT #54).
+    stops_unknown = remaining_stops is None
+    if stops_unknown:
+        remaining_stops = []
+
+    if stops_unknown:
+        logger.error(
+            "CLEANUP UNVERIFIED | the stop/conditional book for {} could not be read — "
+            "state is UNKNOWN, not clean. Check the exchange manually before starting.",
+            settings.symbol,
+        )
+        for o in remaining_orders:
+            logger.error("  Remaining order: {}", o.get("id"))
+        for p in positions:
+            amt = float(p.get("contracts", 0) or 0)
+            if amt != 0:
+                logger.error("  Remaining position: {} {} @ {}", p.get("side"), amt, p.get("entryPrice"))
+    elif remaining_orders or remaining_stops or has_positions:
         logger.error("CLEANUP INCOMPLETE | orders={} stops={} positions={}", len(remaining_orders), len(remaining_stops), has_positions)
         for o in remaining_orders:
             logger.error("  Remaining order: {}", o.get("id"))
