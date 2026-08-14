@@ -230,4 +230,9 @@ GRID_SPECIFIC_MEMBERS = (
     "log_analytics",
     "get_scale_out_trail_price",
     "update_orderbook",
+    # How much one side of a LADDER commits if every rung on it fills. Meaningless to a
+    # trend follower, which holds one position rather than a row of resting rungs. The
+    # startup coherence check that uses it is wrapped in try/except precisely so router
+    # mode degrades to skipping the check rather than raising (AUDIT #66).
+    "one_side_notional",
 )

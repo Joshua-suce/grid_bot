@@ -649,6 +649,16 @@ class TrendFollower:
         """No scale-out: the position exits in one piece at the trailing stop."""
         return None
 
+    def one_side_notional(self, balance: float) -> float:
+        """No ladder, so nothing accumulates a rung at a time.
+
+        main.py's startup check compares this against the position cap to catch a grid
+        whose outer rungs could never fill. A trend follower opens one position sized by
+        _entry_qty and bounded by the same cap, so there is no rung-stranding failure to
+        warn about -- 0.0 reads as "nothing to check" (AUDIT #66).
+        """
+        return 0.0
+
     def log_sl_status(self, side: str = "long") -> None:
         """`side` is accepted and ignored: this strategy holds at most one position and
         already knows which way it is facing. main.py passes it positionally

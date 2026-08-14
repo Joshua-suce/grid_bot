@@ -696,6 +696,44 @@ def run_bot() -> None:
         grid = _install_strategy(grid, exchange, events, notifier)
         grid.initialize(current_price, balance)
 
+    # Can one side of the ladder actually fill, or will the cap strand the outer rungs?
+    #
+    # config.validate() answers this for PERCENT sizing but cannot for the
+    # CAPITAL_PER_GRID_USDT path: that size is absolute while the cap is a fraction of
+    # equity, so the comparison needs a balance config time does not have. #63 correctly
+    # stopped validating a figure that no longer decides anything and left nothing in its
+    # place -- so the guard vanished exactly as the USDT path became the live one.
+    #
+    # The failure it guards is documented: a grid wider than its cap goes permanently
+    # one-sided, the cap blocks that side partway through, and the bot lives in the
+    # capped state that makes recentering destructive (89 recenters in one session).
+    #
+    # A warning, not an abort. The cap and the size taper keep this SAFE, only degraded,
+    # and equity moves -- a restart after a drawdown should not refuse to start
+    # (AUDIT #66).
+    try:
+        _one_side = grid.one_side_notional(balance)
+        _cap = balance * settings.max_position_pct
+        if _one_side > _cap > 0:
+            _per_order = _one_side / max(1, settings.grid_count / 2)
+            logger.warning(
+                "LADDER OUTGROWS THE CAP | {:.0f} rungs a side at {:.2f} USDT commits "
+                "{:.2f}, over the {:.0%} position cap of {:.2f}. The outer {:.1f} rung(s) "
+                "can never fill and the book will go one-sided. Lower GRID_COUNT, lower "
+                "CAPITAL_PER_GRID_USDT or LEVERAGE, or raise MAX_POSITION_PCT",
+                settings.grid_count / 2, _per_order, _one_side,
+                settings.max_position_pct, _cap, (_one_side - _cap) / _per_order,
+            )
+        else:
+            logger.info(
+                "LADDER FITS THE CAP | one side commits {:.2f} of {:.2f} ({:.0%}), "
+                "{:.1f} rung(s) spare",
+                _one_side, _cap, _one_side / _cap if _cap else 0,
+                (_cap - _one_side) / max(1e-9, _one_side / max(1, settings.grid_count / 2)),
+            )
+    except Exception as e:
+        logger.debug("Ladder/cap coherence check skipped: {}", e)
+
     sl_orders: dict[str, dict] = {}
     _scale_out_done = False
     # _sl_needs_update compares desired stops against `sl_orders`, which is a BELIEF.

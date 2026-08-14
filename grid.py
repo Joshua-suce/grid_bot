@@ -451,6 +451,14 @@ class GridEngine:
             round(self.grid_lower, 8), round(self.grid_upper, 8),
         )
 
+    def one_side_notional(self, balance: float) -> float:
+        """USDT one side of the ladder commits if every rung on it fills.
+
+        The position cap lives in main.py (set_position_limit), not here, so the engine
+        exposes the figure and the caller compares it (AUDIT #66).
+        """
+        return self._calc_usdt_per_grid(balance) * (self.grid_count / 2)
+
     def _initialize_uniform(self, current_price: float) -> None:
         levels = []
         for i in range(self.grid_count):
