@@ -1240,6 +1240,58 @@ def run_bot() -> None:
                     equity = exchange.get_total_equity()
                     balance = exchange.get_balance()
 
+                    # A paused strategy is not a flat one. pause() deliberately keeps the
+                    # position -- "the position stays under stop protection", per the
+                    # Strategy protocol -- and the trend filter pauses on a confirmed
+                    # TREND, which is precisely when a held position runs away from you.
+                    #
+                    # Everything below used to sit inside `if grid.active:`. So for the
+                    # majority of this bot's life (measured at ~60% paused on DOGE, see
+                    # AUDIT #52) the stops were never refreshed and NOT ONE kill switch
+                    # was evaluated: no drawdown check, no daily-loss check, no stop-loss
+                    # backstop, no consecutive-loss check, and daily_unrealized_pnl frozen
+                    # at whatever it held when the grid went quiet.
+                    #
+                    # The risk layer was off duty exactly when it was needed (AUDIT #53).
+                    held_side, held_qty = get_net_position(exchange, settings.symbol)
+                    if held_side in ("long", "short") and held_qty > 0:
+                        if held_side == "long":
+                            grid.update_trailing_sl(price)
+                        else:
+                            grid.update_trailing_sl_short(price)
+
+                        if _sl_needs_update(held_side, held_qty):
+                            try:
+                                if not _refresh_sl_stops(held_side, held_qty):
+                                    logger.error(
+                                        "PAUSED POSITION UNPROTECTED | {} {} has no "
+                                        "stop-loss and the grid is paused",
+                                        held_side, held_qty,
+                                    )
+                            except Exception as e:
+                                logger.error("PAUSED POSITION | stop refresh failed: {}", e)
+
+                        risk.update_unrealized(sum(
+                            _position_unrealized_pnl(p, price)
+                            for p in get_position_details(exchange, settings.symbol)
+                        ))
+
+                        held_sl = (grid.get_short_stop_loss_price() if held_side == "short"
+                                   else grid.get_stop_loss_price())
+                        was_paused_recovery = risk.is_in_recovery()
+                        held_safe, held_fatal = risk.check_all(
+                            equity, held_sl or 0.0, price,
+                            grid.get_exposure_pct(balance), side=held_side,
+                            daily_realized_pnl=pnl_reconciler.daily_net_pnl,
+                        )
+                        if not held_safe and held_fatal and not was_paused_recovery:
+                            grid.emergency_stop("risk limit breached while paused")
+                            _reset_sl()
+                            notifier.on_kill_switch(
+                                "Risk limit breached (grid paused, position still open)"
+                            )
+                            events.recovery_event("start", risk.state.recovery_count)
+
                 # Periodic fallback sync so funding-fee settlements (which happen on a
                 # schedule, independent of any grid fill) still get picked up promptly.
                 if loop_count % 60 == 0:

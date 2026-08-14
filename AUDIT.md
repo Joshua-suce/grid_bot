@@ -894,6 +894,61 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 53. The risk layer was off duty for 60% of the bot's life -- CRITICAL
+
+`pause()` deliberately does not flatten. The Strategy protocol says so in as many words:
+"the position stays under stop protection". So a paused grid routinely holds inventory.
+
+Every risk control in the trading loop lived inside `if grid.active:`.
+
+While paused, therefore, **none of them ran**:
+
+```
+no drawdown check          no daily-loss check         no stop-loss backstop
+no consecutive-loss check  daily_unrealized_pnl frozen  stops never refreshed
+```
+
+That last one compounds #50: `_refresh_sl_stops` also sat inside the active branch, so a
+stop that failed to place, or was cancelled and not replaced, stayed missing for the
+entire pause -- however long that lasted.
+
+And `daily_unrealized_pnl` freezing is what makes the daily-loss switch a no-op on a
+paused position: `_check_daily_loss` evaluates `realized + unrealized`, so a position
+running against the account all afternoon leaves the total exactly where it was when the
+grid went quiet.
+
+### Why this is not a rare corner
+
+The trend filter pauses on a **confirmed trend** -- which is precisely when a held
+position runs away from you -- and #52 measured the grid at ~60% paused on DOGE with the
+live thresholds. This is not an edge case reachable by an unlucky sequence. It is the
+majority state of the bot, and the risk layer was switched off throughout it, in the one
+regime that hurts a held position most.
+
+The only thing protecting a paused position was the exchange-side stop order. #50 is the
+audit entry about those silently failing to be placed.
+
+### The fix
+
+The `if not grid.active:` branch now does the work the active branch does, gated on
+actually holding something: refresh the trailing anchor, re-place stops when
+`_sl_needs_update` says so, refresh unrealized PnL from the exchange's own position
+figures, and evaluate `check_all` with the side-correct stop and the verified daily PnL.
+
+A recovery latch (`was_paused_recovery`) keeps it from re-triggering every iteration --
+`check_all` returns `(False, True)` for the whole cooldown, so an ungated caller would
+call `emergency_stop` and re-notify on every loop.
+
+### Verified adversarially
+
+`tests/test_paused_risk.py` -- 6 tests, all 6 fail with the block removed. They parse the
+`if not grid.active:` branch out of main.py by indentation and assert on its contents,
+which is the same approach `test_strategy.py` and `test_stale_feeds.py` take: the trading
+loop is one long function against a live exchange, so its structure is what can be
+pinned. Full suite: 505 passed, 5 skipped.
+
+---
+
 ## 52. The harness was measuring a different bot -- CRITICAL (measurement integrity)
 
 Two defects in `backtest.py`/`run_backtest.py` that did not lose money directly. They
@@ -1000,6 +1055,43 @@ The account can bleed while the switch reads a healthy figure from an hour ago. 
 Both now follow the #50 rule: the position may be closed and may be held, but it may not
 grow. `is_stale()`/`seconds_since_sync()` make the age readable, and both blocks clear
 themselves on the next good iteration.
+
+### Re-validating the live config on the corrected harness
+
+Every configuration decision in this file was taken on the broken harness, so the whole
+live geometry was re-measured: select on the first 120 days of DOGE, validate on an
+untouched 60.
+
+```
+                        in-sample   out-of-sample     verdict
+RANGE_ATR_MULTIPLIER
+  2.0                      +48.45         -18.37
+  2.5                      +49.68         +27.54
+  3.0                      -15.52         +75.47      unstable, sign flips
+  3.5  (live)              +73.47         +65.41      only value strong in BOTH
+  4.0                      +73.26          -1.69      in-sample only
+
+GRID_COUNT
+  6                         +8.26         -39.97
+  8                        +23.48         +12.94
+  10   (live)              +73.47         +65.41      positive in both
+  12                      +100.13         +40.80      positive in both
+
+TREND_FILTER
+  on   (live)              +73.47         +65.41
+  off                      -69.82         -37.17      flips the sign in both windows
+```
+
+`RANGE_ATR_MULTIPLIER=3.5` and `GRID_COUNT=10` both hold up. 12 beats 10 in-sample by 27
+and loses to it out-of-sample by 25 -- a difference well inside the 67-point noise floor
+measured above, so it is not a reason to change anything.
+
+The trend filter's value survives the harness fix intact: it is the difference between
++73/+65 and -70/-37, in both windows. That was the one robust finding before #52 and it
+is still the one robust finding after.
+
+**Net result of re-validation: no configuration change is justified.** The live settings
+were already right. What was wrong was the instrument measuring them.
 
 ### Verified adversarially
 
