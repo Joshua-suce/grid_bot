@@ -14,8 +14,21 @@ class StateManager:
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.filepath = self.state_dir / f"grid_{symbol.lower()}.json"
+        self.consecutive_save_failures = 0
 
-    def save(self, data: dict) -> None:
+    def save(self, data: dict) -> bool:
+        """Atomically persist state. Returns False if it could not be written.
+
+        os.replace is atomic, but without an fsync first the rename can land while the
+        data behind it is still in the page cache -- a power loss or hard kill then
+        leaves a present-but-empty state file. load() copes with that (it renames the
+        empty file aside and starts fresh), but starting fresh means losing the stop
+        ratchets, which is #50b's failure mode arriving by a different road.
+
+        The return value exists because a persistent save failure is otherwise invisible
+        beyond one log line: the bot keeps trading and every restart silently reloads
+        older state (AUDIT #57).
+        """
         try:
             tmp_fd, tmp_path = tempfile.mkstemp(
                 dir=self.state_dir, suffix=".tmp", prefix=".state_",
@@ -23,7 +36,16 @@ class StateManager:
             try:
                 with os.fdopen(tmp_fd, "w") as f:
                     json.dump(data, f, indent=2, default=str)
+                    f.flush()
+                    os.fsync(f.fileno())
                 os.replace(tmp_path, self.filepath)
+                if self.consecutive_save_failures:
+                    logger.info(
+                        "STATE SAVE RECOVERED | after {} consecutive failures",
+                        self.consecutive_save_failures,
+                    )
+                self.consecutive_save_failures = 0
+                return True
             except Exception:
                 try:
                     os.unlink(tmp_path)
@@ -31,7 +53,18 @@ class StateManager:
                     pass
                 raise
         except Exception as e:
-            logger.error("Failed to save state: {}", e)
+            self.consecutive_save_failures += 1
+            # Every caller discards the return value, so a disk that stopped accepting
+            # writes would otherwise show up as one identical line per iteration and
+            # nothing else. Escalate instead: the consequence is that a restart silently
+            # reloads older state, including looser stops.
+            if self.consecutive_save_failures in (1, 5) or self.consecutive_save_failures % 50 == 0:
+                logger.error(
+                    "STATE NOT PERSISTED | {} consecutive save failures — a restart will "
+                    "reload STALE state (stop ratchets included): {}",
+                    self.consecutive_save_failures, e,
+                )
+            return False
 
     def load(self) -> dict | None:
         if not self.filepath.exists():

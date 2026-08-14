@@ -894,6 +894,162 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 57. State could survive the process but not the crash -- MEDIUM
+
+`save()` writes to a temp file and `os.replace`s it, which is atomic with respect to the
+rename. But there was no `fsync` before the rename, so the rename can land while the
+bytes behind it are still in the page cache: a power loss or hard kill leaves a
+present-but-**empty** state file.
+
+`load()` already copes -- it renames the empty file aside and starts fresh. But starting
+fresh means losing `_hard_sl_price` and `_hard_sl_price_short`, which is exactly #50b's
+failure mode arriving by a different road: a restart that silently loosens the stop on an
+open position.
+
+Separately, all five call sites discard `save()`'s return value, so a disk that stopped
+accepting writes showed up as one identical line per iteration and nothing else, while
+every restart quietly reloaded older state. `save()` now returns a bool and
+`StateManager` counts consecutive failures, escalating at 1, 5 and every 50th so the
+condition is visible without spamming.
+
+8 tests, including one that pins the **ordering** -- an fsync after the rename does not
+protect the rename -- and one that a failed write never destroys the last good state.
+
+---
+
+## 56. Every order now says why it exists -- the attribution that was missing
+
+#47 established that the loss was concentrated in a few closes. It could not say what
+kind of closes, because the income ledger is a flat list of numbers.
+
+Splitting 30 days of `userTrades` by the maker flag finally separates them:
+
+```
+             execs     notional    realized   commission        NET
+maker         3271      106,398     +120.02       -21.28     +98.74
+TAKER          890       62,948     -106.86       -25.18    -132.04
+```
+
+**The grid is not the problem.** It wins 76.0% of 1511 closes with an avg_win/avg_loss of
+1.444 against a breakeven requirement of 0.316. It nets **+98.74**.
+
+Forced exits take all of it back and more: 137 closes, 48.2% win rate, avg loss -1.97
+against avg win +0.50. The worst ten alone are **-112.98, which is 81% of that bucket's
+losses**. The single worst is `BUY 31,761 DOGE @ 0.07120` for **-45.68** on 08-08 -- a
+position 1.8x through a 17,467 cap, which is #49/#50 and is fixed. 44,929 and 19,178 are
+the same defect.
+
+### Why tagging, and not just the maker flag
+
+"Taker" lumps stop-outs, reconcile closes, emergency closes and crossed unwinds into one
+bucket. Knowing the bucket costs -132.04 does not say which mechanism to fix.
+
+Every order now carries a two-character purpose tag in its `clientOrderId` --
+`grid_entry`, `grid_exit`, `unwind`, `reconcile`, `stop_trail`, `stop_hard`,
+`emergency` -- and `attribute_pnl.py` joins `userTrades` to orders and groups realized
+PnL by it. Attribution comes from exchange data alone, so it survives restarts and state
+resets.
+
+The tag rides in `params` rather than as a keyword argument: a dozen test doubles accept
+`params` but not extra kwargs. It is popped before the dict reaches ccxt.
+
+### The decoder was wrong first
+
+The first version read a bare two-character prefix. That is ambiguous against the
+previous `"g" + 31 hex chars` format -- any legacy id whose second character was an `e`
+decodes as the `ge` (grid_entry) tag. The first report duly mis-attributed **80 of 1480**
+legacy executions, almost exactly the 1-in-16 you would predict. There is now a `_`
+separator, which cannot occur in hex, and a test that walks all sixteen hex digits.
+
+### #51's fee measurement was taken on the wrong population
+
+Grid cycles pay **pure maker**: 21.280/106,398 = 0.0200%/side to four figures. The 37.2%
+taker share of notional is *entirely* forced exits. Charging ordinary grid levels for
+stop-outs would reject levels that are genuinely profitable, so `TAKER_FILL_SHARE_PCT`
+drops from 11.8 to 5, with the measurement written into the config description so nobody
+re-derives 37.2 and cripples the gate.
+
+---
+
+## 55. The spread reading was dead for the entire life of the bot -- MEDIUM-HIGH
+
+Every status line this bot has ever written says `spread=0.0000%`. DOGE is not that
+liquid. The reading was never alive.
+
+`get_orderbook_depth` took the spread from `fetch_ticker`, and **binanceusdm does not
+populate bid/ask there** -- both come back `None`. So `if bid and ask and ask > 0` never
+fired once, and `_last_spread` sat at its initial `0.0` for the life of every process.
+Probed live against the DEMO account:
+
+```
+ticker bid=None  ask=None  last=0.07023
+book   top bid=0.07023  top ask=0.07024      -> real spread 0.0142%
+```
+
+The order book fetched on the very next line always had the answer. So the ticker call
+was not merely wrong, it was a **wasted round trip on every iteration** -- and this
+function runs once per loop while the grid is active. The spread now comes from the book
+and the ticker fetch is gone: one API call where there were two.
+
+Two related fixes. A failed book fetch used to fabricate `spread_pct: 0`, which reads as
+an infinitely tight book -- the same class of lie as reporting an unreadable order book
+as clean (#50c, #54). It now serves the last known value and flags `stale=True`. And that
+failure was logged at **DEBUG**, invisible at the bot's own level, which is how a
+market-data feed dies for months unnoticed. It is a WARNING now.
+
+Reverted: 3 of 5 tests fail, reproducing the defect exactly as `assert 0.0 > 0`.
+
+---
+
+## 54. Stop coverage was guessed at, not measured -- CRITICAL
+
+Three defects in the stop-loss layer, one of them introduced by #50 itself.
+
+### 54a. Coverage was a boolean, and the position is not
+
+`covered = bool(sl_orders)` -- true if **any** leg placed. But the scale-out splits the
+position across a trail leg and a hard leg, half each. One placing and one failing left
+632 of 1264 DOGE with no stop and reported it protected, so #50's rule that an
+unprotected position must not grow was reading a flag that could not see the failure it
+existed to catch. Coverage is now a quantity: placed qty against position qty.
+
+### 54b. Refresh tore down stops that had not changed
+
+The refresh cancelled every stop and re-placed all of them on any change. When the trail
+ratcheted, the unchanged hard leg was destroyed and rebuilt too. Last night's log shows
+it three times -- the hard leg sat at 0.0672792 throughout and was cancelled and
+re-placed on every single ratchet.
+
+Binance has no atomic replace for stop orders, so the window cannot be closed; the only
+way to shrink it is to stop opening it when nothing changed. Stops are now reconciled
+declaratively: match live orders to desired legs, cancel only what no leg claims, place
+only what is missing. Strays from an earlier crash are swept in the same pass.
+
+### 54c. An unreadable stop book read as an empty one
+
+`get_stop_orders` returned `[]` both when there were no stops and when the read **failed**
+-- the same lie `cancel_everything` told in #50c. Reconciling against a fabricated empty
+book either tears down protection you cannot see or double-places it. It returns `None`
+now; the refresh aborts without touching anything and reports uncovered so the caller
+stops adding exposure. `cancel_all_stop_orders` propagates the same distinction rather
+than reporting "0 cancelled", which reads as a clean sweep, and `cleanup.py` no longer
+prints "exchange is clean" on the strength of a failed read.
+
+### Belief is not verification
+
+`_sl_needs_update` compares desired stops against `sl_orders` -- a *belief*. A leg
+cancelled out of band leaves belief and reality matching forever. Verification is now
+forced every 120s regardless.
+
+### Why this had no tests before
+
+The reconciler lived in a closure inside `run_bot`. The full suite passed untouched
+before this work because **nothing reached that code**. It is at module scope now, which
+is the only reason it can be tested at all. 12 tests; reverted, 5 fail plus two
+structural guards.
+
+---
+
 ## 53. The risk layer was off duty for 60% of the bot's life -- CRITICAL
 
 `pause()` deliberately does not flatten. The Strategy protocol says so in as many words:
