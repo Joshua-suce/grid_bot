@@ -545,28 +545,51 @@ class GridEngine:
     def _calc_usdt_per_grid(self, balance: float) -> float:
         """Return the USDT notional per grid level.
 
-        If both a fixed USDT allocation and a percentage-based allocation are configured,
-        use the larger of the two so a small fixed override does not undercut the
-        chosen percentage allocation.
+        CAPITAL_PER_GRID_USDT, when set, is AUTHORITATIVE: it means "commit this much of
+        my own capital per trade", and the notional is that times leverage.
+
+        It used to be `max(fixed, percent)`, which made the setting silently inert
+        whenever the percent path happened to be larger -- and on a 4930 balance it
+        always was: the fixed path asked for 25 and the percent path returned 88.74, so
+        every order was 3.5x the configured size. The bot logged the override once and
+        carried on, which reads as a note rather than "your setting is being ignored"
+        (AUDIT #63).
+
+        Percent-based sizing remains the default when CAPITAL_PER_GRID_USDT is 0.
         """
         pct_allocation = balance * self.capital_per_grid_pct * self._volatility_mult
-        if self.capital_per_grid_usdt > 0:
-            fixed_allocation = self.capital_per_grid_usdt * self.leverage * self._volatility_mult
-            if fixed_allocation < pct_allocation:
-                if not self._warned_small_fixed_allocation:
-                    self._warned_small_fixed_allocation = True
-                    logger.warning(
-                        "CAPITAL_PER_GRID_USDT ({:.2f}) is smaller than percent-based allocation ({:.2f}); "
-                        "using the larger value for per-grid sizing.",
-                        fixed_allocation, pct_allocation,
-                    )
-            raw = max(fixed_allocation, pct_allocation)
-            current_total = raw * self.grid_count
-            target_total = balance * self.max_exposure_pct
-            if current_total > target_total:
-                raw = target_total / self.grid_count
-            return raw
-        return pct_allocation
+        if self.capital_per_grid_usdt <= 0:
+            return pct_allocation
+
+        # The configured size is a CEILING, not a target. Volatility may shrink an order
+        # but never grow it past what was asked for.
+        #
+        # Unbounded, the calm-market multiplier reaches 2.5 and turned a configured 50
+        # USDT into 102.50 -- ten rungs of which is 1025 against a 587 position cap, so
+        # the cap blocked the ladder in exactly the quiet markets the multiplier exists
+        # to keep it working in. Shrinking in violent markets is kept: that reduces risk
+        # (AUDIT #64).
+        sizing_mult = min(1.0, self._volatility_mult)
+        raw = self.capital_per_grid_usdt * self.leverage * sizing_mult
+        if not self._warned_small_fixed_allocation:
+            self._warned_small_fixed_allocation = True
+            logger.info(
+                "PER-GRID SIZING | CAPITAL_PER_GRID_USDT={:.2f} x {}x leverage = {:.2f} "
+                "USDT notional per order (percent-based would have been {:.2f})",
+                self.capital_per_grid_usdt, self.leverage, raw, pct_allocation,
+            )
+
+        # Total committed notional still cannot exceed the exposure ceiling.
+        current_total = raw * self.grid_count
+        target_total = balance * self.max_exposure_pct
+        if current_total > target_total:
+            raw = target_total / self.grid_count
+            logger.warning(
+                "PER-GRID SIZING | {} rungs at the configured size would commit {:.2f} "
+                "USDT, over the {:.0%} exposure ceiling — trimming to {:.2f} per order",
+                self.grid_count, current_total, self.max_exposure_pct, raw,
+            )
+        return raw
 
     @property
     def round_trip_fee_pct(self) -> float:

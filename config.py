@@ -38,9 +38,17 @@ class Settings(BaseSettings):
     capital_per_grid_usdt: float = Field(
         default=0.0, ge=0, le=10000,
         description=(
-            "Fixed USDT margin per grid level. If > 0, the bot uses the larger of this "
-            "fixed allocation and the percentage-based allocation to avoid overly small "
-            "grid sizing."
+            "Fixed USDT of YOUR CAPITAL committed per grid level. When > 0 this is "
+            "AUTHORITATIVE: notional per order = this x LEVERAGE x volatility multiplier, "
+            "and CAPITAL_PER_GRID_PCT is ignored entirely. Set it to 0 to size by percent "
+            "of balance instead.\n"
+            "\n"
+            "It used to take the LARGER of this and the percent allocation, which made "
+            "the setting silently inert whenever percent was bigger -- on a 4930 balance "
+            "the config asked for 25 and every order went out at 88.74 (AUDIT #63).\n"
+            "\n"
+            "Still bounded by MAX_EXPOSURE_PCT across all rungs, and by MAX_POSITION_PCT "
+            "on the resulting position."
         ),
     )
     replacement_cooldown: int = Field(
@@ -383,9 +391,17 @@ class Settings(BaseSettings):
         # than the cap allows, the surplus levels can never fill: the cap blocks that
         # side partway through, the book goes permanently one-sided, and the bot spends
         # its life in the capped state that makes recentering destructive.
+        #
+        # Only meaningful when the PERCENT path governs. With CAPITAL_PER_GRID_USDT set
+        # the size is an absolute USDT figure and max_position_pct is a fraction of
+        # equity, so the two cannot be compared without a balance -- which config
+        # validation does not have. That case is bounded at runtime instead, by the
+        # exposure ceiling in _calc_usdt_per_grid and the position cap in
+        # set_position_limit. Checking the percent path regardless would be validating a
+        # number that no longer decides anything (AUDIT #63).
         levels_per_side = self.grid_count / 2
         affordable_levels = self.max_position_pct / self.capital_per_grid_pct
-        if levels_per_side > affordable_levels:
+        if self.capital_per_grid_usdt <= 0 and levels_per_side > affordable_levels:
             max_coherent_count = int(2 * affordable_levels)
             raise ValueError(
                 f"GRID_COUNT ({self.grid_count}) puts {levels_per_side:.0f} levels on each "

@@ -38,6 +38,10 @@ def _coherent(**overrides):
         grid_count=10, capital_per_grid_pct=0.018, max_position_pct=0.12,
         maker_fee_pct=0.02, taker_fee_pct=0.04,
         range_min_spacing_pct=0.002, min_profit_multiplier=3.0,
+        # Pinned, not left to the default: Settings reads .env, so an unset field picks
+        # up the developer's live config. These cases exercise the PERCENT sizing path,
+        # and the levels-per-side check only applies there (AUDIT #63).
+        capital_per_grid_usdt=0.0,
     )
     base.update(overrides)
     return Settings(**base)

@@ -156,7 +156,11 @@ def test_grid_engine_initialization():
     assert grid.grid_spacing > 0
 
 
-def test_calc_usdt_per_grid_uses_larger_allocation():
+def test_calc_usdt_per_grid_lets_the_configured_usdt_size_win():
+    """Superseded behaviour: this used to assert max(fixed, percent), so a configured
+    CAPITAL_PER_GRID_USDT was ignored whenever the percent path was larger. On a live
+    4930 balance that was always -- 25 configured, 88.74 sent. It is authoritative now
+    (AUDIT #63); percent sizing applies only when it is left at 0."""
     class FakeExchange:
         class exchange:
             @staticmethod
@@ -179,8 +183,8 @@ def test_calc_usdt_per_grid_uses_larger_allocation():
         max_exposure_pct=1.0,
     )
     grid._volatility_mult = 1.0
-    usdt_per_grid = grid._calc_usdt_per_grid(1000)
-    assert usdt_per_grid == pytest.approx(100.0)
+    # 5 USDT of capital at 2x = 10 notional. The percent path would have said 100.
+    assert grid._calc_usdt_per_grid(1000) == pytest.approx(10.0)
 
 
 def test_calc_usdt_per_grid_uses_fixed_override_when_larger():
