@@ -245,26 +245,48 @@ class Exchange:
         return 0.0
 
     def get_orderbook_depth(self, symbol: str, limit: int = 10) -> dict:
-        try:
-            ticker = self._retry(self.exchange.fetch_ticker, symbol, label="fetch_ticker(book)")
-            bid = ticker.get("bid", 0)
-            ask = ticker.get("ask", 0)
-            if bid and ask and ask > 0:
-                self._last_spread = (ask - bid) / ask
+        """Top-of-book spread and depth imbalance, both derived from the order book.
 
+        The spread used to come from `fetch_ticker`, but binanceusdm does not populate
+        bid/ask there -- both come back None. The guard `if bid and ask` therefore never
+        fired once, `_last_spread` stayed at its initial 0.0 for the entire life of the
+        process, and every status line in every log this bot has ever written reported
+        `spread=0.0000%`. Measured live: ticker bid/ask None, book 0.07022/0.07024, real
+        spread 0.0285%.
+
+        The order book fetched below always had the answer, so the ticker call was a
+        wasted round trip every iteration on top of being wrong (AUDIT #55).
+        """
+        try:
             book = self._retry(self.exchange.fetch_order_book, symbol, limit=limit, label="fetch_order_book")
-            bid_vol = sum(b[1] for b in book.get("bids", [])[:5])
-            ask_vol = sum(a[1] for a in book.get("asks", [])[:5])
+            bids = book.get("bids", []) or []
+            asks = book.get("asks", []) or []
+            if bids and asks:
+                best_bid, best_ask = float(bids[0][0]), float(asks[0][0])
+                if best_ask > 0:
+                    self._last_spread = (best_ask - best_bid) / best_ask
+            bid_vol = sum(b[1] for b in bids[:5])
+            ask_vol = sum(a[1] for a in asks[:5])
             imbalance = (bid_vol - ask_vol) / max(1, bid_vol + ask_vol)
             return {
                 "bid_vol": bid_vol,
                 "ask_vol": ask_vol,
                 "imbalance": imbalance,
                 "spread_pct": self._last_spread,
+                "stale": False,
             }
         except Exception as e:
-            logger.debug("Orderbook fetch failed: {}", e)
-            return {"bid_vol": 0, "ask_vol": 0, "imbalance": 0, "spread_pct": 0}
+            # WARNING, not debug. A market-data feed that fails silently for hours is
+            # how a guard built on it dies without anyone noticing -- which is exactly
+            # what happened to the spread reading itself.
+            logger.warning("Orderbook fetch failed: {} — serving last known spread", e)
+            return {
+                "bid_vol": 0.0,
+                "ask_vol": 0.0,
+                "imbalance": 0.0,
+                "spread_pct": self._last_spread,
+                "stale": True,
+            }
 
     def get_ohlcv(self, symbol: str, timeframe: str = "1h", limit: int = 100) -> pd.DataFrame:
         raw = self._retry(self.exchange.fetch_ohlcv, symbol, timeframe, limit=limit, label="fetch_ohlcv")
