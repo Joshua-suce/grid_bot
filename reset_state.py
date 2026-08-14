@@ -107,7 +107,7 @@ def main() -> None:
     args = parser.parse_args()
 
     setup_logging(settings.log_dir, "INFO")
-    state_mgr = StateManager(settings.state_dir, settings.symbol)
+    state_mgr = StateManager(settings.state_dir, settings.symbol, demo=settings.demo_mode)
     path: Path = state_mgr.filepath
 
     if not path.exists():

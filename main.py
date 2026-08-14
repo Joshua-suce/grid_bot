@@ -476,7 +476,7 @@ def run_bot() -> None:
     # session are genuinely dangerous and the grid re-places its own. A POSITION is
     # different: with saved state it is inventory with a ladder to unwind through, and
     # the same rule as AUDIT #32 applies -- do not book a loss to tidy up (AUDIT #37).
-    state_mgr = StateManager(settings.state_dir, settings.symbol)
+    state_mgr = StateManager(settings.state_dir, settings.symbol, demo=settings.demo_mode)
     saved_state = state_mgr.load()
     has_saved_grid = bool(saved_state and "grid" in saved_state)
 

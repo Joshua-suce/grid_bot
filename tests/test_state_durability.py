@@ -109,6 +109,7 @@ def test_a_corrupt_state_file_is_backed_up_not_deleted(tmp_path):
     sm.filepath.write_text("{not json")
 
     assert sm.load() is None
-    backups = list(tmp_path.glob("grid_dogeusdt.corrupt*"))
+    # derived from filepath, not hardcoded -- the filename is account-scoped (#67)
+    backups = list(tmp_path.glob(f"{sm.filepath.stem}.corrupt*"))
     assert backups, "corrupt state was discarded instead of preserved for diagnosis"
     assert backups[0].read_text() == "{not json"

@@ -10,11 +10,41 @@ from loguru import logger
 
 
 class StateManager:
-    def __init__(self, state_dir: str = "state", symbol: str = "BTCUSDT"):
+    """Persisted grid state, scoped to the ACCOUNT it belongs to.
+
+    The filename used to be `grid_{symbol}.json` with no demo/live distinction, so
+    flipping DEMO_MODE and restarting loaded one account's state against the other. The
+    consequences are not subtle (AUDIT #67):
+
+      - order ids from the other exchange, which check_fills reads as vanished orders
+      - hard-stop ratchets anchored to the other account's prices
+      - a PnL reconciler carrying the other account's totals, and a cursor far in the
+        future of the new account's income, so real income before it is skipped forever
+      - `has_saved_grid` True, which tells startup NOT to flatten a pre-existing
+        position it knows nothing about (see AUDIT #37)
+
+    Separate files per mode mean the two can never occupy one another's state.
+    """
+
+    def __init__(self, state_dir: str = "state", symbol: str = "BTCUSDT",
+                 demo: bool = True):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.filepath = self.state_dir / f"grid_{symbol.lower()}.json"
+        self.mode = "demo" if demo else "live"
+        self.filepath = self.state_dir / f"grid_{symbol.lower()}_{self.mode}.json"
         self.consecutive_save_failures = 0
+
+        # A file from before the rename cannot be attributed to either account, so it is
+        # left alone rather than adopted or deleted -- but silence would look like a
+        # clean start when real state exists on disk.
+        legacy = self.state_dir / f"grid_{symbol.lower()}.json"
+        if legacy.exists() and not self.filepath.exists():
+            logger.warning(
+                "LEGACY STATE IGNORED | {} predates per-account state files and cannot be "
+                "attributed to demo or live — starting fresh for {}. Delete it, or rename "
+                "it to {} if you know it belongs to this account",
+                legacy, self.mode, self.filepath.name,
+            )
 
     def save(self, data: dict) -> bool:
         """Atomically persist state. Returns False if it could not be written.
