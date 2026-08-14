@@ -39,9 +39,17 @@ class _Ex:
         self.purposes.append(purpose)
         return {"id": f"new{self._n}"}
 
-    def cancel_order(self, order_id, symbol):
+    def cancel_stop_order(self, order_id, symbol):
+        # Stops are ALGO orders and go through their own endpoint. Routing them through
+        # cancel_order reports success for orders that survive (AUDIT #74).
         self.cancelled.append(order_id)
         return self._cancel_ok
+
+    def cancel_order(self, order_id, symbol):
+        raise AssertionError(
+            f"stop {order_id} was sent to the ordinary cancel endpoint, which answers "
+            "'unknown order' for an algo id and reads as a successful cancel"
+        )
 
 
 def _live(order_id, price, qty):

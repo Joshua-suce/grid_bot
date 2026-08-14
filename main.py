@@ -165,7 +165,11 @@ def reconcile_stop_orders(
 
     for order in unmatched:
         order_id = order.get("id")
-        if order_id and not exchange.cancel_order(order_id, symbol):
+        # cancel_STOP_order, not cancel_order: these are algo orders, and the ordinary
+        # cancel endpoint answers "unknown order" for an algo id, which ccxt raises as
+        # OrderNotFound and cancel_order reports as a successful cancel. Every stale leg
+        # this loop retired therefore survived, silently (AUDIT #74).
+        if order_id and not exchange.cancel_stop_order(order_id, symbol):
             logger.warning("STOP REFRESH | stale stop {} not confirmed cancelled", order_id)
 
     for kind, oqty, oprice in desired:

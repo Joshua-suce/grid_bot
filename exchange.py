@@ -919,6 +919,46 @@ class Exchange:
             logger.warning("Failed to fetch stop orders: {} — status UNKNOWN, not empty", e)
             return None
 
+    def cancel_stop_order(self, order_id: str, symbol: str) -> bool:
+        """Cancel ONE stop/conditional order. True only if it is confirmed gone.
+
+        Stop orders live in Binance's ALGO order space and must be retired through
+        fapiPrivateDeleteAlgoOrder. Sending an algo id to the ordinary cancel endpoint
+        gets "Unknown order sent", ccxt raises OrderNotFound, and cancel_order reads
+        that as "already gone" -- reporting a successful cancel of an order still
+        sitting on the book.
+
+        Measured live on 2026-08-14 22:59:37: the reconciler retired two stale 233-qty
+        legs after the position grew to 1790, logged nothing wrong, and all four stops
+        were still armed sixteen minutes later. Nothing was left naked -- the legs are
+        reduceOnly -- but stale legs accumulate one pair per ratchet step, and
+        _detect_trail_fill infers "the trailing leg fired" from its absence, which an
+        immortal leftover at the same price can mask (AUDIT #74).
+        """
+        raw = symbol.replace("/", "").replace(":USDT", "")
+        try:
+            self.exchange.fapiPrivateDeleteAlgoOrder({"symbol": raw, "algoId": order_id})
+            logger.info("STOP CANCELLED | id={}", order_id)
+            return True
+        except Exception as e:
+            # "Not found" from the ALGO endpoint is real evidence, unlike the same words
+            # from the ordinary one -- but only after checking, because that is the exact
+            # inference this bug was built on.
+            logger.debug("Algo cancel of {} failed ({}) — verifying against the book", order_id, e)
+
+        live = self.get_stop_orders(symbol)
+        if live is None:
+            logger.warning(
+                "STOP CANCEL UNVERIFIED | {} could not be cancelled and the book could "
+                "not be read — treating it as still live", order_id,
+            )
+            return False
+        if not any(str(o.get("id")) == str(order_id) for o in live):
+            logger.debug("Stop {} is gone from the book", order_id)
+            return True
+        logger.warning("STOP CANCEL FAILED | {} is still on the book", order_id)
+        return False
+
     def cancel_all_stop_orders(self, symbol: str) -> int | None:
         """Cancel every stop/conditional (algo) order for the symbol.
 
