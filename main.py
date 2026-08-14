@@ -557,6 +557,10 @@ def run_bot() -> None:
     # agrees with the real account equity trajectory. Read-only — does not
     # affect order placement or fill handling.
     pnl_reconciler = PnLReconciler.from_dict(saved_state.get("pnl_reconciler") if saved_state else None)
+    # Before the sync: a changed PNL_EPOCH has to clear the accumulated totals, or sync()
+    # simply resumes from the old cursor and the operator reads a number they believe
+    # they changed (AUDIT #60).
+    pnl_reconciler.reset_for_epoch(settings.pnl_epoch_ms)
     pnl_reconciler.sync(exchange, settings.symbol)
     # Anchor session PnL before the first order. Everything the bot reported was either
     # the 89-day account lifetime or today, so a fresh start opened by announcing
@@ -564,10 +568,13 @@ def run_bot() -> None:
     # -50.49 day from defects since fixed), not this run, and it reads as starting in
     # the red (AUDIT #59).
     pnl_reconciler.begin_session()
+    # From the reconciler, never from settings: the label has to describe the value that
+    # actually produced the number, or the two can disagree (AUDIT #60).
+    pnl_window = pnl_reconciler.window_label
     logger.info(
-        "PNL RECONCILER READY | session starts at 0.00 | account {}d net={:+.4f} USDT "
+        "PNL RECONCILER READY | session starts at 0.00 | account ({}) net={:+.4f} USDT "
         "(realized={:+.4f} commission={:+.4f} funding={:+.4f})",
-        BOOTSTRAP_LOOKBACK_DAYS,
+        pnl_window,
         pnl_reconciler.net_realized_pnl, pnl_reconciler.realized_pnl,
         pnl_reconciler.commission, pnl_reconciler.funding_fee,
     )
@@ -931,6 +938,7 @@ def run_bot() -> None:
         grid_active=grid.active,
         total_pnl_verified=pnl_reconciler.net_realized_pnl,
                         session_pnl=pnl_reconciler.session_pnl,
+                        pnl_window=pnl_reconciler.window_label,
     )
     _notify_status(notifier, exchange, settings.symbol, price_now, pnl_reconciler)
 
@@ -1192,6 +1200,7 @@ def run_bot() -> None:
                             fill["side"], fill["price"], profit, grid.total_fills, pnl_reconciler.daily_net_pnl,
                             total_pnl_verified=pnl_reconciler.net_realized_pnl,
                         session_pnl=pnl_reconciler.session_pnl,
+                        pnl_window=pnl_reconciler.window_label,
                         )
                         events.fill(
                             symbol=settings.symbol,
@@ -1442,11 +1451,11 @@ def run_bot() -> None:
 
                 logger.info(
                     "PRICE={} | fills={} | gross={:.2f} fees={:.2f} net={:.2f} | session={:+.2f} "
-                    "account_{}d={:+.2f} today={:+.2f} | balance_free={:.2f} total_equity={:.2f} | "
+                    "account({})={:+.2f} today={:+.2f} | balance_free={:.2f} total_equity={:.2f} | "
                     "grid={} | regime={} | spread={:.4f}%",
                     price, grid.total_fills, grid.total_pnl, grid.total_fees,
                     grid.total_pnl - grid.total_fees,
-                    pnl_reconciler.session_pnl, BOOTSTRAP_LOOKBACK_DAYS,
+                    pnl_reconciler.session_pnl, pnl_window,
                     pnl_reconciler.net_realized_pnl, pnl_reconciler.daily_net_pnl,
                     balance, equity,
                     "ON" if grid.active else "OFF",

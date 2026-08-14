@@ -125,6 +125,25 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Reporting ---
+    pnl_epoch: str = Field(
+        default="",
+        description=(
+            "UTC date (YYYY-MM-DD) from which cumulative PnL is reported. Empty means a "
+            "rolling BOOTSTRAP_LOOKBACK_DAYS window.\n"
+            "\n"
+            "The rolling window keeps dragging old history into the headline figure: on "
+            "2026-08-14 it read -29.08, of which -50.49 was a single day (08-08) caused "
+            "by the position-cap and stop-loss defects fixed in #49/#50. That day stays "
+            "in the window until early November, so the bot would report a loss for "
+            "months no matter how well it traded.\n"
+            "\n"
+            "Set this to the date the current code went live and the number means "
+            "something: PnL under the bot as it actually is. Changing it re-bootstraps "
+            "from scratch rather than silently keeping stale totals (AUDIT #60)."
+        ),
+    )
+
     # --- Risk ---
     stop_loss_pct: float = Field(
         default=0.05, gt=0, le=0.15,
@@ -271,6 +290,26 @@ class Settings(BaseSettings):
     # --- Paths ---
     state_dir: str = Field(default="state")
     log_dir: str = Field(default="logs")
+
+    @property
+    def pnl_epoch_ms(self) -> int | None:
+        """PNL_EPOCH as a UTC epoch in milliseconds, or None for the rolling window.
+
+        Raises on a malformed date rather than falling back: silently reverting to the
+        rolling window would leave the operator reading a number they thought they had
+        changed (AUDIT #60).
+        """
+        raw = (self.pnl_epoch or "").strip()
+        if not raw:
+            return None
+        from datetime import datetime, timezone
+        try:
+            day = datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError as e:
+            raise ValueError(
+                f"PNL_EPOCH must be a UTC date as YYYY-MM-DD, got {raw!r}"
+            ) from e
+        return int(day.timestamp() * 1000)
 
     @property
     def exchange_config(self) -> dict:

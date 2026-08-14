@@ -58,6 +58,10 @@ class PnLReconciler:
     # safety net in case a UTC day rolls over without that call landing first.
     daily_net_pnl: float = 0.0
     daily_reset_date: str = ""
+    # UTC millisecond epoch the cumulative totals are measured FROM, or None for the
+    # rolling BOOTSTRAP_LOOKBACK_DAYS window. Persisted so a change to PNL_EPOCH is
+    # detectable on the next start -- see reset_for_epoch (AUDIT #60).
+    epoch_ms: int | None = None
 
     # Net PnL at the moment this PROCESS started trading, so "how is this run doing?"
     # can be answered at all. Deliberately NOT persisted and deliberately not part of
@@ -123,6 +127,7 @@ class PnLReconciler:
             "bootstrapped": self.bootstrapped,
             "daily_net_pnl": self.daily_net_pnl,
             "daily_reset_date": self.daily_reset_date,
+            "epoch_ms": self.epoch_ms,
         }
 
     @classmethod
@@ -138,6 +143,7 @@ class PnLReconciler:
             bootstrapped=bool(d.get("bootstrapped", False)),
             daily_net_pnl=float(d.get("daily_net_pnl", 0.0)),
             daily_reset_date=str(d.get("daily_reset_date", "")),
+            epoch_ms=(int(d["epoch_ms"]) if d.get("epoch_ms") is not None else None),
         )
 
     @staticmethod
@@ -264,9 +270,54 @@ class PnLReconciler:
                 break
         return all_entries
 
+    @property
+    def window_label(self) -> str:
+        """How the cumulative figure should describe its own window.
+
+        Derived from `epoch_ms` -- the value that actually produced the number -- and
+        never from settings. Reading the label off config while the number comes off the
+        reconciler lets the two disagree, which is exactly what happened the first time
+        this was wired: a preview rendered "since 2026-08-14" above the full 89-day
+        total, because the reconciler had never been told about the epoch (AUDIT #60).
+        """
+        if self.epoch_ms is None:
+            return f"{BOOTSTRAP_LOOKBACK_DAYS}d rolling"
+        day = datetime.fromtimestamp(self.epoch_ms / 1000, tz=timezone.utc)
+        return f"since {day.strftime('%Y-%m-%d')}"
+
+    def reset_for_epoch(self, epoch_ms: int | None) -> bool:
+        """Discard accumulated totals if the reporting epoch changed. Returns True if it did.
+
+        Without this, changing PNL_EPOCH does nothing: the saved state carries
+        bootstrapped=True and a last_income_time_ms far in the future of the new epoch,
+        so sync() just resumes and the operator keeps reading totals built from the old
+        window while believing they changed it (AUDIT #60).
+        """
+        if epoch_ms == self.epoch_ms:
+            return False
+        logger.info(
+            "PNL EPOCH CHANGED | {} -> {} — discarding accumulated totals and re-pulling",
+            self.epoch_ms, epoch_ms,
+        )
+        self.realized_pnl = 0.0
+        self.commission = 0.0
+        self.funding_fee = 0.0
+        self.last_income_time_ms = 0
+        self.last_seen_keys = set()
+        self.bootstrapped = False
+        self.epoch_ms = epoch_ms
+        return True
+
     def bootstrap(self, exchange, symbol: str) -> None:
-        """One-time full-history pull, run once on first startup (or if state is lost)."""
-        start_time_ms = int(time.time() * 1000) - BOOTSTRAP_LOOKBACK_DAYS * 86400 * 1000
+        """One-time full-history pull, run once on first startup (or if state is lost).
+
+        Starts at `epoch_ms` when one is configured, otherwise at a rolling
+        BOOTSTRAP_LOOKBACK_DAYS window.
+        """
+        if self.epoch_ms is not None:
+            start_time_ms = self.epoch_ms
+        else:
+            start_time_ms = int(time.time() * 1000) - BOOTSTRAP_LOOKBACK_DAYS * 86400 * 1000
         try:
             entries = self._fetch_paginated(exchange, symbol, start_time_ms)
             applied = self._apply_entries(entries)

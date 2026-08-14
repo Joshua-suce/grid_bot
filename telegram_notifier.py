@@ -13,7 +13,14 @@ except ImportError:
     HAS_HTTPX = False
 
 
-def _pnl_lines(session_pnl: float | None, account_pnl: float | None) -> str:
+_DEFAULT_WINDOW = f"{BOOTSTRAP_LOOKBACK_DAYS}d rolling"
+
+
+def _pnl_lines(
+    session_pnl: float | None,
+    account_pnl: float | None,
+    window_label: str = _DEFAULT_WINDOW,
+) -> str:
     """Render the PnL footer shared by the fill, balance and startup messages.
 
     The account figure used to be sent alone, labelled "Total PnL (verified)". On a
@@ -28,7 +35,7 @@ def _pnl_lines(session_pnl: float | None, account_pnl: float | None) -> str:
     if session_pnl is not None:
         lines.append(f"\nThis run: {session_pnl:+.4f} USDT")
     if account_pnl is not None:
-        lines.append(f"\nAccount ({BOOTSTRAP_LOOKBACK_DAYS}d, all activity): {account_pnl:+.4f} USDT")
+        lines.append(f"\nAccount ({window_label}, all activity): {account_pnl:+.4f} USDT")
     return "".join(lines)
 
 
@@ -147,10 +154,11 @@ class TelegramNotifier:
         self, side: str, price: float, pnl: float, fill_count: int, daily_pnl: float = 0.0,
         total_pnl_verified: float | None = None,
         session_pnl: float | None = None,
+        pnl_window: str | None = None,
     ) -> None:
         emoji = "&#x1f7e2;" if side == "sell" else "&#x1f534;"
         price_str = f"{price:.8f}".rstrip("0").rstrip(".")
-        verified_line = _pnl_lines(session_pnl, total_pnl_verified)
+        verified_line = _pnl_lines(session_pnl, total_pnl_verified, pnl_window or _DEFAULT_WINDOW)
         self.send(
             f"{emoji} <b>FILL #{fill_count}</b>\n"
             f"Side: {side.upper()}\n"
@@ -266,8 +274,9 @@ class TelegramNotifier:
         self, free: float, used: float, total_equity: float, exposure_pct: float,
         total_pnl_verified: float | None = None,
         session_pnl: float | None = None,
+        pnl_window: str | None = None,
     ) -> None:
-        verified_line = _pnl_lines(session_pnl, total_pnl_verified)
+        verified_line = _pnl_lines(session_pnl, total_pnl_verified, pnl_window or _DEFAULT_WINDOW)
         self.send(
             f"&#x1f4b0; <b>BALANCE</b>\n"
             f"Free: {free:.2f} USDT\n"
@@ -339,11 +348,12 @@ class TelegramNotifier:
         regime: str, adx: float, grid_active: bool,
         total_pnl_verified: float | None = None,
         session_pnl: float | None = None,
+        pnl_window: str | None = None,
     ) -> None:
         lo = f"{grid_lower:.8f}".rstrip("0").rstrip(".")
         hi = f"{grid_upper:.8f}".rstrip("0").rstrip(".")
         status = "ACTIVE" if grid_active else "PAUSED (trend)"
-        verified_line = _pnl_lines(session_pnl, total_pnl_verified)
+        verified_line = _pnl_lines(session_pnl, total_pnl_verified, pnl_window or _DEFAULT_WINDOW)
         self.send(
             f"<b>Bot Started</b> | {self._esc(mode)}\n"
             f"Pair: {self._esc(symbol)} @ {price:.6f}\n"
