@@ -40,9 +40,11 @@ class Settings(BaseSettings):
             "  - One side of the ladder must still fit inside MAX_POSITION_PCT, or the "
             "outer rungs can never fill and the book goes permanently one-sided.\n"
             "  - On ISOLATED margin, liquidation sits near 1/leverage minus the "
-            "maintenance rate. At 25x that is ~3.4% against a 3% hard stop -- barely half "
-            "a percent of daylight. This bot neither sets nor reads margin mode, so "
-            "switching the account to isolated would make that live silently (AUDIT #65)."
+            "maintenance rate. At 25x on DOGEUSDT that is ~3.4% against a 3% hard stop -- "
+            "barely half a percent of daylight, and liquidation prices off the MARK, "
+            "which wanders from last. Startup now reads the account's margin mode and "
+            "refuses to trade if the stop does not clear liquidation, instead of finding "
+            "out during a drawdown (AUDIT #69)."
         ),
     )
     grid_count: int = Field(default=15, ge=3, le=100, description="Number of grid levels")

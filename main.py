@@ -431,6 +431,160 @@ def daily_reset_check(
         risk.reset_daily()
 
 
+def verify_account_config(exchange: Exchange, cfg, balance: float) -> list[str]:
+    """Check the EXCHANGE agrees with the assumptions the sizing and stop math make.
+
+    Everything the bot computes about money -- notional per order, margin consumed,
+    how far liquidation sits from the stop -- is derived from config values that the
+    exchange is free to disagree with. Nothing verified that they matched. Measured on
+    this account while writing the check: .env said LEVERAGE=25, the exchange said 5.
+    On demo that difference is a number in a log; on a live account it is a 5x error
+    in every margin figure the bot believes.
+
+    Returns a list of blocking problems -- empty means the account is safe to trade.
+    Read-only: it reports, it does not reconfigure the account (AUDIT #69).
+    """
+    problems: list[str] = []
+    acct = exchange.get_account_config(cfg.symbol)
+    if acct is None:
+        return [
+            "account configuration could not be read, so leverage, margin mode and "
+            "position mode are all unverified — refusing to size orders against "
+            "assumptions nothing confirmed"
+        ]
+
+    logger.info(
+        "ACCOUNT CONFIG | leverage={}x | margin={} | position mode={} | max notional={:,.0f}",
+        acct["leverage"], acct["margin_mode"],
+        "HEDGE (dual-side)" if acct["dual_side"] else "one-way",
+        acct["max_notional"],
+    )
+
+    if acct["leverage"] != cfg.leverage:
+        problems.append(
+            f"leverage mismatch: config says {cfg.leverage}x, the exchange is on "
+            f"{acct['leverage']}x. Order notional is CAPITAL_PER_GRID_USDT x LEVERAGE, so "
+            f"every margin figure would be out by {cfg.leverage / max(1, acct['leverage']):.2g}x"
+        )
+
+    if acct["dual_side"]:
+        problems.append(
+            "the account is in HEDGE (dual-side) position mode. This bot sends no "
+            "positionSide, which Binance rejects outright in hedge mode (-4061), and its "
+            "reduce-only stops assume one net position. Switch the account to One-way mode"
+        )
+
+    # Isolated margin puts liquidation a fixed distance from entry. The stop has to be
+    # comfortably nearer than that, or the position is closed by the exchange at a
+    # liquidation fee instead of by the stop at a maker/taker fee.
+    per_order = cfg.capital_per_grid_usdt * cfg.leverage if cfg.capital_per_grid_usdt > 0 else 0.0
+    one_side = per_order * (cfg.grid_count / 2)
+    if acct["isolated"]:
+        mmr = exchange.get_maint_margin_ratio(cfg.symbol, one_side or 1.0)
+        if mmr is None:
+            problems.append(
+                "the account is on ISOLATED margin and the maintenance-margin rate could "
+                "not be read, so the distance from the stop to liquidation is unknown"
+            )
+        else:
+            liq_distance = 1.0 / cfg.leverage - mmr
+            logger.info(
+                "ISOLATED MARGIN | liquidation ~{:.2%} from entry (1/{}x - {:.2%} maint) "
+                "vs a {:.2%} stop",
+                liq_distance, cfg.leverage, mmr, cfg.stop_loss_pct,
+            )
+            # Liquidation is priced off the MARK price, which wanders from last trade,
+            # so "the stop is 0.1% nearer" is not clearance. Ask for a third.
+            if cfg.stop_loss_pct > liq_distance * 0.75:
+                problems.append(
+                    f"on ISOLATED margin at {cfg.leverage}x, liquidation sits about "
+                    f"{liq_distance:.2%} from entry while STOP_LOSS_PCT is "
+                    f"{cfg.stop_loss_pct:.2%}. The stop needs real daylight beneath it "
+                    f"(mark price differs from last), so either switch the symbol to CROSS "
+                    f"margin, drop LEVERAGE, or tighten STOP_LOSS_PCT below "
+                    f"{liq_distance * 0.75:.2%}"
+                )
+    else:
+        logger.info(
+            "CROSS MARGIN | the whole {:.2f} USDT wallet backs the position, so "
+            "liquidation is far from the {:.2%} stop", balance, cfg.stop_loss_pct,
+        )
+
+    # Every resting order reserves initial margin. The ladder is placed all at once, so
+    # the account has to fund all of it -- not just the rungs that end up filling.
+    if cfg.capital_per_grid_usdt > 0:
+        needed = cfg.capital_per_grid_usdt * cfg.grid_count
+        if balance < needed:
+            problems.append(
+                f"free balance {balance:.2f} USDT cannot fund the ladder: {cfg.grid_count} "
+                f"resting orders reserve {cfg.capital_per_grid_usdt:.2f} each, so "
+                f"{needed:.2f} is the minimum before fees or stops. Fund the account, "
+                f"lower GRID_COUNT, or lower CAPITAL_PER_GRID_USDT"
+            )
+        elif balance < needed * 1.5:
+            logger.warning(
+                "THIN MARGIN | the ladder reserves {:.2f} of {:.2f} free USDT — a "
+                "drawdown could stop new rungs being placed", needed, balance,
+            )
+
+    if acct["max_notional"] and one_side > acct["max_notional"]:
+        problems.append(
+            f"one side of the ladder is {one_side:.2f} USDT but {cfg.leverage}x is only "
+            f"allowed up to {acct['max_notional']:,.0f} on this symbol"
+        )
+
+    # The minimum profitable spacing is built from the CONFIGURED fee rates. If the
+    # account actually pays more, rungs go closer together than a cycle can pay for and
+    # every completed cycle loses the difference -- silently, because the arithmetic all
+    # agrees with itself. Demo and live are not on the same fee schedule.
+    fees = exchange.get_commission_rates(cfg.symbol)
+    if fees is None:
+        logger.warning(
+            "FEE RATES UNVERIFIED | trading on the configured {:.4f}%/{:.4f}% without "
+            "confirming them against the account", cfg.maker_fee_pct, cfg.taker_fee_pct,
+        )
+    else:
+        actual_rt = fees["maker_pct"] * 2
+        config_rt = cfg.maker_fee_pct * 2
+        logger.info(
+            "FEE RATES | account maker={:.4f}% taker={:.4f}% | config maker={:.4f}% "
+            "taker={:.4f}%",
+            fees["maker_pct"], fees["taker_pct"], cfg.maker_fee_pct, cfg.taker_fee_pct,
+        )
+        # Grid cycles are pure maker, so the maker rate is what the spacing floor rides
+        # on. 5% relative tolerance: a rounding difference is not a defect, a fee tier is.
+        if actual_rt > config_rt * 1.05:
+            floor = config_rt * cfg.min_profit_multiplier
+            true_floor = actual_rt * cfg.min_profit_multiplier
+            problems.append(
+                f"the account pays {fees['maker_pct']:.4f}% maker but MAKER_FEE_PCT says "
+                f"{cfg.maker_fee_pct:.4f}%. The minimum profitable spacing is built from "
+                f"that number, so the grid would place rungs {floor:.4f}% apart when they "
+                f"need {true_floor:.4f}%, and every cycle would lose the difference. Set "
+                f"MAKER_FEE_PCT={fees['maker_pct']:.4f} and TAKER_FEE_PCT="
+                f"{fees['taker_pct']:.4f}"
+            )
+        elif fees["taker_pct"] > cfg.taker_fee_pct * 1.05:
+            # Taker only prices forced exits, which no spacing decision depends on -- but
+            # it is the dominant cost in the measured history, so a stale figure makes
+            # every PnL estimate optimistic.
+            logger.warning(
+                "TAKER FEE UNDERSTATED | the account pays {:.4f}% but TAKER_FEE_PCT says "
+                "{:.4f}% — forced exits cost {:.0%} more than the bot's estimates. Set "
+                "TAKER_FEE_PCT={:.4f}",
+                fees["taker_pct"], cfg.taker_fee_pct,
+                fees["taker_pct"] / max(1e-9, cfg.taker_fee_pct) - 1, fees["taker_pct"],
+            )
+        elif actual_rt < config_rt * 0.95:
+            logger.info(
+                "FEES OVERSTATED | the account pays less than configured, so spacing is "
+                "wider than it needs to be. Harmless, but MAKER_FEE_PCT={:.4f} would be "
+                "accurate", fees["maker_pct"],
+            )
+
+    return problems
+
+
 def run_bot() -> None:
     setup_logging(settings.log_dir, "INFO")
     mode = "DEMO (testnet)" if settings.demo_mode else "LIVE"
@@ -450,16 +604,53 @@ def run_bot() -> None:
         settings.telegram_enabled,
     )
 
-    events = EventJournal(settings.log_dir)
+    events = EventJournal(settings.log_dir, demo=settings.demo_mode)
 
     try:
         config = settings.exchange_config
         exchange = Exchange(config, demo=settings.demo_mode)
     except Exception as e:
         logger.error("Failed to connect to exchange: {}", e)
+        # Demo Trading and live are separate accounts with separate keys, so the first
+        # start after flipping DEMO_MODE fails here if the keys were not swapped too.
+        # That reads as a network problem unless someone says otherwise.
+        logger.error(
+            "If DEMO_MODE was just changed: {} mode needs {} API keys — demo keys come "
+            "from demo.binance.com and do not work against the live API (or the reverse). "
+            "A live key also needs Futures trading enabled and this IP whitelisted",
+            mode, "DEMO" if settings.demo_mode else "LIVE",
+        )
         return
 
-    exchange.set_leverage(settings.symbol, settings.leverage)
+    # Every money figure the bot computes is config x exchange-reality. Confirm they
+    # agree before any of it is spent (AUDIT #69).
+    leverage_ok = exchange.set_leverage(settings.symbol, settings.leverage)
+    try:
+        startup_balance = exchange.get_balance()
+    except Exception as e:
+        logger.error("Could not read balance to verify account configuration: {}", e)
+        return
+
+    account_problems = verify_account_config(exchange, settings, startup_balance)
+    if not leverage_ok and not account_problems:
+        # set_leverage failed but the account was already on the right leverage. Nothing
+        # is mis-sized, so this is a note, not a stop.
+        logger.warning(
+            "LEVERAGE CALL FAILED | the account was already on {}x, so sizing is correct, "
+            "but the write path to account settings is not working", settings.leverage,
+        )
+    if account_problems:
+        logger.error("=" * 50)
+        logger.error("ACCOUNT NOT SAFE TO TRADE | {} problem(s) found", len(account_problems))
+        for problem in account_problems:
+            logger.error("  - {}", problem)
+        logger.error("=" * 50)
+        notifier.send(
+            "&#x1f6a8; <b>STARTUP ABORTED</b>\nAccount configuration does not match the "
+            "bot's sizing assumptions:\n"
+            + "\n".join(f"• {p}" for p in account_problems)
+        )
+        return
 
     # Read the state file BEFORE deciding what to do with any open position.
     #
@@ -488,6 +679,45 @@ def run_bot() -> None:
         logger.info(
             "STARTUP | saved grid state found — keeping any open position for the "
             "restored grid to unwind rather than closing it at market"
+        )
+    elif not state_mgr.has_history():
+        # Closing an "orphan" is right after a crash and wrong on a first run. This is
+        # the first time the bot has been pointed at this account and symbol, so any
+        # position here was opened by someone else -- most likely the human, right after
+        # flipping DEMO_MODE. Market-closing it would be the bot's opening act on a live
+        # account: a trade nobody asked for, at whatever the book offers (AUDIT #72).
+        try:
+            pre_existing = [
+                p for p in exchange.get_positions(settings.symbol)
+                if abs(float(p.get("contracts") or p.get("info", {}).get("positionAmt") or 0)) > 0
+            ]
+        except Exception as e:
+            logger.error("Could not check for pre-existing positions ({}) — not starting", e)
+            return
+        if pre_existing:
+            logger.error("=" * 50)
+            logger.error(
+                "PRE-EXISTING POSITION | this is the first {} run for {} and a position is "
+                "already open. The bot did not open it, so it will not close it.",
+                state_mgr.mode.upper(), settings.symbol,
+            )
+            for p in pre_existing:
+                logger.error(
+                    "  - {} {} @ {}", p.get("side"), p.get("contracts"), p.get("entryPrice"),
+                )
+            logger.error(
+                "Close it yourself (py cleanup.py) or let it run, then start the bot."
+            )
+            logger.error("=" * 50)
+            notifier.send(
+                "&#x1f6a8; <b>STARTUP ABORTED</b>\nA position was already open on the first "
+                f"{state_mgr.mode.upper()} run for {settings.symbol}. The bot did not open "
+                "it and will not close it."
+            )
+            return
+        logger.info(
+            "STARTUP | first {} run for {} — no prior state, book is clean",
+            state_mgr.mode, settings.symbol,
         )
     else:
         closed = exchange.close_all_positions(settings.symbol)
@@ -549,7 +779,7 @@ def run_bot() -> None:
     )
 
     grid = None
-    journal = TradeJournal(settings.log_dir)
+    journal = TradeJournal(settings.log_dir, demo=settings.demo_mode)
 
     # PnL reconciler: reports cumulative PnL sourced from Binance's own income
     # ledger (realized PnL + commission + funding) rather than the grid engine's

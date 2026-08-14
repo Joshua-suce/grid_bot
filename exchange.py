@@ -197,12 +197,149 @@ class Exchange:
         self._balance_cache_at[key] = time.time()
         self._balance_cache_time = self._balance_cache_at[key]
 
-    def set_leverage(self, symbol: str, leverage: int) -> None:
+    def set_leverage(self, symbol: str, leverage: int) -> bool:
+        """Set leverage and CONFIRM it from the exchange's own reply.
+
+        This swallowed every failure behind one warning, which is survivable on an
+        account that was already at the right leverage and quietly catastrophic
+        otherwise: with CAPITAL_PER_GRID_USDT sizing, notional per order is
+        margin x LEVERAGE, so the bot's entire margin plan is the CONFIG's leverage
+        while the money is spent at the ACCOUNT's. Measured on this very account:
+        .env said 25, the exchange said 5 (AUDIT #69).
+
+        Failure is real on a live account -- an open position, a bracket that caps the
+        tier, or a key without futures-trading permission all reject it. So the caller
+        gets a bool and startup refuses to trade on a mismatch.
+        """
         try:
-            self.exchange.set_leverage(leverage, symbol)
-            logger.info("Leverage set to {}x for {}", leverage, symbol)
+            resp = self.exchange.set_leverage(leverage, symbol)
         except Exception as e:
-            logger.warning("Could not set leverage: {}", e)
+            logger.error("LEVERAGE NOT SET | {} rejected {}x: {}", symbol, leverage, e)
+            return False
+
+        # Binance echoes the leverage it actually applied. Trust the reply over the
+        # request: a 200 that set something else is the case worth catching.
+        applied = None
+        for blob in (resp, (resp or {}).get("info", {})):
+            if isinstance(blob, dict) and blob.get("leverage") is not None:
+                try:
+                    applied = int(float(blob["leverage"]))
+                    break
+                except (TypeError, ValueError):
+                    pass
+        if applied is not None and applied != leverage:
+            logger.error(
+                "LEVERAGE MISMATCH | asked for {}x, exchange applied {}x", leverage, applied,
+            )
+            return False
+        logger.info("Leverage set to {}x for {}", leverage, symbol)
+        return True
+
+    def get_account_config(self, symbol: str) -> dict | None:
+        """What the EXCHANGE thinks this symbol is set to. None if it cannot be read.
+
+        Read from positionRisk, which reports leverage and margin mode even when the
+        position is flat -- fetch_positions returns nothing at all when flat, and the
+        v3 account endpoint omits symbols with no position.
+        """
+        try:
+            rows = self._retry(
+                self.exchange.fapiPrivateV2GetPositionRisk,
+                {"symbol": symbol.replace("/", "").replace(":USDT", "")},
+                label="fetch_position_risk",
+            )
+        except Exception as e:
+            logger.warning("Could not read account config for {}: {}", symbol, e)
+            return None
+
+        row = rows[0] if rows else None
+        if not row:
+            logger.warning("Account config for {} came back empty", symbol)
+            return None
+
+        try:
+            dual = self._retry(
+                self.exchange.fapiPrivateGetPositionSideDual, label="fetch_position_side",
+            )
+            dual_side = bool(dual.get("dualSidePosition"))
+        except Exception as e:
+            logger.warning("Could not read position mode: {}", e)
+            return None
+
+        try:
+            leverage = int(float(row.get("leverage")))
+        except (TypeError, ValueError):
+            logger.warning("Account config for {} had no readable leverage", symbol)
+            return None
+
+        return {
+            "leverage": leverage,
+            "margin_mode": str(row.get("marginType", "")).lower(),
+            "isolated": str(row.get("marginType", "")).lower() == "isolated",
+            "dual_side": dual_side,
+            "max_notional": float(row.get("maxNotionalValue") or 0.0),
+        }
+
+    def get_commission_rates(self, symbol: str) -> dict | None:
+        """The account's ACTUAL maker/taker rates, as percentages. None if unreadable.
+
+        MAKER_FEE_PCT/TAKER_FEE_PCT are config, and the minimum profitable spacing is
+        built from them -- so if the account pays more than the config says, the grid
+        places rungs closer together than a cycle can pay for, and every completed cycle
+        quietly loses the difference. Demo and live are not on the same fee schedule
+        (AUDIT #69).
+        """
+        try:
+            data = self._retry(
+                self.exchange.fapiPrivateGetCommissionRate,
+                {"symbol": symbol.replace("/", "").replace(":USDT", "")},
+                label="fetch_commission_rate",
+            )
+        except Exception as e:
+            logger.warning("Could not read commission rates for {}: {}", symbol, e)
+            return None
+        try:
+            return {
+                "maker_pct": float(data["makerCommissionRate"]) * 100,
+                "taker_pct": float(data["takerCommissionRate"]) * 100,
+            }
+        except (KeyError, TypeError, ValueError):
+            logger.warning("Commission rates for {} came back unparseable", symbol)
+            return None
+
+    def get_maint_margin_ratio(self, symbol: str, notional: float) -> float | None:
+        """Maintenance margin rate for `notional`, from the symbol's leverage brackets.
+
+        This is what sets the distance to liquidation on isolated margin, and it is
+        tiered -- DOGEUSDT is 0.6% under 5k notional and 1.0% by 25k. Guessing a
+        constant would misstate exactly the number the stop has to clear.
+        """
+        try:
+            data = self._retry(
+                self.exchange.fapiPrivateGetLeverageBracket,
+                {"symbol": symbol.replace("/", "").replace(":USDT", "")},
+                label="fetch_leverage_bracket",
+            )
+        except Exception as e:
+            logger.warning("Could not read leverage brackets for {}: {}", symbol, e)
+            return None
+
+        entry = data[0] if isinstance(data, list) and data else data
+        parsed = []
+        for b in (entry or {}).get("brackets") or []:
+            try:
+                parsed.append((float(b["notionalFloor"]), float(b["notionalCap"]),
+                               float(b["maintMarginRatio"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not parsed:
+            return None
+        for floor, cap, rate in parsed:
+            if floor <= notional <= cap:
+                return rate
+        # Past every published cap, the widest bracket is the binding one. Its rate is
+        # the highest, so this errs toward a nearer liquidation, never a rosier one.
+        return max(parsed, key=lambda t: t[1])[2]
 
     @staticmethod
     def _is_timestamp_error(e: Exception) -> bool:

@@ -1,4 +1,5 @@
 import pytest
+from loguru import logger
 
 import main as main_module
 from main import (
@@ -212,14 +213,37 @@ def test_build_scale_out_orders_clamps_scale_pct():
 
 class DirtyBookExchange:
     """Exchange stub that leaves stale orders open after cleanup, forcing the
-    startup dirty-book abort path to trigger."""
+    startup dirty-book abort path to trigger.
+
+    It has to satisfy every check that now runs BEFORE the cleanup verification --
+    account config, balance, positions (AUDIT #69/#72). Omitting them does not make the
+    test fail; it makes it abort earlier and pass without ever reaching the dirty book,
+    which is the same false pass the account checks exist to prevent.
+    """
 
     def __init__(self, config, demo=False):
         self.config = config
         self.demo = demo
 
     def set_leverage(self, symbol, leverage):
-        pass
+        return True
+
+    def get_balance(self, asset="USDT"):
+        return 4931.09
+
+    def get_account_config(self, symbol):
+        return {"leverage": main_module.settings.leverage, "margin_mode": "cross",
+                "isolated": False, "dual_side": False, "max_notional": 600000.0}
+
+    def get_maint_margin_ratio(self, symbol, notional):
+        return 0.006
+
+    def get_commission_rates(self, symbol):
+        return {"maker_pct": main_module.settings.maker_fee_pct,
+                "taker_pct": main_module.settings.taker_fee_pct}
+
+    def get_positions(self, symbol):
+        return []
 
     def cancel_everything(self, symbol):
         return 0
@@ -231,13 +255,93 @@ class DirtyBookExchange:
         return [{"id": "stale-1"}, {"id": "stale-2"}]
 
 
-def test_run_bot_aborts_on_dirty_book(monkeypatch):
-    """Startup must NOT continue past the cleanup check when the book is still dirty;
-    if it did, the stub below (no get_ohlcv) would raise and fail this test."""
+def _run_and_capture(monkeypatch, exchange_cls, state_dir):
+    """Drive run_bot() against a stub and return everything it logged.
+
+    state_dir is pinned to a tmp path so the first-run/orphan branch depends on the
+    test, not on whatever happens to be sitting in the real state/ directory."""
+    monkeypatch.setattr(main_module, "Exchange", exchange_cls)
+    monkeypatch.setattr(main_module.settings, "telegram_enabled", False)
+    monkeypatch.setattr(main_module.settings, "state_dir", str(state_dir))
+    monkeypatch.setattr(main_module, "setup_logging", lambda *a, **k: None)
+
+    sink = []
+    handle = logger.add(lambda m: sink.append(str(m)), level="INFO")
+    try:
+        main_module.run_bot()
+    finally:
+        logger.remove(handle)
+    return "".join(sink)
+
+
+class WrongLeverageExchange(DirtyBookExchange):
+    """The measured case: .env says 25x, the exchange is on 5x."""
+
+    def get_account_config(self, symbol):
+        return {"leverage": 5, "margin_mode": "cross", "isolated": False,
+                "dual_side": False, "max_notional": 4800000.0}
+
+
+def test_run_bot_refuses_to_trade_a_misconfigured_account(monkeypatch, tmp_path):
+    """verify_account_config being correct is worth nothing if run_bot ignores it.
+
+    Nothing covered the WIRING: the gate could be commented out and every account-config
+    test still passed, because they all call the function directly (AUDIT #69)."""
+    logs = _run_and_capture(monkeypatch, WrongLeverageExchange, tmp_path)
+
+    assert "ACCOUNT NOT SAFE TO TRADE" in logs
+    assert "leverage mismatch" in logs
+    assert "still open after cleanup" not in logs, "startup continued past the gate"
+
+
+class PreExistingPositionExchange(DirtyBookExchange):
+    """A position that is already open the first time the bot sees this account."""
+
+    def get_positions(self, symbol):
+        return [{"side": "long", "contracts": 8215.0, "entryPrice": 0.06945,
+                 "info": {"positionAmt": "8215"}}]
+
+
+def test_run_bot_will_not_close_a_position_it_did_not_open(monkeypatch, tmp_path):
+    """First run against an account, so any position belongs to whoever opened it --
+    most likely the human, right after flipping DEMO_MODE (AUDIT #72)."""
+    logs = _run_and_capture(monkeypatch, PreExistingPositionExchange, tmp_path)
+
+    assert "PRE-EXISTING POSITION" in logs
+    assert "still open after cleanup" not in logs, "startup continued past the guard"
+
+
+def test_an_orphan_from_a_previous_session_is_still_closed(monkeypatch, tmp_path):
+    """The guard must not disarm ordinary crash recovery: with proof the bot ran here
+    before, an open position IS an orphan and closing it is the documented behaviour."""
+    (tmp_path / f"grid_{main_module.settings.symbol.lower()}_demo.bak.1786498297").write_text("{}")
+
+    logs = _run_and_capture(monkeypatch, PreExistingPositionExchange, tmp_path)
+
+    assert "PRE-EXISTING POSITION" not in logs
+    assert "still open after cleanup" in logs, "it did not reach the normal cleanup path"
+
+
+def test_run_bot_aborts_on_dirty_book(monkeypatch, caplog):
+    """Startup must NOT continue past the cleanup check when the book is still dirty.
+
+    Asserting on the reason, not just on 'it returned': every abort path returns, so a
+    bare call proves only that something stopped it -- not that the dirty book did."""
     monkeypatch.setattr(main_module, "Exchange", DirtyBookExchange)
     monkeypatch.setattr(main_module.settings, "telegram_enabled", False)
     monkeypatch.setattr(main_module, "setup_logging", lambda *a, **k: None)
-    main_module.run_bot()
+
+    sink = []
+    handle = logger.add(lambda m: sink.append(str(m)), level="INFO")
+    try:
+        main_module.run_bot()
+    finally:
+        logger.remove(handle)
+
+    logs = "".join(sink)
+    assert "still open after cleanup" in logs, (
+        "startup aborted somewhere else — this test no longer covers the dirty book"
+    )
 
 
 def test_build_scale_out_orders_returns_nothing_when_no_stop_is_available():
