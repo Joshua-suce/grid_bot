@@ -59,10 +59,39 @@ class PnLReconciler:
     daily_net_pnl: float = 0.0
     daily_reset_date: str = ""
 
+    # Net PnL at the moment this PROCESS started trading, so "how is this run doing?"
+    # can be answered at all. Deliberately NOT persisted and deliberately not part of
+    # to_dict: it means "since this process started", so a restart must reset it.
+    #
+    # Without it every figure the bot reports is either the 89-day account lifetime or
+    # today. On a "Bot Started" message the lifetime number reads as though the bot
+    # begins in the red -- it opened at -30.20, which is genuine but is 89 days of
+    # account history, including a -50.49 day caused by defects that are now fixed.
+    # There was no way to see whether the bot is making money NOW (AUDIT #59).
+    session_start_net: float | None = field(default=None, repr=False)
+
     @property
     def net_realized_pnl(self) -> float:
-        """Realized PnL net of commissions and funding — the true cumulative PnL."""
+        """Realized PnL net of commissions and funding — the true cumulative PnL.
+
+        This is the ACCOUNT's figure over BOOTSTRAP_LOOKBACK_DAYS, not the bot's, and
+        not this run's. It includes anything else that touched the symbol.
+        """
         return self.realized_pnl + self.commission + self.funding_fee
+
+    def begin_session(self) -> None:
+        """Anchor session PnL to wherever the account stands right now.
+
+        Called once after bootstrap/restore, before the first order goes out.
+        """
+        self.session_start_net = self.net_realized_pnl
+
+    @property
+    def session_pnl(self) -> float:
+        """PnL since this process started. 0.0 until begin_session() anchors it."""
+        if self.session_start_net is None:
+            return 0.0
+        return self.net_realized_pnl - self.session_start_net
 
     def seconds_since_sync(self) -> float:
         """Age of the numbers on this object. `inf` if it has never synced."""

@@ -4,11 +4,32 @@ import time
 
 from loguru import logger
 
+from pnl_tracker import BOOTSTRAP_LOOKBACK_DAYS
+
 try:
     import httpx
     HAS_HTTPX = True
 except ImportError:
     HAS_HTTPX = False
+
+
+def _pnl_lines(session_pnl: float | None, account_pnl: float | None) -> str:
+    """Render the PnL footer shared by the fill, balance and startup messages.
+
+    The account figure used to be sent alone, labelled "Total PnL (verified)". On a
+    "Bot Started" message that reads as though the bot begins in the red: it opened at
+    -30.20, which is true but is 89 days of ACCOUNT history -- including a -50.49 day
+    caused by defects since fixed -- and says nothing about how this run is doing.
+
+    Session first, because it is the number that answers "is it working now?", and the
+    account figure explicitly labelled as the account's, not the bot's (AUDIT #59).
+    """
+    lines = []
+    if session_pnl is not None:
+        lines.append(f"\nThis run: {session_pnl:+.4f} USDT")
+    if account_pnl is not None:
+        lines.append(f"\nAccount ({BOOTSTRAP_LOOKBACK_DAYS}d, all activity): {account_pnl:+.4f} USDT")
+    return "".join(lines)
 
 
 class TelegramNotifier:
@@ -125,10 +146,11 @@ class TelegramNotifier:
     def on_fill(
         self, side: str, price: float, pnl: float, fill_count: int, daily_pnl: float = 0.0,
         total_pnl_verified: float | None = None,
+        session_pnl: float | None = None,
     ) -> None:
         emoji = "&#x1f7e2;" if side == "sell" else "&#x1f534;"
         price_str = f"{price:.8f}".rstrip("0").rstrip(".")
-        verified_line = f"\nTotal PnL (verified): {total_pnl_verified:.4f} USDT" if total_pnl_verified is not None else ""
+        verified_line = _pnl_lines(session_pnl, total_pnl_verified)
         self.send(
             f"{emoji} <b>FILL #{fill_count}</b>\n"
             f"Side: {side.upper()}\n"
@@ -243,8 +265,9 @@ class TelegramNotifier:
     def on_balance_update(
         self, free: float, used: float, total_equity: float, exposure_pct: float,
         total_pnl_verified: float | None = None,
+        session_pnl: float | None = None,
     ) -> None:
-        verified_line = f"\nTotal PnL (verified): {total_pnl_verified:.4f} USDT" if total_pnl_verified is not None else ""
+        verified_line = _pnl_lines(session_pnl, total_pnl_verified)
         self.send(
             f"&#x1f4b0; <b>BALANCE</b>\n"
             f"Free: {free:.2f} USDT\n"
@@ -315,11 +338,12 @@ class TelegramNotifier:
         balance_free: float, equity: float, leverage: int,
         regime: str, adx: float, grid_active: bool,
         total_pnl_verified: float | None = None,
+        session_pnl: float | None = None,
     ) -> None:
         lo = f"{grid_lower:.8f}".rstrip("0").rstrip(".")
         hi = f"{grid_upper:.8f}".rstrip("0").rstrip(".")
         status = "ACTIVE" if grid_active else "PAUSED (trend)"
-        verified_line = f"\nTotal PnL (verified): {total_pnl_verified:.4f} USDT" if total_pnl_verified is not None else ""
+        verified_line = _pnl_lines(session_pnl, total_pnl_verified)
         self.send(
             f"<b>Bot Started</b> | {self._esc(mode)}\n"
             f"Pair: {self._esc(symbol)} @ {price:.6f}\n"

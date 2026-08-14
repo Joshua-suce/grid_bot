@@ -18,7 +18,7 @@ from state import StateManager
 from telegram_notifier import TelegramNotifier
 from trade_journal import TradeJournal
 from event_journal import EventJournal
-from pnl_tracker import PnLReconciler
+from pnl_tracker import BOOTSTRAP_LOOKBACK_DAYS, PnLReconciler
 from router import StrategyRouter
 from signals import SignalGenerator
 from trend_follower import TrendFollower
@@ -401,7 +401,11 @@ def _notify_status(
         exposure_usdt = sum(p["qty"] * price for p in pos_details)
         exposure_pct = exposure_usdt / equity
     total_pnl_verified = pnl_reconciler.net_realized_pnl if pnl_reconciler is not None else None
-    notifier.on_balance_update(balance_info["free"], balance_info["used"], equity, exposure_pct, total_pnl_verified)
+    session_pnl = pnl_reconciler.session_pnl if pnl_reconciler is not None else None
+    notifier.on_balance_update(
+        balance_info["free"], balance_info["used"], equity, exposure_pct,
+        total_pnl_verified, session_pnl,
+    )
 
 
 def daily_reset_check(
@@ -554,8 +558,16 @@ def run_bot() -> None:
     # affect order placement or fill handling.
     pnl_reconciler = PnLReconciler.from_dict(saved_state.get("pnl_reconciler") if saved_state else None)
     pnl_reconciler.sync(exchange, settings.symbol)
+    # Anchor session PnL before the first order. Everything the bot reported was either
+    # the 89-day account lifetime or today, so a fresh start opened by announcing
+    # "Total PnL (verified): -30.20" -- accurate, but it is account history (including a
+    # -50.49 day from defects since fixed), not this run, and it reads as starting in
+    # the red (AUDIT #59).
+    pnl_reconciler.begin_session()
     logger.info(
-        "PNL RECONCILER READY | net_realized_pnl={:.4f} USDT (realized={:.4f} commission={:.4f} funding={:.4f})",
+        "PNL RECONCILER READY | session starts at 0.00 | account {}d net={:+.4f} USDT "
+        "(realized={:+.4f} commission={:+.4f} funding={:+.4f})",
+        BOOTSTRAP_LOOKBACK_DAYS,
         pnl_reconciler.net_realized_pnl, pnl_reconciler.realized_pnl,
         pnl_reconciler.commission, pnl_reconciler.funding_fee,
     )
@@ -918,6 +930,7 @@ def run_bot() -> None:
         adx=trend.adx_value,
         grid_active=grid.active,
         total_pnl_verified=pnl_reconciler.net_realized_pnl,
+                        session_pnl=pnl_reconciler.session_pnl,
     )
     _notify_status(notifier, exchange, settings.symbol, price_now, pnl_reconciler)
 
@@ -1178,6 +1191,7 @@ def run_bot() -> None:
                         notifier.on_fill(
                             fill["side"], fill["price"], profit, grid.total_fills, pnl_reconciler.daily_net_pnl,
                             total_pnl_verified=pnl_reconciler.net_realized_pnl,
+                        session_pnl=pnl_reconciler.session_pnl,
                         )
                         events.fill(
                             symbol=settings.symbol,
@@ -1427,9 +1441,12 @@ def run_bot() -> None:
                 state_mgr.save(state_data)
 
                 logger.info(
-                    "PRICE={} | fills={} | gross={:.2f} fees={:.2f} net={:.2f} | verified_net={:.2f} verified_daily={:.2f} | balance_free={:.2f} total_equity={:.2f} | grid={} | regime={} | spread={:.4f}%",
+                    "PRICE={} | fills={} | gross={:.2f} fees={:.2f} net={:.2f} | session={:+.2f} "
+                    "account_{}d={:+.2f} today={:+.2f} | balance_free={:.2f} total_equity={:.2f} | "
+                    "grid={} | regime={} | spread={:.4f}%",
                     price, grid.total_fills, grid.total_pnl, grid.total_fees,
                     grid.total_pnl - grid.total_fees,
+                    pnl_reconciler.session_pnl, BOOTSTRAP_LOOKBACK_DAYS,
                     pnl_reconciler.net_realized_pnl, pnl_reconciler.daily_net_pnl,
                     balance, equity,
                     "ON" if grid.active else "OFF",
