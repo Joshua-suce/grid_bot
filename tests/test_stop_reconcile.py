@@ -25,16 +25,18 @@ class _Ex:
 
     def __init__(self, place_fails=(), cancel_ok=True):
         self.placed: list[tuple] = []
+        self.purposes: list[str] = []
         self.cancelled: list[str] = []
         self._place_fails = set(place_fails)
         self._cancel_ok = cancel_ok
         self._n = 0
 
-    def place_stop_market(self, symbol, side, amount, stop_price):
+    def place_stop_market(self, symbol, side, amount, stop_price, purpose="stop_hard"):
         if round(float(stop_price), 8) in {round(float(p), 8) for p in self._place_fails}:
             raise RuntimeError(f"exchange rejected stop @ {stop_price}")
         self._n += 1
         self.placed.append((side, float(amount), float(stop_price)))
+        self.purposes.append(purpose)
         return {"id": f"new{self._n}"}
 
     def cancel_order(self, order_id, symbol):

@@ -54,6 +54,46 @@ class CircuitBreaker:
 
 MAX_OPEN_ORDERS = 250
 
+# Two-character clientOrderId prefixes identifying WHY an order was placed. Binance
+# echoes clientOrderId on every order, so joining userTrades -> orders -> prefix
+# attributes each realized PnL to the mechanism responsible, retroactively and from
+# exchange data alone. See scripts/attribute_pnl.py (AUDIT #56).
+PURPOSE_TAGS = {
+    "grid_entry": "ge",     # a ladder level opening exposure
+    "grid_exit": "gx",      # the replacement leg closing a cycle
+    "unwind": "uw",         # _unwind_position_through_grid, reduce-only through the grid
+    "reconcile": "rc",      # reconcile_positions hedging or closing a drifted position
+    "stop_trail": "st",     # trailing scale-out leg
+    "stop_hard": "sh",      # static hard stop
+    "emergency": "em",      # kill switch / shutdown close
+    "other": "gg",
+}
+_VALID_TAGS = set(PURPOSE_TAGS.values())
+
+# The tag is separated from the random part by "_". Without it the scheme is ambiguous
+# against the previous "g" + 31 hex-char format: any legacy id whose second character
+# happened to be an 'e' decodes as the "ge" (grid_entry) tag. That is 1 in 16 of them,
+# and the first attribution report duly mis-labelled 80 of 1480 legacy executions.
+# Underscore is not a hex digit and is legal in a Binance clientOrderId.
+PURPOSE_SEP = "_"
+
+
+def _purpose_tag(purpose: str) -> str:
+    """Accept either a purpose name or an already-resolved two-char tag."""
+    if purpose in PURPOSE_TAGS:
+        return PURPOSE_TAGS[purpose] + PURPOSE_SEP
+    if purpose in _VALID_TAGS:
+        return purpose + PURPOSE_SEP
+    return PURPOSE_TAGS["other"] + PURPOSE_SEP
+
+
+def purpose_of_client_order_id(client_order_id: str) -> str:
+    """Decode a clientOrderId back to its purpose name, or 'untagged'."""
+    cid = str(client_order_id or "")
+    if len(cid) > 2 and cid[2] == PURPOSE_SEP and cid[:2] in _VALID_TAGS:
+        return {v: k for k, v in PURPOSE_TAGS.items()}[cid[:2]]
+    return "untagged"
+
 
 class Exchange:
     def __init__(self, config: dict, demo: bool = False, max_retries: int = 3, retry_delay: float = 5.0) -> None:
@@ -403,9 +443,16 @@ class Exchange:
 
     def place_limit_order(
         self, symbol: str, side: str, price: float, amount: float, max_attempts: int = 3, params: dict | None = None,
-        post_only: bool = True, allow_taker_fallback: bool = False,
+        post_only: bool = True, allow_taker_fallback: bool = False, purpose: str = "gg",
     ) -> dict[str, Any]:
         """Place a limit order.
+
+        `purpose` is a two-character tag stamped into the clientOrderId (see PURPOSE_TAGS)
+        so every execution can be attributed, from exchange data alone, to the mechanism
+        that caused it. Without it the income ledger is a flat list of numbers: 30 days of
+        it showed maker fills netting +98.74 and taker fills -132.04, and there was no way
+        to tell which taker fills were stop-outs, which were reconcile closes and which
+        were crossed unwinds -- so no way to know what to fix (AUDIT #56).
 
         Normalizes common parameter names and precedence:
         - If 'postOnly' or 'post_only' is present inside params, that value overrides the post_only argument.
@@ -426,7 +473,14 @@ class Exchange:
         Returns the exchange order dict.
         """
         last_err = None
-        client_order_id = f"g{uuid.uuid4().hex[:31]}"
+        # `purpose` may also arrive inside params. Callers reach this method through a
+        # dozen test doubles whose signatures accept params but not extra keyword args,
+        # so params is the one channel that works everywhere. It is popped before the
+        # dict is forwarded -- ccxt would reject the unknown key.
+        if params and "purpose" in params:
+            params = dict(params)
+            purpose = params.pop("purpose")
+        client_order_id = f"{_purpose_tag(purpose)}{uuid.uuid4().hex[:29]}"
         for attempt in range(1, max_attempts + 1):
             try:
                 # Merge and normalize params: allow callers to pass post-only via either the post_only
@@ -588,18 +642,35 @@ class Exchange:
                 logger.debug("fetch_order {} failed: {}", order_id, e)
                 return None
 
-    def close_position(self, symbol: str, side: str, amount: float, max_attempts: int | None = None) -> dict:
+    def close_position(
+        self, symbol: str, side: str, amount: float, max_attempts: int | None = None,
+        purpose: str = "reconcile",
+    ) -> dict:
+        """Market-close a position. Always a TAKER fill, and taker fills are where this
+        bot loses its money -- 30 days of ledger put maker at +98.74 and taker at
+        -132.04 -- so the order is tagged with why it happened (AUDIT #56)."""
         close_side = "sell" if side == "long" else "buy"
         order = self._retry(
             self.exchange.create_market_order, symbol, close_side, amount,
+            {"newClientOrderId": f"{_purpose_tag(purpose)}{uuid.uuid4().hex[:29]}"},
             label="close_position", max_attempts=max_attempts,
         )
-        logger.info("POSITION CLOSED | {} {} {}", close_side.upper(), amount, symbol)
+        logger.info("POSITION CLOSED | {} {} {} ({})", close_side.upper(), amount, symbol, purpose)
         return order
 
-    def place_stop_market(self, symbol: str, side: str, amount: float, stop_price: float) -> dict:
-        """Place a stop-market order (e.g. stop-loss to close a long position)."""
-        params = {"stopPrice": stop_price, "reduceOnly": True}
+    def place_stop_market(
+        self, symbol: str, side: str, amount: float, stop_price: float, purpose: str = "stop_hard",
+    ) -> dict:
+        """Place a stop-market order (e.g. stop-loss to close a long position).
+
+        Tagged like limit orders so a stop-out is distinguishable from every other taker
+        close in the ledger afterwards (AUDIT #56).
+        """
+        params = {
+            "stopPrice": stop_price,
+            "reduceOnly": True,
+            "newClientOrderId": f"{_purpose_tag(purpose)}{uuid.uuid4().hex[:29]}",
+        }
         order = self._retry(
             self.exchange.create_order, symbol, "stop_market", side, amount, None, params,
             label="stop_market",

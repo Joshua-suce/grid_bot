@@ -172,7 +172,10 @@ def reconcile_stop_orders(
         if kind in kept:
             continue
         try:
-            placed = exchange.place_stop_market(symbol, close_side, oqty, oprice)
+            placed = exchange.place_stop_market(
+                symbol, close_side, oqty, oprice,
+                purpose="stop_trail" if kind == "trail" else "stop_hard",
+            )
             kept[kind] = {"id": placed["id"], "side": close_side, "qty": oqty, "price": oprice}
             logger.info(
                 "STOP-LOSS ORDER PLACED | kind={} side={} qty={} @ {}",

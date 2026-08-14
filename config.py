@@ -106,14 +106,22 @@ class Settings(BaseSettings):
         description="Taker fee as percent (0.04% = 0.0004)",
     )
     taker_fill_share_pct: float = Field(
-        default=11.8, ge=0.0, le=100.0,
+        default=5.0, ge=0.0, le=100.0,
         description=(
-            "Share of fill volume that actually pays the TAKER rate, as a percent. "
-            "Every profitability gate and break-even price is computed from a blend of "
-            "the maker and taker rates weighted by this. It is not zero and cannot be: "
-            "reduce-only exits are placed postOnly=False by design, and stop-losses "
-            "always cross. Measured at 11.8% against the Binance income ledger over 15 "
-            "days; re-measure with analyze_performance rather than assuming (AUDIT #51)."
+            "Share of a GRID CYCLE's fill volume that pays the TAKER rate, as a percent. "
+            "Every level-profitability gate and break-even price blends the maker and "
+            "taker rates by this weight.\n"
+            "\n"
+            "Measured over 30 days of userTrades, split by the maker flag:\n"
+            "  maker fills  106,398 notional, 21.280 commission -> 0.0200%/side exactly\n"
+            "  taker fills   62,948 notional, 25.179 commission -> 0.0400%/side exactly\n"
+            "\n"
+            "So grid cycles pay PURE MAKER. Taker is 37.2% of all traded notional, but "
+            "every bit of it is forced exits -- stop-markets, reconcile closes, crossed "
+            "unwinds -- not grid cycles. Do NOT put 37.2 here: it would charge ordinary "
+            "levels for stop-outs and reject levels that are genuinely profitable. The "
+            "5% default is a small buffer for reduce-only exits, which are placed "
+            "postOnly=False and can cross (AUDIT #51, corrected in #56)."
         ),
     )
 

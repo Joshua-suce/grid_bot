@@ -832,7 +832,10 @@ class GridEngine:
             )
             return False
         try:
-            order = self.exchange.place_limit_order(self.symbol, level.side, level.price, float(quantity), max_attempts=1)
+            order = self.exchange.place_limit_order(
+                self.symbol, level.side, level.price, float(quantity), max_attempts=1,
+                params={"purpose": "grid_entry"},
+            )
             if "id" not in order:
                 raise ValueError("Order response missing 'id'")
             level.order_id = order["id"]
@@ -1041,7 +1044,7 @@ class GridEngine:
                 # long, so covering a SHORT went out as a plain buy: if the position had
                 # already closed between the read and the order, that opens a fresh
                 # long of the same size instead of closing anything (AUDIT #41).
-                params = {"reduceOnly": True, "postOnly": False}
+                params = {"reduceOnly": True, "postOnly": False, "purpose": "reconcile"}
                 order = self.exchange.place_limit_order(self.symbol, hedge_side, hedge_price, float(qty), params=params)
                 if "id" not in order:
                     raise ValueError("Order response missing 'id'")
@@ -1091,7 +1094,7 @@ class GridEngine:
             if float(qty) <= 0:
                 continue
             try:
-                params = {"reduceOnly": True, "postOnly": False}
+                params = {"reduceOnly": True, "postOnly": False, "purpose": "reconcile"}
                 order = self.exchange.place_limit_order(self.symbol, "sell", level.price, float(qty), params=params)
                 if "id" not in order:
                     raise ValueError("Order response missing 'id'")
@@ -1186,7 +1189,7 @@ class GridEngine:
                             qty, level.price, MIN_NOTIONAL_USDT,
                         )
                         continue
-                    params = {"reduceOnly": True, "postOnly": False}
+                    params = {"reduceOnly": True, "postOnly": False, "purpose": "unwind"}
                     order = self.exchange.place_limit_order(self.symbol, exit_side, level.price, float(qty), params=params)
                     if "id" not in order:
                         raise ValueError("Order response missing 'id'")
@@ -1515,6 +1518,11 @@ class GridEngine:
                 level.status = "pending"
                 return fill_record
             level.quantity = float(quantity)
+            # The counter-leg of a cycle: reduce-only when it closes a position, plain
+            # when it re-opens the other side of the ladder. Tagged either way so the
+            # ledger can separate cycle economics from forced exits (AUDIT #56).
+            params = dict(params or {})
+            params["purpose"] = "grid_exit" if params.get("reduceOnly") else "grid_entry"
             order = self.exchange.place_limit_order(self.symbol, new_side, new_price, float(quantity), params=params)
             if "id" not in order:
                 raise ValueError("Order response missing 'id'")
