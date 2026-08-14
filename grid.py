@@ -1738,6 +1738,26 @@ class GridEngine:
         else:
             logger.warning("GRID NOT ACTIVATED | no orders could be placed or restored")
 
+    def _has_open_position(self) -> bool:
+        """Is there a live position that would be left unprotected by cancelling stops?
+
+        Asks the exchange, falling back to the last figures set_position_limit saw. On
+        an unreadable book it answers True: assuming a position exists costs a few
+        orphan stop orders, assuming none exists costs an unhedged position (AUDIT #65).
+        """
+        try:
+            for pos in self.exchange.get_positions(self.symbol):
+                if abs(float(pos.get("contracts", 0) or 0)) > 0:
+                    return True
+            return False
+        except Exception as e:
+            cached = self._net_long_qty > 0 or self._net_short_qty > 0
+            logger.warning(
+                "POSITION CHECK FAILED | {} — assuming {} so stops are not cancelled "
+                "out from under a live position", e, "a position" if cached else "none",
+            )
+            return True
+
     def emergency_stop(self, reason: str = "emergency") -> None:
         """Cancel everything. `reason` only picks the log level.
 
@@ -1746,11 +1766,31 @@ class GridEngine:
         red EMERGENCY STOP lines and looked like a crash. Real faults have to stand out
         from routine ones or the log stops being readable (AUDIT #35).
         """
+        # A position that outlives the bot must keep its stops. cancel_everything takes
+        # the algo orders too, so every shutdown used to strand an unprotected position:
+        # pause/shutdown deliberately does not flatten (Strategy.pause, AUDIT #37), the
+        # stops were cancelled anyway, and the position then rode naked for as long as
+        # the bot stayed down. Found live -- a 2522 DOGE short sat unhedged after a clean
+        # Ctrl+C, and an 8215 DOGE long before it.
+        #
+        # Grid orders still go: they are this process's working state and would be
+        # duplicated on restart. Stops are not working state, they are protection, and
+        # #54's reconciler adopts live stop legs on restart rather than re-placing them
+        # (AUDIT #65).
+        holding = self._has_open_position()
         if reason == "shutdown":
-            logger.info("SHUTDOWN | cancelling all orders")
+            logger.info("SHUTDOWN | cancelling grid orders")
         else:
-            logger.error("EMERGENCY STOP | cancelling all orders ({})", reason)
-        cancelled = self.exchange.cancel_everything(self.symbol)
+            logger.error("EMERGENCY STOP | cancelling grid orders ({})", reason)
+
+        if holding:
+            cancelled = self.exchange.cancel_all_open_orders(self.symbol)
+            logger.warning(
+                "STOPS LEFT ARMED | a position is still open, so its stop-loss legs stay "
+                "on the exchange — it remains protected while the bot is down",
+            )
+        else:
+            cancelled = self.exchange.cancel_everything(self.symbol)
         for level in self.levels:
             if level.order_id is not None:
                 if self._event_journal:

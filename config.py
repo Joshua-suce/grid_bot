@@ -29,7 +29,22 @@ class Settings(BaseSettings):
 
     # --- Grid ---
     symbol: str = Field(default="BTCUSDT", description="Trading pair")
-    leverage: int = Field(default=2, ge=1, le=20)
+    leverage: int = Field(
+        default=2, ge=1, le=25,
+        description=(
+            "Exchange leverage. With CAPITAL_PER_GRID_USDT set, this also multiplies the "
+            "order size: notional per order = CAPITAL_PER_GRID_USDT x LEVERAGE.\n"
+            "\n"
+            "The ceiling was an undocumented 20; raised to 25 on request. It is a rail, "
+            "not a recommendation, and two things bound what is sensible above it:\n"
+            "  - One side of the ladder must still fit inside MAX_POSITION_PCT, or the "
+            "outer rungs can never fill and the book goes permanently one-sided.\n"
+            "  - On ISOLATED margin, liquidation sits near 1/leverage minus the "
+            "maintenance rate. At 25x that is ~3.4% against a 3% hard stop -- barely half "
+            "a percent of daylight. This bot neither sets nor reads margin mode, so "
+            "switching the account to isolated would make that live silently (AUDIT #65)."
+        ),
+    )
     grid_count: int = Field(default=15, ge=3, le=100, description="Number of grid levels")
     capital_per_grid_pct: float = Field(
         default=0.05, gt=0, le=0.25,
