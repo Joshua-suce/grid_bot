@@ -148,15 +148,20 @@ def test_the_maintenance_rate_used_is_the_one_passed_in():
 # --- funding ----------------------------------------------------------------------
 
 def test_a_balance_that_cannot_fund_the_ladder_blocks():
-    """8 resting orders reserve 5 USDT of margin each whether they fill or not."""
-    problems = verify_account_config(FakeExchange(), cfg(), balance=30.0)
+    """One side of the ladder reserves margin before anything fills."""
+    problems = verify_account_config(FakeExchange(), cfg(), balance=15.0)
 
     assert any("cannot fund the ladder" in p for p in problems)
-    assert any("40.00" in p for p in problems)
+    assert any("20.00" in p for p in problems)
 
 
-def test_exactly_enough_balance_is_allowed():
-    assert verify_account_config(FakeExchange(), cfg(), balance=40.0) == []
+def test_only_one_side_of_the_ladder_has_to_be_funded():
+    """In one-way mode the two sides cannot both increase the position, so Binance
+    reserves for the larger side only. Measured on this account: 8 rungs at 5 USDT
+    reserved 19.997 of margin, not 40. Requiring the full ladder would refuse an
+    account that can genuinely fund it."""
+    assert verify_account_config(FakeExchange(), cfg(), balance=20.0) == []
+    assert verify_account_config(FakeExchange(), cfg(), balance=25.0) == []
 
 
 def test_percent_sizing_skips_the_funding_check():

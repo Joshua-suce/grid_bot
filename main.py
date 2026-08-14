@@ -510,21 +510,25 @@ def verify_account_config(exchange: Exchange, cfg, balance: float) -> list[str]:
             "liquidation is far from the {:.2%} stop", balance, cfg.stop_loss_pct,
         )
 
-    # Every resting order reserves initial margin. The ladder is placed all at once, so
-    # the account has to fund all of it -- not just the rungs that end up filling.
+    # Resting orders reserve initial margin before they fill. In one-way mode the two
+    # sides cannot both increase the position, so Binance reserves for the LARGER side
+    # only -- measured on this account: 8 rungs at 5 USDT reserved 19.997, not 40. The
+    # binding figure is one side, and asking for the full ladder would refuse an account
+    # that can genuinely fund it.
     if cfg.capital_per_grid_usdt > 0:
-        needed = cfg.capital_per_grid_usdt * cfg.grid_count
+        needed = cfg.capital_per_grid_usdt * (cfg.grid_count / 2)
         if balance < needed:
             problems.append(
-                f"free balance {balance:.2f} USDT cannot fund the ladder: {cfg.grid_count} "
-                f"resting orders reserve {cfg.capital_per_grid_usdt:.2f} each, so "
-                f"{needed:.2f} is the minimum before fees or stops. Fund the account, "
-                f"lower GRID_COUNT, or lower CAPITAL_PER_GRID_USDT"
+                f"free balance {balance:.2f} USDT cannot fund the ladder: {cfg.grid_count // 2} "
+                f"rungs a side reserve {cfg.capital_per_grid_usdt:.2f} each, so "
+                f"{needed:.2f} is the minimum before fees, stops, or any adverse move. "
+                f"Fund the account, lower GRID_COUNT, or lower CAPITAL_PER_GRID_USDT"
             )
-        elif balance < needed * 1.5:
+        elif balance < needed * 2:
             logger.warning(
-                "THIN MARGIN | the ladder reserves {:.2f} of {:.2f} free USDT — a "
-                "drawdown could stop new rungs being placed", needed, balance,
+                "THIN MARGIN | one side of the ladder reserves {:.2f} of {:.2f} free USDT "
+                "— once rungs fill, the position holds margin too and a drawdown could "
+                "stop new rungs being placed", needed, balance,
             )
 
     if acct["max_notional"] and one_side > acct["max_notional"]:
