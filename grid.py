@@ -753,36 +753,91 @@ class GridEngine:
             self._open_orders_fetch_time = now
         return self._open_orders_map.get((float(price), side))
 
-    def _release_awaiting_levels(self) -> None:
-        """Flip any rung whose counter-slot has freed back onto the counter side.
+    def _current_price_or_none(self) -> float | None:
+        """Live price for the release gate, or None if it cannot be read.
 
-        A rung that filled while its exit was already resting holds instead of placing
-        (see _handle_fill). Once the occupying order is gone, the rung becomes the
-        replacement it was always meant to be (AUDIT #61).
+        None degrades to counter-slot-only release rather than guessing: re-arming a
+        rung on a fabricated price is how a rung refills at the price it just filled at.
         """
+        try:
+            price = float(self.exchange.get_price(self.symbol))
+        except Exception as e:
+            logger.debug("RELEASE GATE | price unavailable ({}) — counter-slot only", e)
+            return None
+        return price if price > 0 else None
+
+    def _price_has_cleared(self, level: GridLevel, price: float) -> bool:
+        """Has price moved a full spacing past this rung, so it can rest again?
+
+        This is the gate that separates the two failure modes seen live. #58 let a
+        filled rung re-arm on its own side immediately: with price sitting ON the rung
+        it refilled six times and took 8215 DOGE, 96% of the cap, at one price. #61 then
+        refused to re-arm at all until the counter-slot freed -- and since every counter
+        is another rung of the same ladder, held rungs waited on held rungs and the book
+        drained from 10 orders to 5 in one session.
+
+        A rung may come back, but only once price has genuinely left it (AUDIT #62).
+        """
+        gap = abs(self.grid_spacing)
+        if gap <= 0:
+            return False
+        if level.side == "buy":
+            return price >= level.price + gap
+        return price <= level.price - gap
+
+    def _release_awaiting_levels(self, current_price: float | None = None) -> None:
+        """Bring held rungs back, either as the counter leg or at their own rung.
+
+        Two ways out of the hold:
+          1. The counter-slot frees -- the rung becomes the replacement it was meant
+             to be, which is what #61 intended.
+          2. Price moves a full spacing away from the rung itself -- the classic grid
+             re-arm. Without this the ladder starves, because in a ladder of buys below
+             and sells above, EVERY fill's counter-target is another live rung.
+
+        Slots claimed earlier in this pass are tracked, or two rungs release onto the
+        same price: a just-released level has order_id None, so an occupancy check that
+        only looks at live orders sees the slot as free twice. Observed live at
+        16:20:51 -- BUY 0.06922 and BUY 0.06939 both released to SELL 0.06955.
+        """
+        claimed = {
+            (l.price, l.side) for l in self.levels
+            if l.order_id is not None and l.status in ("pending", "replaced")
+        }
+
         for level in self.levels:
             if level.status != "awaiting_counter" or level.awaiting_price is None:
                 continue
-            still_taken = any(
-                l is not level
-                and l.price == level.awaiting_price
-                and l.order_id is not None
-                and l.status in ("pending", "replaced")
-                for l in self.levels
-            )
-            if still_taken:
+
+            counter = (level.awaiting_price, level.awaiting_side or level.side)
+            if counter not in claimed:
+                logger.info(
+                    "COUNTER SLOT FREED | {} {} -> {} {} — re-arming the held rung",
+                    level.side.upper(), level.price, counter[1].upper(), counter[0],
+                )
+                claimed.add(counter)
+                level.side = counter[1]
+                level.price = counter[0]
+                level.status = "pending"
+                level.order_id = None
+                level.awaiting_side = None
+                level.awaiting_price = None
                 continue
-            logger.info(
-                "COUNTER SLOT FREED | {} {} -> {} {} — re-arming the held rung",
-                level.side.upper(), level.price,
-                (level.awaiting_side or level.side).upper(), level.awaiting_price,
-            )
-            level.side = level.awaiting_side or level.side
-            level.price = level.awaiting_price
-            level.status = "pending"
-            level.order_id = None
-            level.awaiting_side = None
-            level.awaiting_price = None
+
+            own = (level.price, level.side)
+            if (current_price is not None
+                    and own not in claimed
+                    and self._price_has_cleared(level, current_price)):
+                logger.info(
+                    "RUNG RE-ARMED | {} {} — price {} has moved a full spacing clear "
+                    "while its counter {} stays busy",
+                    level.side.upper(), level.price, current_price, counter[0],
+                )
+                claimed.add(own)
+                level.status = "pending"
+                level.order_id = None
+                level.awaiting_side = None
+                level.awaiting_price = None
 
     def _place_order_for_level(self, level: GridLevel, balance: float) -> bool:
         if level.status == "awaiting_counter":
@@ -919,7 +974,7 @@ class GridEngine:
         failed = 0
         held = 0
         first = True
-        self._release_awaiting_levels()
+        self._release_awaiting_levels(self._current_price_or_none())
         for level in self.levels:
             if level.order_id is not None:
                 continue
@@ -1356,8 +1411,8 @@ class GridEngine:
                     continue
                 fills.append(self._handle_fill(level, balance))
 
-        # Rungs held for a busy counter-slot become placeable again the moment it frees.
-        self._release_awaiting_levels()
+        # Held rungs come back when the counter frees, or when price clears them.
+        self._release_awaiting_levels(self._current_price_or_none())
 
         orphaned = [l for l in self.levels if l.order_id is None and l.status == "pending" and (l.quantity > 0 or l.fill_count == 0)]
         if orphaned:

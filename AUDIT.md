@@ -894,6 +894,67 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 62. #61 stopped the doubling down and started starving the ladder -- HIGH
+
+Third pass at the same subsystem, and the first one that names the actual invariant.
+
+#58 let a filled rung re-arm on its own side immediately: price sat ON the rung and it
+refilled six times, 8215 DOGE at one price. #61 then made it wait for its counter-slot
+instead -- and in a ladder of buys below and sells above, **every fill's counter-target
+is another live rung of the same ladder**. So held rungs waited on held rungs. Live on
+2026-08-14:
+
+```
+12:06  PLACED 10 initial grid orders (0 failed, 0 awaiting counter)
+17:34  BATCH CANCELLED 5 orders
+```
+
+The book drained by half over one session. Six fills, and the rungs that produced them
+never came back.
+
+### The invariant both attempts missed
+
+A rung may come back -- but **not at the price it just filled at**. That single gate
+separates the two failures:
+
+* price still on the rung -> hold, so #58's accumulation cannot happen
+* price a full spacing clear -> re-arm in place, so #61's starvation cannot happen
+
+`_price_has_cleared` implements it (buy needs `price >= rung + spacing`, sell the
+mirror), and a held rung now has two exits: the counter-slot frees (the flip #61
+wanted), or price clears the rung (the classic grid re-arm). When the price cannot be
+read the gate degrades to counter-only rather than guessing -- re-arming on a fabricated
+price is exactly how a rung refills where it just filled.
+
+### The collision the same run exposed
+
+```
+16:20:51  COUNTER SLOT FREED | BUY 0.06922 -> SELL 0.06955 — re-arming the held rung
+16:20:52  COUNTER SLOT FREED | BUY 0.06939 -> SELL 0.06955 — re-arming the held rung
+```
+
+Two rungs onto one price. The occupancy check only looked at levels holding a live
+order, and a just-released level has `order_id = None` -- so the second rung saw the slot
+as free. Slots claimed earlier in the pass are now tracked, and occupancy is keyed on
+**(price, side)** to match `_place_order_for_level`'s own duplicate guard: a buy at
+0.07035 does not occupy the sell slot there.
+
+Two #61 tests had to change with this. One assumed a held rung never places -- now false
+by design. The other set up an occupier without a side, which the side-aware check
+correctly stops treating as a blocker.
+
+Verified adversarially, separately per fix: without slot tracking 5 of 7 tests fail,
+without the clearance gate 3 of 7, and the end-to-end ladder-drain test fails under both.
+
+### What the same run confirmed working
+
+`POSITION CLOSED | SELL 8215.0 DOGEUSDT (reconcile)` (#56 tagging, and #37 flattening an
+orphan with no saved ladder), `PNL EPOCH CHANGED | None -> 1786665600000` with 18 income
+entries pulled instead of 5876 (#60), `session=+0.00 account(since 2026-08-14)=+1.04`
+(#59), `spread=0.0144%` (#55). The session closed **+0.75**.
+
+---
+
 ## 61. #58 stopped the stranding and started doubling down -- CRITICAL
 
 #58 was half a fix, and the other half was worse than the bug.

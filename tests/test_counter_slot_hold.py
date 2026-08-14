@@ -124,7 +124,10 @@ def test_a_held_rung_flips_to_the_counter_side_once_the_slot_frees():
     held = g.levels[0]
     occupier = g.levels[1]
 
+    # The side matters: occupancy is per (price, side), matching the duplicate guard in
+    # _place_order_for_level. A BUY at 0.07035 does not occupy the SELL slot there.
     occupier.price = 0.07035
+    occupier.side = "sell"
     occupier.order_id = "live"
     occupier.status = "pending"
 
@@ -148,17 +151,28 @@ def test_a_held_rung_flips_to_the_counter_side_once_the_slot_frees():
 
 def test_holding_is_not_reported_as_a_failure():
     """A held rung is doing the right thing. Counting it as failed would read as the
-    ladder being broken."""
+    ladder being broken.
+
+    Held here means genuinely held: the counter-slot is busy AND price has not cleared
+    the rung. Once price does clear it the rung re-arms in place instead (AUDIT #62) --
+    that is what stops the ladder draining, and it is covered in test_rung_rearm_gate.
+    """
     g = _engine()
+    price = g.exchange.get_price("DOGEUSDT")
     for level in g.levels:
         level.order_id = None
         level.status = "awaiting_counter"
         level.awaiting_side = "sell"
         level.awaiting_price = 0.09
-        # keep the slot occupied so nothing releases
-    g.levels[0].order_id = "live"
-    g.levels[0].status = "pending"
-    g.levels[0].price = 0.09
+        # Park every rung ON the current price so the clearance gate cannot fire.
+        level.side = "buy"
+        level.price = price
+
+    occupier = g.levels[0]
+    occupier.status = "pending"
+    occupier.side = "sell"
+    occupier.price = 0.09
+    occupier.order_id = "live"
 
     assert g.place_initial_orders(5000.0) == 0
 
