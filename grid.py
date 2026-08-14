@@ -15,11 +15,16 @@ class GridLevel:
     price: float
     side: str  # "buy" or "sell"
     order_id: str | None = None
-    status: str = "pending"  # pending, replaced
+    status: str = "pending"  # pending, replaced, awaiting_counter
     fill_count: int = 0
     total_pnl: float = 0.0
     quantity: float = 0.0
     entry_price: float = 0.0
+    # Set when this rung filled but its counter-slot was already live. That order is
+    # this fill's exit, so the rung places nothing until the slot frees -- re-arming on
+    # the same side instead accumulated 8215 DOGE at one price (AUDIT #61).
+    awaiting_side: str | None = None
+    awaiting_price: float | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -748,7 +753,42 @@ class GridEngine:
             self._open_orders_fetch_time = now
         return self._open_orders_map.get((float(price), side))
 
+    def _release_awaiting_levels(self) -> None:
+        """Flip any rung whose counter-slot has freed back onto the counter side.
+
+        A rung that filled while its exit was already resting holds instead of placing
+        (see _handle_fill). Once the occupying order is gone, the rung becomes the
+        replacement it was always meant to be (AUDIT #61).
+        """
+        for level in self.levels:
+            if level.status != "awaiting_counter" or level.awaiting_price is None:
+                continue
+            still_taken = any(
+                l is not level
+                and l.price == level.awaiting_price
+                and l.order_id is not None
+                and l.status in ("pending", "replaced")
+                for l in self.levels
+            )
+            if still_taken:
+                continue
+            logger.info(
+                "COUNTER SLOT FREED | {} {} -> {} {} — re-arming the held rung",
+                level.side.upper(), level.price,
+                (level.awaiting_side or level.side).upper(), level.awaiting_price,
+            )
+            level.side = level.awaiting_side or level.side
+            level.price = level.awaiting_price
+            level.status = "pending"
+            level.order_id = None
+            level.awaiting_side = None
+            level.awaiting_price = None
+
     def _place_order_for_level(self, level: GridLevel, balance: float) -> bool:
+        if level.status == "awaiting_counter":
+            # Its exit is already resting. Placing here would add exposure the rung has
+            # no matching exit for -- the 8215 DOGE accumulation (AUDIT #61).
+            return False
         if level.side == "buy" and self._block_buys:
             logger.debug("SKIP BUY ORDER | position limit reached")
             return False
@@ -877,9 +917,16 @@ class GridEngine:
     def place_initial_orders(self, balance: float) -> int:
         placed = 0
         failed = 0
+        held = 0
         first = True
+        self._release_awaiting_levels()
         for level in self.levels:
             if level.order_id is not None:
+                continue
+            if level.status == "awaiting_counter":
+                # Not a failure -- its exit is already on the book. Counted separately so
+                # a held rung is never mistaken for one that could not place.
+                held += 1
                 continue
             if self.order_pacing_seconds > 0 and not first:
                 time.sleep(self.order_pacing_seconds)
@@ -890,8 +937,9 @@ class GridEngine:
                 failed += 1
 
         logger.info(
-            "PLACED {} initial grid orders ({} failed) | vol_mult={:.2f} | exposure={:.1%}",
-            placed, failed, self._volatility_mult, self.get_exposure_pct(balance),
+            "PLACED {} initial grid orders ({} failed, {} awaiting counter) | "
+            "vol_mult={:.2f} | exposure={:.1%}",
+            placed, failed, held, self._volatility_mult, self.get_exposure_pct(balance),
         )
         return placed
 
@@ -1308,6 +1356,9 @@ class GridEngine:
                     continue
                 fills.append(self._handle_fill(level, balance))
 
+        # Rungs held for a busy counter-slot become placeable again the moment it frees.
+        self._release_awaiting_levels()
+
         orphaned = [l for l in self.levels if l.order_id is None and l.status == "pending" and (l.quantity > 0 or l.fill_count == 0)]
         if orphaned:
             placed_slots: set[tuple[float, str]] = set()
@@ -1458,27 +1509,34 @@ class GridEngine:
             for l in self.levels
         )
         if occupied:
-            # Do NOT move this level onto the occupied price. That is a one-way trip:
-            # the orphan loop then calls _place_order_for_level, which finds an order
-            # already tracked by another level, returns False and logs it at DEBUG. The
-            # level retries forever and never places again.
+            # The counter-slot is already live, so THAT order is the exit this fill
+            # needs. This rung has no work to do until it fills.
             #
-            # Observed live on 2026-08-14: a buy filled at 0.07017, its replacement sell
-            # targeted the already-occupied 0.07035, and the ladder ran the next 57
-            # minutes on 9 orders with a permanent hole at 0.07017 -- the rung NEAREST
-            # the price. _refill_missing_grid_lines would repair it, but that only runs
-            # on state-load and reset, never in the live loop.
+            # Two wrong answers, both observed live:
             #
-            # The occupying order is already the exit this fill needs, so a second one
-            # there would be redundant even if it were placeable. Keep the rung instead:
-            # leave side and price alone and let it re-arm where it is (AUDIT #58).
+            #   1. Move the level onto the occupied price (the original behaviour). A
+            #      one-way trip -- _place_order_for_level then finds an order already
+            #      tracked by another level and returns False forever. On 2026-08-14 a
+            #      buy filled at 0.07017, its sell targeted the occupied 0.07035, and the
+            #      ladder ran 57 minutes on 9 of 10 rungs with a hole at the price.
+            #
+            #   2. Re-arm on the SAME side (AUDIT #58's first attempt). That breaks the
+            #      alternation a grid depends on. With price pinned at the rung it just
+            #      buys again: six consecutive BUY fills at 0.06945 on 2026-08-14,
+            #      0 -> 8215 DOGE, 96% of the position cap, every one booking
+            #      profit=-0.000000 and paying a fee. Doubling down is worse than idling.
+            #
+            # So: hold the rung, place nothing, and remember what it is waiting for. The
+            # level re-arms as the counter side the moment that slot frees (AUDIT #61).
             logger.info(
-                "REPLACEMENT SLOT TAKEN | {} @ {} is already live — re-arming this level "
-                "at its own rung {} {} instead of stranding it on top",
+                "REPLACEMENT SLOT TAKEN | {} @ {} is already live and is this fill's exit "
+                "— holding {} {} until it frees rather than adding exposure",
                 new_side.upper(), new_price, level.side.upper(), level.price,
             )
             level.order_id = None
-            level.status = "pending"
+            level.status = "awaiting_counter"
+            level.awaiting_side = new_side
+            level.awaiting_price = new_price
             return fill_record
 
         qty = level.quantity if level.quantity > 0 else (self._calc_usdt_per_grid(balance) / max(new_price, 1e-12))

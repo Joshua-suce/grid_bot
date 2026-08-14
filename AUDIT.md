@@ -894,6 +894,59 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 61. #58 stopped the stranding and started doubling down -- CRITICAL
+
+#58 was half a fix, and the other half was worse than the bug.
+
+It correctly stopped a filled rung migrating onto an occupied counter-slot, where
+`_place_order_for_level` would find an order already tracked by another level and refuse
+forever. But it re-armed the rung on its **own side** instead. That breaks the
+alternation a grid runs on: buy fills -> sell one step up -> buy back. With price sitting
+on the rung, a rung that re-arms as a buy simply buys again.
+
+Live on 2026-08-14, six consecutive fills at one price:
+
+```
+09:42  FILL #8  BUY @ 0.06945  qty=2397
+09:43  FILL #9  BUY @ 0.06945  qty=2478   -> LONG 2181
+10:00  FILL #10 BUY @ 0.06945  qty=2463   -> LONG 4644
+10:37  FILL #11 BUY @ 0.06945  qty=2246   -> LONG 6890
+11:05  FILL #12 BUY @ 0.06945  qty=927    -> LONG 7817
+11:22  FILL #13 BUY @ 0.06945  qty=398    -> LONG 8215
+                                BUY SCALE | long=8215.0/8515.3 | scale=0.07
+```
+
+**96% of the position cap**, every fill booking `profit=-0.000000` and paying a fee. The
+cap and the size taper (#49) held -- the run ended +1.12 net -- but this is the mechanism
+that fills the inventory whose forced exits cost -132.04 over 30 days (#56). It walks
+into the cap rather than crashing through it.
+
+The occupying order **is** the exit for the first fill. A second buy at the same rung
+adds exposure with no matching exit. So the rung now holds: status `awaiting_counter`,
+places nothing, and records the price it is waiting on. `_release_awaiting_levels` flips
+it to the counter side the moment that slot frees, which is what #58 wanted all along.
+Held rungs are reported separately from failed ones -- holding is correct behaviour, and
+counting it as a failure reads as a broken ladder.
+
+`test_ladder_rearm`'s end-to-end assertion had to change with it. It demanded 10 live
+orders after a fill, which encodes the wrong invariant now: a held rung deliberately has
+none. The invariant is **recovery** -- every rung is live, or waiting on a named slot,
+never simply stuck.
+
+Reverted, the behavioural test fails and the log reproduces the live sequence exactly:
+`FILL | BUY @ 0.07017 | profit=-0.000000`, `PLACED 1 initial grid orders`, repeating.
+
+### What the same run confirmed working
+
+- `spread=0.0143%` -- #55's fix live, after a lifetime of `0.0000%`.
+- `Failed to fetch stop orders: ... status UNKNOWN, not empty` -- #54 catching a real
+  three-retry failure and refusing to reconcile against a fabricated empty book.
+- Only the moved trail leg re-placed on each ratchet; the hard stop untouched -- #54's
+  churn fix.
+- 13 fills in 5 hours against 1 in 68 minutes.
+
+---
+
 ## 57. State could survive the process but not the crash -- MEDIUM
 
 `save()` writes to a temp file and `os.replace`s it, which is atomic with respect to the

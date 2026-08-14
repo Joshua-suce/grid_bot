@@ -89,9 +89,15 @@ def test_a_fill_whose_slot_is_taken_re_arms_its_own_rung():
         assert buy.side == side_before
 
 
-def test_the_ladder_keeps_all_its_rungs_working_after_a_fill():
-    """The end-to-end symptom: 10 rungs in, one fills, and the book must not be left
-    permanently one order short."""
+def test_no_rung_is_left_permanently_dead_after_a_fill():
+    """The end-to-end symptom this exists for: a rung that can never place again.
+
+    Note what is NOT asserted -- that the book always holds 10 live orders. A rung whose
+    counter-slot is already resting deliberately places nothing and waits (AUDIT #61);
+    that order is its exit, and buying again there is the 8215 DOGE accumulation. The
+    invariant is recovery, not headcount: every rung must be live, or held with a
+    concrete slot it is waiting on. Never simply stuck.
+    """
     g = _engine()
     assert len(g.exchange.orders) == 10
 
@@ -103,11 +109,19 @@ def test_the_ladder_keeps_all_its_rungs_working_after_a_fill():
         g.check_fills(5000.0)
         g.place_initial_orders(5000.0)
 
-    live = len(g.exchange.orders)
-    assert live >= 10, (
-        f"ladder is running on {live} orders after one fill -- a rung was stranded. "
-        f"That is exactly the 9-of-10 the live run showed for 57 minutes."
+    stuck = [
+        l for l in g.levels
+        if l.order_id is None and l.status != "awaiting_counter"
+        and l.price not in {o["price"] for o in g.exchange.orders.values()}
+    ]
+    assert not stuck, (
+        f"{len(stuck)} rung(s) hold no order and are not waiting on anything -- "
+        f"stranded: {[(l.side, l.price, l.status) for l in stuck]}"
     )
+
+    held = [l for l in g.levels if l.status == "awaiting_counter"]
+    for level in held:
+        assert level.awaiting_price is not None, "held without recording what it waits for"
 
 
 def test_no_two_levels_claim_the_same_order():
