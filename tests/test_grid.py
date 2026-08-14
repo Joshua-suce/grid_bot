@@ -538,6 +538,7 @@ def test_set_position_limit_cancels_resting_buys_when_long_capped():
         def cancel_order(self, order_id, symbol):
             self.cancelled.append(order_id)
             self.open.discard(order_id)
+            return True          # Exchange.cancel_order returns bool; callers act on it
 
     ex = FakeExchange()
     grid = GridEngine(
@@ -577,6 +578,7 @@ def test_set_position_limit_cancels_resting_sells_when_short_capped():
         def cancel_order(self, order_id, symbol):
             self.cancelled.append(order_id)
             self.open.discard(order_id)
+            return True          # Exchange.cancel_order returns bool; callers act on it
 
     ex = FakeExchange()
     grid = GridEngine(

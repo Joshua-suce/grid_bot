@@ -68,9 +68,28 @@ def _engine(ex):
     return g
 
 
-def _blocked_buy_level(g):
+def _blocked_buy_level(g, isolate=True):
+    """Reproduce the incident: one blocked level, and nothing else near the price.
+
+    `isolate` matters. The original version of this helper left the ladder's own levels
+    in place, so the blocked level had a neighbour 0.00009 away -- and the move was
+    allowed only because the crowding floor was 0.00008425, a 7% margin. Pricing the
+    round trip honestly (AUDIT #51) widened that floor to 0.00009419 and the move
+    started being refused, which read as a dormancy regression but was not one: a
+    neighbour that close quotes, so the grid is not silent.
+
+    The real incident had no such neighbour -- the blocked level was the only one within
+    1.2% of the price. That is the condition that makes refusing catastrophic, so it is
+    the condition this file tests.
+    """
     lvl = next(l for l in g.levels if l.side == "buy")
     lvl.price, lvl.order_id, lvl.status = 0.07034, None, "pending"
+    if isolate:
+        others = [l for l in g.levels if l is not lvl]
+        low, high = g.grid_lower, 0.06936          # >1.2% below the 0.07020 market
+        for i, other in enumerate(others):
+            other.price = round(low + (high - low) * i / max(1, len(others) - 1), 5)
+            other.order_id, other.status = None, "pending"
     return lvl
 
 
@@ -171,8 +190,8 @@ def test_no_move_when_it_would_deform_the_ladder():
     stays put rather than creating a pair inside the fee floor."""
     ex = _Ex()
     g = _engine(ex)
-    lvl = _blocked_buy_level(g)
-    break_even = ENTRY * (1 - 2 * g.maker_fee_pct)
+    lvl = _blocked_buy_level(g, isolate=False)
+    break_even = ENTRY * (1 - g.round_trip_fee_pct)
     for other in g.levels:
         if other is not lvl:
             other.price = round(break_even, 5)

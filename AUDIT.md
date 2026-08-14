@@ -894,6 +894,103 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 51. A failed cancel is not a cancel, and the fees were never all-maker -- CRITICAL
+
+`Exchange.cancel_order` has always returned an honest `bool`: `True` only when the order
+is confirmed gone (`OrderNotFound` counts as gone), `False` for "status unknown". It
+never falls off the end -- every path returns explicitly.
+
+**Three of the four production callers discarded it.** Only the reconcile path (#41)
+checked. And because `cancel_order` swallows the ccxt exception internally and returns
+`False`, the `except` blocks wrapped around these calls almost never fire: the normal
+failure is a quiet `False` that nobody read.
+
+### 51a. The position cap freed levels it had not cancelled -- CRITICAL
+
+`_cancel_resting_orders` is the last line of defence: it runs when the position is **at
+its cap**. On a failed cancel it fell straight through to journalling the order as
+cancelled, notifying the operator it was cancelled, setting `order_id = None`, `status =
+"pending"`, and counting it in the total.
+
+So the order was still live, the engine had forgotten it, and the level was marked
+free -- meaning the next `place_initial_orders` laid a **second order at the same
+price**. At the cap, cancels fail, the engine believes it shrank exposure, and it grows
+it instead. That is #49's failure with the guard's own hands.
+
+It now keeps `order_id` on any unconfirmed cancel (retried next iteration, self-healing),
+counts only confirmed cancels, and logs the failures at ERROR instead of reporting a
+clean sweep.
+
+### 51b. `pause()` did the same -- HIGH
+
+Pause deliberately does not flatten. A level it could not cancel must stay claimed, or
+resuming re-places on top of the survivor.
+
+### 51c. An unconfirmed entry cancel became a double entry -- HIGH
+
+`TrendFollower._cancel_entry` cleared `_order_id` regardless. That is the exact variable
+`place_initial_orders` guards on (`if self._order_id is not None: return 0`), so the next
+call opened a **second entry at full size** while the first was still live -- and the
+survivor filled outside `check_fills`, untracked, with no stop. It now returns `bool` and
+keeps the order claimed unless the cancel is confirmed.
+
+### 51d. The round trip was never 2 x maker -- MEDIUM-HIGH
+
+Eight gates priced a completed cycle at `2 * maker_fee_pct`, documented as "the true
+round-trip cost, not an optimistic floor". The income ledger disagrees: **11.8% of fill
+volume paid the taker rate**, so the real round trip is 0.0447% against the 0.0400%
+assumed -- 1.12x.
+
+The gap is structural, not drift. Reduce-only exits are placed `postOnly=False` on
+purpose (a queued exit that never fills is worse than a crossed one), stop-losses always
+cross, and reconcile/unwind close at market. It will never be zero.
+
+Understating it hurt twice:
+
+- `MIN_PROFIT_MULTIPLIER=3.0` bought a real **2.68x** margin, not 3.0x.
+- Worse, **every break-even price was 12% short.** `_position_break_even` returns
+  `entry * (1 +/- fees)`, and that number is what #32's guard clamps exits to. Clamping
+  to a break-even that understates fees books a small *genuine* loss on every exit that
+  hits it -- a guard whose entire purpose is to not lose money.
+
+All eight now route through one `round_trip_fee_pct` property blending both rates by
+`TAKER_FILL_SHARE_PCT` (default 11.8, measured). Config validation prices the required
+spacing the same way. Setting the share to 0 collapses it to the old figure exactly.
+
+### What this exposed in the dormancy tests, and what it did not
+
+The wider floor tipped `test_dormancy` red, which looked like #42 reopening. It was not.
+
+The move being refused was 0.00009 from a neighbour, against a floor that grew from
+0.00008425 to 0.00009419 -- **the old test passed by 7%.** The first attempt at a fix
+was to ignore *pending* neighbours when checking crowding; that is wrong, and
+`test_no_move_when_it_would_deform_the_ladder` caught it immediately. `place_initial_
+orders` walks the whole ladder every iteration, so a pending level is not an empty
+price, it is an order about to exist.
+
+The guard is right as written, and it bounds its own dormancy risk: a neighbour inside
+the fee floor is a neighbour within ~0.13%, and it quotes. The #42 incident was the
+opposite case -- the blocked level was the **only one within 1.2% of the price**. That
+is the condition that makes refusing catastrophic, and it is now the condition the
+dormancy tests actually set up, rather than relying on a 7% margin in an unrelated
+constant.
+
+### Verified adversarially
+
+`tests/test_unconfirmed_cancels.py` -- 8 tests. With all four fixes reverted, 6 fail.
+The two that hold are the positive controls: a *confirmed* cancel still frees its level
+(the fix must not strand inventory the way #42 did), and an all-maker book still
+collapses to the old fee number.
+
+`test_pause_keeps_a_level_that_would_not_cancel` passed against broken code on the first
+adversarial run -- `pause()` returns immediately when `active` is False, so it asserted
+nothing. Fixed, then re-verified. Two vacuous tests have now been caught this way in
+three audits; the adversarial pass is not optional.
+
+Full suite: 488 passed, 5 skipped.
+
+---
+
 ## 50. Three safety nets that were not there -- CRITICAL
 
 #49 closed the mechanism that let the position reach 31,761 DOGE against a 17,467 cap.

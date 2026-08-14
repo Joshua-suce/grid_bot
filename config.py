@@ -105,6 +105,17 @@ class Settings(BaseSettings):
         default=0.04, ge=0.0, le=0.1,
         description="Taker fee as percent (0.04% = 0.0004)",
     )
+    taker_fill_share_pct: float = Field(
+        default=11.8, ge=0.0, le=100.0,
+        description=(
+            "Share of fill volume that actually pays the TAKER rate, as a percent. "
+            "Every profitability gate and break-even price is computed from a blend of "
+            "the maker and taker rates weighted by this. It is not zero and cannot be: "
+            "reduce-only exits are placed postOnly=False by design, and stop-losses "
+            "always cross. Measured at 11.8% against the Binance income ledger over 15 "
+            "days; re-measure with analyze_performance rather than assuming (AUDIT #51)."
+        ),
+    )
 
     # --- Risk ---
     stop_loss_pct: float = Field(
@@ -298,16 +309,22 @@ class Settings(BaseSettings):
             )
 
         # --- Spacing must clear fees by a real margin, not a hair ---------------
-        # Every completed cycle earns one grid spacing and pays a round trip of maker
-        # fees. Spacing set near the fee floor is how a bot books thousands of fills
-        # and still ends the day negative: the exchange takes most of the gross.
-        round_trip_fee = 2 * (self.maker_fee_pct / 100)
+        # Every completed cycle earns one grid spacing and pays a round trip of fees.
+        # Spacing set near the fee floor is how a bot books thousands of fills and still
+        # ends the day negative: the exchange takes most of the gross. The round trip is
+        # priced at the BLENDED rate, not the maker rate -- assuming an all-maker book
+        # understated the true cost by 12% (AUDIT #51).
+        share = self.taker_fill_share_pct / 100
+        round_trip_fee = 2 * (
+            (self.maker_fee_pct / 100) * (1 - share) + (self.taker_fee_pct / 100) * share
+        )
         required_spacing = round_trip_fee * self.min_profit_multiplier
         if self.range_min_spacing_pct < required_spacing:
             raise ValueError(
                 f"RANGE_MIN_SPACING_PCT ({self.range_min_spacing_pct:.5f} = "
                 f"{self.range_min_spacing_pct * 100:.3f}%) does not clear fees. A round trip "
-                f"costs {round_trip_fee * 100:.3f}% at the maker rate, and "
+                f"costs {round_trip_fee * 100:.3f}% at the blended rate "
+                f"({self.taker_fill_share_pct:.1f}% taker), and "
                 f"MIN_PROFIT_MULTIPLIER={self.min_profit_multiplier} requires spacing of at "
                 f"least {required_spacing:.5f} ({required_spacing * 100:.3f}%). "
                 "Raise RANGE_MIN_SPACING_PCT, lower GRID_COUNT, or lower MIN_PROFIT_MULTIPLIER."

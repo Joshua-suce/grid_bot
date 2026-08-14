@@ -105,6 +105,7 @@ class GridEngine:
         stop_loss_pct: float,
         maker_fee_pct: float = 0.0002,
         taker_fee_pct: float = 0.0004,
+        taker_fill_share: float = 0.118,
         recenter_cooldown: int = 300,
         replacement_cooldown: int = 60,
         order_pacing_seconds: float = 0.6,
@@ -128,6 +129,7 @@ class GridEngine:
         self.stop_loss_pct = stop_loss_pct
         self.maker_fee_pct = maker_fee_pct
         self.taker_fee_pct = taker_fee_pct
+        self.taker_fill_share = min(1.0, max(0.0, taker_fill_share))
         self.recenter_cooldown = recenter_cooldown
         self.replacement_cooldown = replacement_cooldown
         self.order_pacing_seconds = order_pacing_seconds
@@ -333,14 +335,25 @@ class GridEngine:
             logger.error("POSITION LIMIT | could not fetch open orders to cancel {} orders: {}", side, e)
             return 0
         cancelled = 0
+        failed = 0
         for level in targets:
             if level.order_id in still_open:
+                # cancel_order returns False for "status unknown" and only True when the
+                # order is confirmed gone (OrderNotFound counts as gone). A level cleared
+                # on an unconfirmed cancel is the worst outcome available here: the order
+                # is still live AND the level goes back to "pending", so the next
+                # place_initial_orders lays a SECOND order at the same price -- growing
+                # exposure at the exact moment the cap says to shrink it (AUDIT #51).
                 try:
-                    self.exchange.cancel_order(level.order_id, self.symbol)
+                    confirmed = self.exchange.cancel_order(level.order_id, self.symbol)
                 except Exception as e:
                     logger.error(
                         "POSITION LIMIT | failed to cancel {} @ {}: {}", level.side, level.price, e,
                     )
+                    confirmed = False
+                if not confirmed:
+                    failed += 1
+                    continue                      # keep order_id: retried next iteration
             if self._event_journal:
                 self._event_journal.order_cancelled(self.symbol, level.side, level.price, level.order_id, reason)
             if self._notifier:
@@ -348,9 +361,16 @@ class GridEngine:
             level.order_id = None
             level.status = "pending"
             cancelled += 1
-        logger.warning(
-            "POSITION LIMIT | cancelled {} resting {} orders ({})", cancelled, side, reason,
-        )
+        if failed:
+            logger.error(
+                "POSITION LIMIT | cancelled {} resting {} orders ({}) but {} could NOT be "
+                "confirmed cancelled — those levels stay claimed and will retry",
+                cancelled, side, reason, failed,
+            )
+        else:
+            logger.warning(
+                "POSITION LIMIT | cancelled {} resting {} orders ({})", cancelled, side, reason,
+            )
         return cancelled
 
     def update_orderbook(self) -> None:
@@ -543,16 +563,34 @@ class GridEngine:
             return raw
         return pct_allocation
 
+    @property
+    def round_trip_fee_pct(self) -> float:
+        """Cost of one completed cycle as a fraction of price, at the BLENDED rate.
+
+        Every gate here used to price the round trip at `2 * maker_fee`, on the reasoning
+        that both legs rest as post-only maker orders. The Binance income ledger says
+        otherwise: 11.8% of fill volume over 15 days paid the taker rate, making the real
+        round trip 0.0447% against the 0.0400% assumed -- 1.12x. The gap is structural,
+        not drift. Reduce-only exits are placed `postOnly=False` on purpose (a queued
+        exit that never fills is worse than a crossed one), stop-losses always cross, and
+        reconcile/unwind close at market.
+
+        Understating it hurts twice: `MIN_PROFIT_MULTIPLIER=3.0` bought a real 2.68x
+        margin rather than 3.0x, and -- worse -- every break-even price was 12% short, so
+        exits clamped to "break-even" booked a small genuine loss (AUDIT #51).
+        """
+        per_side = (self.maker_fee_pct * (1.0 - self.taker_fill_share)
+                    + self.taker_fee_pct * self.taker_fill_share)
+        return 2.0 * per_side
+
     def _is_level_profitable(self, level_price: float) -> bool:
         """Is one round trip at this level worth more than the fees it will pay?
 
         A completed cycle earns one grid_spacing of price movement and pays two fees
-        (entry + exit). Both legs rest as post-only maker orders -- crossing orders are
-        now refused rather than downgraded to taker (see PostOnlyWouldCross) -- so
-        2 * maker_fee is the true round-trip cost, not an optimistic floor.
+        (entry + exit), priced at the blended rate -- see round_trip_fee_pct.
         """
         expected_profit = self.grid_spacing
-        round_trip_fees = 2 * self.maker_fee_pct * level_price
+        round_trip_fees = self.round_trip_fee_pct * level_price
         return expected_profit > round_trip_fees * self._min_profit_multiplier
 
     def _position_break_even(self) -> tuple[str, float] | None:
@@ -587,7 +625,7 @@ class GridEngine:
             if qty < 0:
                 side = "short" if side == "long" else "long"
                 qty = abs(qty)
-            fees = 2 * self.maker_fee_pct
+            fees = self.round_trip_fee_pct
             if side == "long":
                 result = ("long", entry * (1 + fees))
             elif side == "short":
@@ -669,7 +707,15 @@ class GridEngine:
         if target <= 0 or not (self.grid_lower <= target <= self.grid_upper):
             return None
 
-        floor = target * 2 * self.maker_fee_pct * self._min_profit_multiplier
+        # Pending levels count. place_initial_orders walks the whole ladder every
+        # iteration, so a pending neighbour is not an empty price -- it is an order about
+        # to exist, and moving on top of it is #34's deformation either way.
+        #
+        # This also bounds the dormancy risk that refusing creates: a neighbour inside
+        # the fee floor is a neighbour within ~0.13% of the target, and it quotes. The
+        # #42 incident was the opposite case -- the blocked level was the ONLY one within
+        # 1.2% of the price, so refusing meant the grid quoted nothing at all.
+        floor = target * self.round_trip_fee_pct * self._min_profit_multiplier
         for other in self.levels:
             if other is level:
                 continue
@@ -739,7 +785,7 @@ class GridEngine:
             logger.info(
                 "SKIP ORDER @ {} | spacing={:.8f} < min_profit={:.8f} ({}x fees)",
                 level.price, self.grid_spacing,
-                2 * self.maker_fee_pct * level.price * self._min_profit_multiplier,
+                self.round_trip_fee_pct * level.price * self._min_profit_multiplier,
                 self._min_profit_multiplier,
             )
             return False
@@ -938,7 +984,7 @@ class GridEngine:
             # 0.07059, hedge 0.07030 -- above break-even, so covering there books -0.52.
             # Clamp to break-even, the same rule the ordinary ladder follows since
             # AUDIT #32, and bounds-check the clamped price rather than the raw one.
-            fees = 2 * self.maker_fee_pct
+            fees = self.round_trip_fee_pct
             if side == "long":
                 hedge_price = self._round_price(best_level.price + self.grid_spacing)
                 hedge_price = max(hedge_price, self._round_price_toward(entry * (1 + fees), +1))
@@ -1096,7 +1142,7 @@ class GridEngine:
             # a long held at 0.06962 -- both filled, -0.88 realised, over half that
             # session's loss, on a position whose stop was far below and which price
             # recovered past within minutes (AUDIT #32).
-            fees = 2 * self.maker_fee_pct
+            fees = self.round_trip_fee_pct
             break_even = entry * (1 + fees) if side == "long" else entry * (1 - fees)
             levels = [
                 l for l in free
@@ -1492,7 +1538,15 @@ class GridEngine:
             if level.order_id is not None:
                 if level.order_id in still_open:
                     logger.warning("PAUSE | order {} still open after cancel_everything — force cancelling", level.order_id)
-                    self.exchange.cancel_order(level.order_id, self.symbol)
+                    if not self.exchange.cancel_order(level.order_id, self.symbol):
+                        # Pausing does not flatten (see Strategy.pause), so a level that
+                        # is still live must stay claimed -- otherwise resuming re-places
+                        # it on top of the survivor (AUDIT #51).
+                        logger.error(
+                            "PAUSE | order {} @ {} could NOT be confirmed cancelled — "
+                            "level stays claimed", level.order_id, level.price,
+                        )
+                        continue
                 if self._event_journal:
                     self._event_journal.order_cancelled(self.symbol, level.side, level.price, level.order_id, "pause")
                 if self._notifier:
@@ -1932,7 +1986,7 @@ class GridEngine:
         prices = sorted(l.price for l in self.levels)
         defects: list[str] = []
 
-        floor = 2 * self.maker_fee_pct * self._min_profit_multiplier
+        floor = self.round_trip_fee_pct * self._min_profit_multiplier
         too_close = [
             (a, b) for a, b in zip(prices, prices[1:])
             if a > 0 and (b - a) / a < floor
@@ -2127,7 +2181,7 @@ class GridEngine:
         # the levels that should have covered the middle of the range never placed at
         # all. AUDIT #34 rebuilt ladders deformed this way; this is the deformity
         # itself (AUDIT #36).
-        floor_pct = 2 * self.maker_fee_pct * self._min_profit_multiplier
+        floor_pct = self.round_trip_fee_pct * self._min_profit_multiplier
         missing = 0
         while len(self.levels) < self.grid_count:
             prices = sorted(self._round_price(l.price) for l in self.levels)

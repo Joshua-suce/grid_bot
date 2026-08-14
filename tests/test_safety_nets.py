@@ -173,8 +173,6 @@ def test_main_uses_the_return_value_to_block_exposure():
 
 def _cancel_everything_logs(get_open_orders):
     """Run the real cancel_everything against a stubbed book and capture its logs."""
-    import sys
-
     from loguru import logger
 
     from exchange import Exchange
@@ -186,15 +184,16 @@ def _cancel_everything_logs(get_open_orders):
     ex.exchange = type("X", (), {"cancel_all_orders": staticmethod(lambda s: None)})()
 
     sink = []
-    logger.remove()
     h = logger.add(lambda m: sink.append(str(m)), level="INFO")
     try:
         ex.cancel_everything("DOGEUSDT", timeout_seconds=0)
     except Exception:
         pass                       # only the logging behaviour is under test
     finally:
+        # Only remove what this helper added. Calling logger.remove() and re-adding
+        # sys.stderr rebinds loguru to pytest's captured stream, which is closed at
+        # teardown -- every later test then spews "I/O operation on closed file".
         logger.remove(h)
-        logger.add(sys.stderr, level="INFO")
     return "".join(sink)
 
 

@@ -185,18 +185,33 @@ class TrendFollower:
     def peak_price(self, value: float) -> None:
         self._peak_price = float(value)
 
-    def _cancel_entry(self, reason: str) -> None:
+    def _cancel_entry(self, reason: str) -> bool:
+        """Returns True only when the entry order is confirmed gone.
+
+        Clearing `_order_id` on an unconfirmed cancel lets place_initial_orders through
+        its `if self._order_id is not None: return 0` guard, so it opens a SECOND entry
+        at full size while the first is still live -- and the survivor fills untracked,
+        outside check_fills and outside the stop (AUDIT #51).
+        """
         if self._order_id is None:
-            return
+            return True
         try:
-            self.exchange.cancel_order(self._order_id, self.symbol)
+            confirmed = self.exchange.cancel_order(self._order_id, self.symbol)
         except Exception as e:
             logger.warning("TREND FOLLOWER | cancel {} failed: {}", self._order_id, e)
+            confirmed = False
+        if not confirmed:
+            logger.error(
+                "TREND FOLLOWER | entry {} could NOT be confirmed cancelled — keeping it "
+                "claimed rather than risking a duplicate entry", self._order_id,
+            )
+            return False
         if self._event_journal:
             self._event_journal.order_cancelled(
                 self.symbol, self._side or "", self._entry_price, self._order_id, reason,
             )
         self._order_id = None
+        return True
 
     # --- trading -----------------------------------------------------------
 
