@@ -91,6 +91,12 @@ TIMEFRAME_MULTIPLIER = {
     "1h": 24, "4h": 6, "1d": 1,
 }
 
+# How old the income ledger may get before the daily-loss kill switch is treated as
+# flying blind. Generous on purpose: the periodic fallback sync runs every 60 loops, so
+# this only trips on a genuinely broken feed, not a slow one. It self-clears on the next
+# successful sync, because set_position_limit rebuilds the side blocks each iteration.
+PNL_STALE_SECONDS = 1800.0
+
 def candles_for_lookback(timeframe: str, days: int) -> int:
     mult = TIMEFRAME_MULTIPLIER.get(timeframe, 24)
     return days * mult + 100
@@ -737,10 +743,18 @@ def run_bot() -> None:
                 grid.update_trailing_sl(start_price)
             else:
                 grid.update_trailing_sl_short(start_price)
-            _refresh_sl_stops(position_side, position_qty)
+            # The third caller, and the one that matters most: this runs at STARTUP with
+            # an inherited position, before the loop has done anything. Discarding the
+            # answer here meant a restart that could not re-establish stops went on to
+            # activate the grid and add exposure to a naked position (AUDIT #52).
+            if not _refresh_sl_stops(position_side, position_qty):
+                grid.block_side("buy" if position_side == "long" else "sell",
+                                "stop-loss missing at startup")
             grid.log_sl_status(position_side)
         except Exception as e:
             logger.error("Failed to place stop-loss on startup: {}", e)
+            grid.block_side("buy" if position_side == "long" else "sell",
+                            "stop-loss placement raised at startup")
 
     price_now = exchange.get_price(settings.symbol)
     balance_info = exchange.get_balance_info()
@@ -1181,6 +1195,22 @@ def run_bot() -> None:
                     # the grid's per-level estimate (see AUDIT.md "Daily PnL is still
                     # unreconciled" -- risk.state.daily_realized_pnl itself is left alone,
                     # it still drives consecutive_losses via record_trade()).
+                    # A kill switch fed a frozen number is not a kill switch. If the
+                    # income ledger has gone quiet, daily_net_pnl stops moving and the
+                    # daily-loss limit can never trip, however badly the account is
+                    # doing. Same rule as an unprotected position (#50): it may be
+                    # closed and it may be held, but it may not grow (AUDIT #52).
+                    if pnl_reconciler.is_stale(PNL_STALE_SECONDS):
+                        age = pnl_reconciler.seconds_since_sync()
+                        logger.error(
+                            "PNL FEED STALE | no income data for {} — the daily-loss kill "
+                            "switch is reading a frozen figure; blocking new exposure",
+                            "ever" if age == float("inf") else f"{age / 60:.0f}m",
+                        )
+                        events.risk_check("pnl_feed_age", age, float(PNL_STALE_SECONDS), "STALE")
+                        grid.block_side("buy", "PnL feed stale")
+                        grid.block_side("sell", "PnL feed stale")
+
                     is_safe, is_fatal = risk.check_all(
                         equity, grid_sl_price, price, exposure, side=position_side or "long",
                         daily_realized_pnl=pnl_reconciler.daily_net_pnl,

@@ -894,6 +894,124 @@ Verified adversarially: with the fix reverted, 2 of the 29 router tests fail.
 
 ---
 
+## 52. The harness was measuring a different bot -- CRITICAL (measurement integrity)
+
+Two defects in `backtest.py`/`run_backtest.py` that did not lose money directly. They
+did something worse: they made the numbers this project has been steering by describe a
+bot that does not exist. Both were found by asking why a knob appeared to do nothing.
+
+### 52a. The harness traded a band production sits out -- CRITICAL
+
+main.py pauses on a confirmed trend and re-activates on a confirmed **RANGE**:
+
+```python
+if trend.is_trending() and grid.active:   grid.pause()
+elif trend.is_ranging() and not grid.active:   grid.activate(...)
+```
+
+backtest.py re-activated on **"not a trend"** -- which is RANGING *or* UNCERTAIN.
+
+That gap is the entire UNCERTAIN band. Measured over 180 days of hourly candles at the
+live thresholds (trend 30, range 15):
+
+```
+symbol    ranging   uncertain   trending
+DOGE        13.0%      59.4%      27.6%
+ETH         11.2%      54.7%      34.2%
+SOL         12.4%      57.0%      30.5%
+```
+
+**The harness was scoring a bot that trades ~87% of the time against a live bot that
+trades ~13%.** The tell was a knob with no effect: sweeping `ADX_RANGE_THRESHOLD` across
+15/20/25/30 returned byte-identical results, because only `trend_threshold` was ever
+consulted. With the gate corrected, the same sweep spans +73.47 to -67.22.
+
+### 52b. Every non-DOGE backtest used DOGE's tick and step -- CRITICAL
+
+`backtest.py` defaults `price_decimals=5, amount_decimals=0` -- DOGE's -- and
+`run_backtest.py` never passed them. `--symbol` changed a label, not the precision.
+
+One grid level is ~1.8% of a 5,000 balance, about 90 USDT. At `amount_decimals=0` that
+is **0 ETH**: the order rounds away entirely. The run completes, reports `0.00 net, 0
+fills`, and raises nothing. SOL rounded to whole coins instead, mis-sizing every order.
+
+Every cross-asset result recorded in this file predates the fix. The claim that the
+router stays off partly because "SOL already showed a ranking reversing out of sample"
+rests on a run that used DOGE's step size, and should be treated as unmeasured rather
+than as evidence.
+
+Unknown symbols now stop with an explicit message instead of silently borrowing DOGE's
+precision. `KNOWN_PRECISION` was read from Binance's market metadata on 2026-08-14, not
+guessed -- SOL's amount step is 0.01, which is not what it looks like it should be.
+`MIN_NOTIONAL_USDT` is still hardcoded at 5.0, which is right for DOGE and SOL and wrong
+for ETH (20) and BTC (50); noted in the code rather than fixed, since nothing trades
+those.
+
+### What the corrected harness says about the live config
+
+With the gate fixed, `ADX_RANGE_THRESHOLD` is the strongest effect measured in this
+project. On DOGE, selecting on the first 120 days and validating on an untouched 60:
+
+```
+                       in-sample    out-of-sample
+range<=15                 +73.47          +65.41
+range<=20                  -8.57          -33.74
+range<=25                 -67.22           +9.58
+```
+
+And against the noise floor (180d, 16 start offsets):
+
+```
+range<=15   mean +117.94   sd 67.03   mean/sd 1.76   14/16 positive
+range<=20   mean  +16.27   sd 72.92   mean/sd 0.22    8/16 positive
+```
+
+This project's own rule is that below ~0.5 a result is indistinguishable from chance.
+**1.76 is the first configuration here to clear that bar**, and it agrees in-sample,
+out-of-sample, and across start offsets.
+
+The live setting is already 15. The conclusion is therefore not a change -- it is that
+**the idleness is the strategy working.** The grid is paused ~60% of the time, and the
+attempt to "fix" the bot not trading by widening the band would have destroyed the only
+robust edge this bot has. That is the opposite of the change I expected to make when I
+started measuring, which is the reason for measuring.
+
+It does not generalise across assets: run correctly, ETH prefers 25 (+47.41) and is
+worst at 15 (-95.69). Consistent with everything else in this file, the parameter is
+asset-specific and must not be carried to another symbol without re-measuring.
+
+### 52c. Two more risk controls reading numbers nobody checked
+
+Found by enumerating every function that returns a `bool` and every call site that
+discards it -- the family behind #47, #49, #50 and #51.
+
+**A third `_refresh_sl_stops` caller.** #50 fixed the two in the loop and missed the one
+at startup, which is the one that matters most: it runs against an **inherited** position
+before the loop has done anything, and discarding the answer meant a restart that could
+not re-establish stops went on to activate the grid and add to a naked position.
+
+**`PnLReconciler.last_sync_time` was written from the beginning and read by nobody.** The
+income endpoint is separate from the order endpoints and fails on its own; when it does,
+`sync()` logs a warning, returns `False`, and all three callers in main.py discard it.
+`daily_net_pnl` then stops moving -- and it is the input to the daily-loss kill switch.
+The account can bleed while the switch reads a healthy figure from an hour ago. This is
+#39's frozen-equity defect in a second location.
+
+Both now follow the #50 rule: the position may be closed and may be held, but it may not
+grow. `is_stale()`/`seconds_since_sync()` make the age readable, and both blocks clear
+themselves on the next good iteration.
+
+### Verified adversarially
+
+`tests/test_harness_fidelity.py` (5) and `tests/test_stale_feeds.py` (6). With all four
+fixes reverted, 8 of 11 fail. The harness-fidelity tests pin **both** sides of the
+contract -- if main.py's gate changes, the test naming backtest.py's mirror fails too, so
+the next person is told where the other half lives instead of discovering this again.
+
+Full suite: 499 passed, 5 skipped.
+
+---
+
 ## 51. A failed cancel is not a cancel, and the fees were never all-maker -- CRITICAL
 
 `Exchange.cancel_order` has always returned an honest `bool`: `True` only when the order

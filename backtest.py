@@ -736,10 +736,22 @@ def _run(ohlcv, *, symbol, starting_balance, grid_count, capital_per_grid_pct,
                     # interface -- place_initial_orders below drives any handoff.
                     strategy.update_regime(regimes[i])
                 else:
-                    trending = regimes[i] in ("uptrend", "downtrend")
-                    if trending and engine.active:
+                    # Mirror main.py exactly. It pauses on a confirmed trend and
+                    # re-activates only on a confirmed RANGE -- not on "anything that is
+                    # not a trend". The difference is the whole UNCERTAIN band, and this
+                    # harness used to trade straight through it while production sat out.
+                    #
+                    # That is not a rounding error. With the live thresholds (trend 30,
+                    # range 15) UNCERTAIN is 59.4% of DOGE candles, 54.7% of ETH, 57.0%
+                    # of SOL. The harness was measuring a bot that trades ~87% of the
+                    # time against a live bot that trades ~13%, and it made
+                    # ADX_RANGE_THRESHOLD look like a knob with no effect: sweeping it
+                    # 15/20/25/30 returned byte-identical results, because only
+                    # trend_threshold was ever consulted (AUDIT #52).
+                    regime = regimes[i]
+                    if regime in ("uptrend", "downtrend") and engine.active:
                         engine.pause()
-                    elif not trending and not engine.active:
+                    elif regime == "ranging" and not engine.active:
                         engine.active = True
                 if not strategy.active:
                     paused_candles += 1

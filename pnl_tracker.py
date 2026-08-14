@@ -64,6 +64,26 @@ class PnLReconciler:
         """Realized PnL net of commissions and funding — the true cumulative PnL."""
         return self.realized_pnl + self.commission + self.funding_fee
 
+    def seconds_since_sync(self) -> float:
+        """Age of the numbers on this object. `inf` if it has never synced."""
+        if self.last_sync_time <= 0:
+            return float("inf")
+        return max(0.0, time.time() - self.last_sync_time)
+
+    def is_stale(self, max_age_seconds: float) -> bool:
+        """Is `daily_net_pnl` too old to make a risk decision on?
+
+        `last_sync_time` was recorded from the very beginning and read by nobody. The
+        income endpoint is separate from the order endpoints and can fail on its own --
+        and when it does, sync() logs a warning, returns False, and every caller in
+        main.py discards that answer. The numbers then simply stop moving.
+
+        A frozen daily PnL is the worst possible input to a daily-loss kill switch: the
+        account bleeds and the switch reads yesterday's healthy figure forever. This is
+        AUDIT #39's frozen-equity defect in a second location (AUDIT #52).
+        """
+        return self.seconds_since_sync() > max_age_seconds
+
     def to_dict(self) -> dict:
         return {
             "realized_pnl": self.realized_pnl,

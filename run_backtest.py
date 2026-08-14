@@ -70,6 +70,48 @@ def _defaults_from_env() -> dict:
     }
 
 
+# Price/quantity precision, from Binance USDM market metadata. `backtest.py` defaults
+# these to DOGEUSDT's (5, 0) and this front end never passed them, so every non-DOGE run
+# silently used DOGE's tick and step. That is not a small distortion: one grid level is
+# ~1.8% of a 5,000 balance = ~90 USDT, and at amount_decimals=0 that is 0 ETH -- the
+# order rounds away entirely and the run reports 0 fills, 0.00 net, no error. SOL rounds
+# to whole coins instead, mis-sizing every order.
+#
+# Every cross-asset result this project has recorded predates this fix. Rather than
+# guess a symbol's precision, unknown symbols now stop with an explicit message
+# (AUDIT #52).
+# Read from Binance USDM market metadata on 2026-08-14 (tick/step converted to decimal
+# places). Re-read rather than extend by guesswork -- SOL's amount step is 0.01, not the
+# whole coin it looks like it should be.
+#
+# NOTE the harness also hardcodes MIN_NOTIONAL_USDT = 5.0, which is DOGE's and SOL's.
+# ETH's real minimum is 20 and BTC's is 50, so cross-asset runs on those two still model
+# a smaller minimum order than the exchange allows.
+KNOWN_PRECISION: dict[str, tuple[int, int]] = {
+    "DOGEUSDT": (5, 0),
+    "ETHUSDT": (2, 3),
+    "SOLUSDT": (2, 2),
+    "BTCUSDT": (1, 3),
+}
+
+
+def _resolve_precision(symbol: str, args) -> tuple[int, int]:
+    if args.price_decimals is not None and args.amount_decimals is not None:
+        return args.price_decimals, args.amount_decimals
+    known = KNOWN_PRECISION.get(symbol.upper())
+    if known is not None:
+        return known
+    raise SystemExit(
+        f"No market precision is known for {symbol}.\n\n"
+        f"The harness used to fall back to DOGEUSDT's (5 price / 0 amount decimals) "
+        f"without saying so, which rounds every ETH-sized order to zero and every SOL "
+        f"order to a whole coin -- so the run completes, reports a number, and means "
+        f"nothing.\n\n"
+        f"Pass the real values from the exchange's market metadata:\n"
+        f"  --price-decimals N --amount-decimals N"
+    )
+
+
 def _parse_sweep(spec: str) -> tuple[str, list]:
     if "=" not in spec:
         raise SystemExit(f"--sweep needs KEY=v1,v2,...  got '{spec}'")
@@ -108,12 +150,18 @@ def main() -> None:
     p.add_argument("--offsets", type=int, default=12, help="Number of start offsets for --robustness.")
     p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                    help="Override any sweepable parameter, repeatable.")
+    p.add_argument("--price-decimals", type=int, default=None,
+                   help="Price precision for the symbol, from the exchange's market "
+                        "metadata. Required for any symbol not in KNOWN_PRECISION.")
+    p.add_argument("--amount-decimals", type=int, default=None,
+                   help="Quantity precision for the symbol. See --price-decimals.")
     args = p.parse_args()
 
     cfg = _defaults_from_env()
     symbol = args.symbol or cfg.get("symbol", "DOGEUSDT")
     cfg["symbol"] = symbol
     cfg["use_trend_filter"] = args.trend_filter
+    cfg["price_decimals"], cfg["amount_decimals"] = _resolve_precision(symbol, args)
 
     for override in args.set:
         key, values = _parse_sweep(override)
