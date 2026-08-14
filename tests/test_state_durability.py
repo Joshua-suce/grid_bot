@@ -19,7 +19,7 @@ from state import StateManager
 
 
 def test_state_round_trips(tmp_path):
-    sm = StateManager(state_dir=str(tmp_path), symbol="DOGEUSDT")
+    sm = StateManager(state_dir=str(tmp_path), symbol="DOGEUSDT", demo=True)
     assert sm.save({"hard_sl": 0.0673, "peak": 0.0710}) is True
     assert sm.load() == {"hard_sl": 0.0673, "peak": 0.0710}
 
@@ -43,7 +43,7 @@ def test_the_payload_is_fsynced_before_the_rename(tmp_path, monkeypatch):
     monkeypatch.setattr("state.os.fsync", spy_fsync)
     monkeypatch.setattr("state.os.replace", spy_replace)
 
-    StateManager(state_dir=str(tmp_path), symbol="DOGEUSDT").save({"a": 1})
+    StateManager(state_dir=str(tmp_path), symbol="DOGEUSDT", demo=True).save({"a": 1})
 
     assert events == ["fsync", "replace"], (
         f"durability ordering is wrong: {events} -- the rename can outrun the data"
@@ -51,7 +51,7 @@ def test_the_payload_is_fsynced_before_the_rename(tmp_path, monkeypatch):
 
 
 def test_a_failed_save_reports_failure(tmp_path, monkeypatch):
-    sm = StateManager(state_dir=str(tmp_path), symbol="DOGEUSDT")
+    sm = StateManager(state_dir=str(tmp_path), symbol="DOGEUSDT", demo=True)
     monkeypatch.setattr("state.os.replace", lambda *a: (_ for _ in ()).throw(OSError("disk full")))
 
     assert sm.save({"a": 1}) is False
@@ -60,7 +60,7 @@ def test_a_failed_save_reports_failure(tmp_path, monkeypatch):
 
 def test_repeated_failures_accumulate_and_reset_on_success(tmp_path, monkeypatch):
     """The counter is what makes a persistently unwritable disk visible at all."""
-    sm = StateManager(state_dir=str(tmp_path), symbol="DOGEUSDT")
+    sm = StateManager(state_dir=str(tmp_path), symbol="DOGEUSDT", demo=True)
     boom = lambda *a: (_ for _ in ()).throw(OSError("disk full"))
     monkeypatch.setattr("state.os.replace", boom)
 
@@ -76,7 +76,7 @@ def test_repeated_failures_accumulate_and_reset_on_success(tmp_path, monkeypatch
 def test_a_failed_save_leaves_no_temp_files_behind(tmp_path, monkeypatch):
     """A save that fails every iteration must not fill the disk with .state_* files
     while it does so."""
-    sm = StateManager(state_dir=str(tmp_path), symbol="DOGEUSDT")
+    sm = StateManager(state_dir=str(tmp_path), symbol="DOGEUSDT", demo=True)
     monkeypatch.setattr("state.os.replace", lambda *a: (_ for _ in ()).throw(OSError("disk full")))
 
     for _ in range(20):
@@ -86,7 +86,7 @@ def test_a_failed_save_leaves_no_temp_files_behind(tmp_path, monkeypatch):
 
 
 def test_a_failed_save_does_not_destroy_the_previous_good_state(tmp_path, monkeypatch):
-    sm = StateManager(state_dir=str(tmp_path), symbol="DOGEUSDT")
+    sm = StateManager(state_dir=str(tmp_path), symbol="DOGEUSDT", demo=True)
     sm.save({"hard_sl": 0.0673})
 
     monkeypatch.setattr("state.os.replace", lambda *a: (_ for _ in ()).throw(OSError("disk full")))
@@ -97,7 +97,7 @@ def test_a_failed_save_does_not_destroy_the_previous_good_state(tmp_path, monkey
 
 
 def test_an_empty_state_file_is_moved_aside_rather_than_parsed(tmp_path):
-    sm = StateManager(state_dir=str(tmp_path), symbol="DOGEUSDT")
+    sm = StateManager(state_dir=str(tmp_path), symbol="DOGEUSDT", demo=True)
     sm.filepath.write_text("")
 
     assert sm.load() is None
@@ -105,7 +105,7 @@ def test_an_empty_state_file_is_moved_aside_rather_than_parsed(tmp_path):
 
 
 def test_a_corrupt_state_file_is_backed_up_not_deleted(tmp_path):
-    sm = StateManager(state_dir=str(tmp_path), symbol="DOGEUSDT")
+    sm = StateManager(state_dir=str(tmp_path), symbol="DOGEUSDT", demo=True)
     sm.filepath.write_text("{not json")
 
     assert sm.load() is None

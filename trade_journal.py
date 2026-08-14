@@ -8,10 +8,19 @@ from loguru import logger
 
 
 class TradeJournal:
-    def __init__(self, log_dir: str = "logs") -> None:
+    """Per-fill record, scoped to the account it came from.
+
+    This wrote every fill to one trades.csv regardless of account, so a demo run and a
+    live run would interleave in the file that tools/analyze_performance.py reads to
+    judge how the bot is doing. Demo fills are free; live fills are not; averaged
+    together they answer nothing (AUDIT #70).
+    """
+
+    def __init__(self, log_dir: str = "logs", demo: bool = True) -> None:
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.filepath = self.log_dir / "trades.csv"
+        self.mode = "demo" if demo else "live"
+        self.filepath = self.log_dir / f"trades_{self.mode}.csv"
         self._ensure_header()
 
     _HEADER = [

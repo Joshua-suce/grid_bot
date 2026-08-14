@@ -26,8 +26,11 @@ class StateManager:
     Separate files per mode mean the two can never occupy one another's state.
     """
 
-    def __init__(self, state_dir: str = "state", symbol: str = "BTCUSDT",
-                 demo: bool = True):
+    def __init__(self, state_dir: str = "state", symbol: str = "BTCUSDT", *,
+                 demo: bool):
+        # `demo` is required and keyword-only on purpose. A default would let the fix
+        # above be undone by omission -- a live caller that forgot the argument would
+        # silently get the demo file, which is the exact bug (AUDIT #67/#71).
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.mode = "demo" if demo else "live"
@@ -45,6 +48,23 @@ class StateManager:
                 "it to {} if you know it belongs to this account",
                 legacy, self.mode, self.filepath.name,
             )
+
+    def has_history(self) -> bool:
+        """Has this bot ever run against THIS account and symbol?
+
+        Startup market-closes any position it finds when there is no saved grid to
+        unwind it with, on the reasoning that it is an orphan of a dead session. That
+        reasoning holds for a crash. It does not hold the first time the bot is pointed
+        at an account, where a position it did not open belongs to whoever did.
+
+        Backups, emptied files and corrupt files all count: they are proof of a previous
+        session even though none of them can be restored (AUDIT #72).
+        """
+        stem = self.filepath.stem
+        return any(
+            p.name == self.filepath.name or p.name.startswith(f"{stem}.")
+            for p in self.state_dir.glob(f"{stem}*")
+        )
 
     def save(self, data: dict) -> bool:
         """Atomically persist state. Returns False if it could not be written.

@@ -8,10 +8,13 @@ from loguru import logger
 
 
 class EventJournal:
-    def __init__(self, log_dir: str = "logs") -> None:
+    """Structured event stream, scoped to the account it came from (AUDIT #70)."""
+
+    def __init__(self, log_dir: str = "logs", demo: bool = True) -> None:
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.filepath = self.log_dir / "events.jsonl"
+        self.mode = "demo" if demo else "live"
+        self.filepath = self.log_dir / f"events_{self.mode}.jsonl"
 
     def _emit(self, event: str, **data: object) -> None:
         record = {

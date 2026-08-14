@@ -5,7 +5,22 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
-from analyze_performance import build_report  # noqa: E402
+from analyze_performance import build_report, default_csv  # noqa: E402
+
+
+@pytest.mark.parametrize("env,expected", [
+    ("true", "trades_demo.csv"),
+    ("True", "trades_demo.csv"),
+    ("1", "trades_demo.csv"),
+    ("false", "trades_live.csv"),
+    ("False", "trades_live.csv"),
+    ("0", "trades_live.csv"),
+])
+def test_the_default_journal_follows_demo_mode(monkeypatch, env, expected):
+    """The journals are per-account since #70, so there is no single trades.csv to
+    default to -- and defaulting to the wrong one reports demo fills as live results."""
+    monkeypatch.setenv("DEMO_MODE", env)
+    assert default_csv().name == expected
 
 
 def _row(ts, regime, cycle_pnl, fee, completed=True):

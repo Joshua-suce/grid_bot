@@ -1,10 +1,13 @@
 """Performance analysis / tuning-decision report for the grid bot.
 
-Reads the bot's own trade history (logs/trades.csv) -- no exchange
+Reads the bot's own trade history (logs/trades_{demo,live}.csv) -- no exchange
 connection or API keys required -- and reports win rate, net PnL, and fee
 drag, broken down by market regime and by day. Flags regimes that are net
 losers and estimates how much of the drag is concentrated in a handful of
 outlier trades.
+
+Defaults to the journal matching DEMO_MODE, because reporting demo fills as live
+results is the one output nobody could use.
 
 This is meant to be re-run periodically (e.g. weekly, or after switching a
 configs/*.env profile) to make config tuning an evidence-based, repeatable
@@ -13,12 +16,13 @@ exchange.
 
 Usage:
     python tools/analyze_performance.py
-    python tools/analyze_performance.py --csv logs/trades.csv --top 10
+    python tools/analyze_performance.py --csv logs/trades_live.csv --top 10
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -174,14 +178,36 @@ def format_report(report: Report) -> str:
     return "\n".join(lines)
 
 
+def default_csv(log_dir: str = "logs") -> Path:
+    """Pick the journal for the mode the bot is configured for.
+
+    The journals are per-account since AUDIT #70, so there is no single trades.csv to
+    default to -- and defaulting to the wrong one would report demo results as live.
+    """
+    demo = os.environ.get("DEMO_MODE", "").strip().lower()
+    if demo in ("true", "1", "yes", "on"):
+        return Path(log_dir) / "trades_demo.csv"
+    if demo in ("false", "0", "no", "off"):
+        return Path(log_dir) / "trades_live.csv"
+    try:
+        from config import settings  # optional: only if the package imports cleanly
+        return Path(log_dir) / f"trades_{'demo' if settings.demo_mode else 'live'}.csv"
+    except Exception:
+        return Path(log_dir) / "trades_demo.csv"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--csv", default="logs/trades.csv", help="Path to trades.csv")
+    parser.add_argument("--csv", default=None,
+                        help="Path to a trades journal (default: the one matching DEMO_MODE)")
     parser.add_argument("--top", type=int, default=10, help="Number of worst trades to show")
     args = parser.parse_args()
 
+    path = Path(args.csv) if args.csv else default_csv()
+    print(f"reading {path}", file=sys.stderr)
+
     try:
-        rows = load_rows(Path(args.csv))
+        rows = load_rows(path)
     except FileNotFoundError as e:
         print(str(e), file=sys.stderr)
         return 1
