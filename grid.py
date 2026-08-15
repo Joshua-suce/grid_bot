@@ -965,16 +965,75 @@ class GridEngine:
         if gap <= 0:
             return []
         occupied = sorted({l.price for l in self.levels})
+
+        # The ladder is NOT a uniform lattice. _initialize_dynamic concentrates rungs
+        # near price, so grid_spacing is an AVERAGE and neighbouring lines legitimately
+        # sit anywhere from 1.0 to ~1.7 of it apart. This used to demand a clean
+        # multiple of the average, which rejected a real 1.733-spacing hole as "ragged"
+        # and left the ladder a line short for an entire run (AUDIT #82).
+        #
+        # A hole is therefore just a gap wide enough to seat another rung, and the rung
+        # goes in the middle of it. No lattice is assumed. The upper bound keeps rungs
+        # from being invented inside a stretch the ladder legitimately spans.
         holes: list[float] = []
         for a, b in zip(occupied, occupied[1:]):
-            n = int(round((b - a) / gap))
-            # Only a clean multiple of the spacing is a hole. A ragged gap means the
-            # levels have drifted off the lattice, and inventing lines inside it would
-            # put orders where the ladder never had any.
-            if n < 2 or n > self.grid_count + 1 or abs((b - a) - n * gap) > gap * 0.25:
-                continue
-            holes.extend(self._round_price(a + k * gap) for k in range(1, n))
+            width = (b - a) / gap
+            if 1.5 <= width <= 3.0:
+                holes.append(self._round_price((a + b) / 2))
         return holes
+
+    def _repair_ladder(self, current_price: float | None) -> None:
+        """Move a doubled-up rung onto a line the ladder has lost.
+
+        _release_awaiting_levels can only rehome a rung that is HELD, so a hole is
+        repaired only when a stranded 'awaiting_counter' rung happens to be sitting
+        beside it. On a saw-tooth that fired exactly ONCE in a whole run: the ladder
+        dropped a line and stayed down, and it is always the line nearest price that
+        goes, because that is where the fills are (AUDIT #82).
+
+        Fills migrate levels between lines, so a lost line always has a doubled-up line
+        somewhere to pay for it. Only a rung with no live order is moved -- one resting
+        on the exchange is left alone, since relocating it would need a cancel and this
+        runs every poll.
+        """
+        if current_price is None:
+            return
+        holes = self._ladder_holes()
+        if not holes:
+            return
+
+        occupants: dict[float, list[GridLevel]] = {}
+        for lvl in self.levels:
+            occupants.setdefault(lvl.price, []).append(lvl)
+        claimed = {(l.price, l.side) for l in self.levels if l.order_id is not None}
+
+        for hole in sorted(holes, key=lambda h: abs(h - current_price)):
+            side = "buy" if hole < current_price else "sell"
+            if (hole, side) in claimed:
+                continue
+            spare = next(
+                (lvl for group in occupants.values() if len(group) > 1
+                 for lvl in group
+                 if lvl.order_id is None
+                 and lvl.status in ("pending", "awaiting_counter")),
+                None,
+            )
+            if spare is None:
+                return                      # nothing free to pay for the hole
+            occupants[spare.price].remove(spare)
+            logger.info(
+                "LADDER REPAIRED | {} {} -> {} {} — two rungs shared that line while "
+                "this one had none",
+                spare.side.upper(), spare.price, side.upper(), hole,
+            )
+            spare.price = hole
+            spare.side = side
+            spare.status = "pending"
+            spare.order_id = None
+            spare.awaiting_side = None
+            spare.awaiting_price = None
+            occupants.setdefault(hole, []).append(spare)
+            claimed.add((hole, side))
 
     def _release_awaiting_levels(self, current_price: float | None = None) -> None:
         """Bring held rungs back, either as the counter leg or at their own rung.
@@ -1211,7 +1270,9 @@ class GridEngine:
         failed = 0
         held = 0
         first = True
-        self._release_awaiting_levels(self._current_price_or_none())
+        _price_now = self._current_price_or_none()
+        self._release_awaiting_levels(_price_now)
+        self._repair_ladder(_price_now)
         for level in self.levels:
             if level.order_id is not None:
                 continue
@@ -1665,7 +1726,9 @@ class GridEngine:
                 fills.append(self._handle_fill(level, balance))
 
         # Held rungs come back when the counter frees, or when price clears them.
-        self._release_awaiting_levels(self._current_price_or_none())
+        _price_now = self._current_price_or_none()
+        self._release_awaiting_levels(_price_now)
+        self._repair_ladder(_price_now)
 
         orphaned = [l for l in self.levels if l.order_id is None and l.status == "pending" and (l.quantity > 0 or l.fill_count == 0)]
         if orphaned:

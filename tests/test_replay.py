@@ -162,22 +162,12 @@ def test_a_market_that_actually_swings_produces_cycles():
     assert r["cycles"] > 0
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "OPEN, AUDIT #82. #79 keeps the ladder whole on the recorded 2026-08-15 path, "
-    "but a market that genuinely swings still drives it 14 -> 13. The recorded run "
-    "was nearly flat (0.444%), so it never exercised this. Deterministic replay of a "
-    "2.9% saw-tooth does, and the line is lost for the rest of the run."))
 def test_the_ladder_keeps_every_line_through_a_swinging_market():
     r = replay(sawtooth(0.0690, 0.0710, 6))
     assert r["lines_worst"] == r["lines_start"], (
         f"ladder fell from {r['lines_start']} lines to {r['lines_worst']}")
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "OPEN, AUDIT #83. In a rising market the engine retries one rung as a SELL below "
-    "the market over and over -- 136 attempts at 0.06931 while price ran 0.0694-0.0699. "
-    "Binance rejects every one of those post-only (-2019), so live this is a rung that "
-    "silently never re-arms. #77 re-sides a rung on RELEASE; this path does not."))
 def test_no_crossing_orders_are_ever_placed():
     r = replay(sawtooth(0.0690, 0.0710, 6))
     assert not r["crossing"], f"engine placed {len(r['crossing'])} crossing orders"

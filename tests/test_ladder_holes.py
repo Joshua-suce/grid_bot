@@ -155,9 +155,10 @@ def test_two_stranded_rungs_do_not_both_take_one_hole():
 
 
 def test_a_rung_stays_held_when_the_ladder_has_no_hole():
-    """Option 3 must not relocate rungs for its own sake."""
+    """Option 3 must not relocate rungs for its own sake. The ladder here is whole --
+    one level per line, nothing doubled up -- so there is nowhere it needs to go."""
     stranded = held(0.06987, "buy", 0.07001, "sell")
-    levels = [stranded, live(0.06987, "buy"), live(0.07001, "sell")]
+    levels = [stranded, live(0.07001, "sell"), live(0.07015, "sell")]
 
     engine(levels)._release_awaiting_levels(0.06994)
 
