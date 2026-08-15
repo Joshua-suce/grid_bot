@@ -26,8 +26,42 @@ import re
 import sys
 from pathlib import Path
 
+import grid as _grid
 from config import settings
 from grid import GridEngine
+
+
+class VirtualClock:
+    """Deterministic time for the engine under replay.
+
+    GridEngine caches the position and the open-order map for 2.0 wall-clock seconds
+    (grid.py break-even and _open_orders_map). A replay pushes ~2000 ticks through in
+    about ten seconds of real time, so those caches straddle real seconds arbitrarily
+    and the SAME code gives different answers run to run -- measured: 6 fills/14 lines
+    on one run, 5 fills/13 lines on the next.
+
+    That makes a replay useless as a regression test, and it is also unfaithful: live
+    polls are ~15s apart, so those caches have always expired by the next tick. The
+    clock advances one poll interval per tick, which is both deterministic and closer
+    to what the bot really sees.
+    """
+
+    def __init__(self, step: float, start: float = 1_700_000_000.0):
+        self._now = float(start)
+        self._step = float(step)
+
+    def advance(self) -> None:
+        self._now += self._step
+
+    def time(self) -> float:
+        return self._now
+
+    def sleep(self, seconds):        # never actually wait during a replay
+        self._now += float(seconds or 0)
+
+    def __getattr__(self, name):     # anything else falls through to the real module
+        import time as _real
+        return getattr(_real, name)
 
 
 # --------------------------------------------------------------------------------
@@ -246,18 +280,25 @@ def replay(prices: list[float], *, grid_count: int | None = None,
         max_exposure_pct=settings.max_exposure_pct,
         min_profit_multiplier=settings.min_profit_multiplier,
     )
-    grid.initialize(start, paper.free)
-    grid.activate(paper.free)
+    clock = VirtualClock(step=max(settings.poll_interval, 1))
+    real_time = _grid.time
+    _grid.time = clock
+    try:
+        grid.initialize(start, paper.free)
+        grid.activate(paper.free)
 
-    lines_at_start = len({l.price for l in grid.levels})
-    worst_lines, worst_at = lines_at_start, None
+        lines_at_start = len({l.price for l in grid.levels})
+        worst_lines, worst_at = lines_at_start, None
 
-    for i, p in enumerate(prices):
-        paper.tick(p)
-        grid.check_fills(paper.free)
-        n = len({l.price for l in grid.levels})
-        if n < worst_lines:
-            worst_lines, worst_at = n, i
+        for i, p in enumerate(prices):
+            clock.advance()
+            paper.tick(p)
+            grid.check_fills(paper.free)
+            n = len({l.price for l in grid.levels})
+            if n < worst_lines:
+                worst_lines, worst_at = n, i
+    finally:
+        _grid.time = real_time
 
     return {
         "ticks": len(prices),
