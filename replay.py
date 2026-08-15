@@ -1,0 +1,326 @@
+"""Replay recorded prices through the real GridEngine. No network, no waiting.
+
+Every behavioural defect found live so far -- #75 phantom fills, #77 one-way
+starvation, #79 the vacated ladder line, #80 the overstated cycle P&L -- was fully
+visible in data the bot had already written to its own log. Finding them cost 8-hour
+live runs anyway, because there was no way to re-run a recorded session.
+
+This is that way. It drives the actual GridEngine against a paper exchange that fills
+resting limit orders when the recorded price crosses them, and asserts the invariants
+that live runs kept violating:
+
+  * the ladder keeps one level per grid line and never loses one       (#79)
+  * no post-only order is ever placed on the wrong side of the market  (#77)
+  * the grid's own P&L claim matches the fills that actually happened  (#80)
+
+Usage:
+    py replay.py                       # replay the newest log
+    py replay.py logs/grid_2026-08-15.log
+    py replay.py --run 1               # an earlier run in the same log (0 = newest)
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+from config import settings
+from grid import GridEngine
+
+
+# --------------------------------------------------------------------------------
+# a paper exchange: same surface GridEngine calls, none of the network
+# --------------------------------------------------------------------------------
+
+class _Ccxt:
+    """The precision helpers GridEngine reaches for via exchange.exchange."""
+
+    def __init__(self, price_dp: int, amount_dp: int):
+        self._p, self._a = price_dp, amount_dp
+
+    def price_to_precision(self, symbol, price):
+        return f"{float(price):.{self._p}f}"
+
+    def amount_to_precision(self, symbol, amount):
+        return f"{float(amount):.{self._a}f}"
+
+
+class PaperExchange:
+    """Fills a resting limit order the moment the recorded price reaches it.
+
+    Position is NETTED, one-way, exactly as Binance USDM runs it -- a buy against a
+    short reduces it and realises P&L rather than opening a second leg. Getting that
+    wrong is what makes the grid's own (exit-entry)*qty arithmetic disagree with the
+    account, so the paper book models it properly and reports the real number.
+    """
+
+    def __init__(self, symbol: str, balance: float = 5000.0,
+                 maker_fee: float = 0.0002, price_dp: int = 5, amount_dp: int = 0):
+        self.symbol = symbol
+        self.exchange = _Ccxt(price_dp, amount_dp)
+        self.free = balance
+        self.maker_fee = maker_fee
+        self.price = 0.0
+        self.orders: dict[str, dict] = {}
+        self.qty = 0.0          # signed: + long, - short
+        self.entry = 0.0
+        self.realized = 0.0     # gross, before fees
+        self.fees = 0.0
+        self.trades: list[dict] = []
+        self.crossing_orders: list[dict] = []
+        self._seq = 0
+
+    # --- driving ---------------------------------------------------------------
+
+    def tick(self, price: float) -> list[str]:
+        self.price = price
+        hit = [
+            oid for oid, o in self.orders.items()
+            if o["status"] == "open"
+            and ((o["side"] == "buy" and price <= o["price"])
+                 or (o["side"] == "sell" and price >= o["price"]))
+        ]
+        for oid in hit:
+            self._execute(oid)
+        return hit
+
+    def _execute(self, oid: str) -> None:
+        o = self.orders[oid]
+        o["status"] = "closed"
+        o["filled"] = o["amount"]
+        o["info"]["executedQty"] = str(o["amount"])
+        signed = o["amount"] if o["side"] == "buy" else -o["amount"]
+        px = o["price"]
+        fee = abs(signed) * px * self.maker_fee
+        self.fees += fee
+
+        if self.qty == 0 or (self.qty > 0) == (signed > 0):
+            # opening or adding: blend the entry
+            total = self.qty + signed
+            self.entry = (self.entry * self.qty + px * signed) / total if total else 0.0
+            self.qty = total
+        else:
+            closing = min(abs(signed), abs(self.qty))
+            direction = 1 if self.qty > 0 else -1
+            self.realized += (px - self.entry) * closing * direction
+            self.qty += signed
+            if abs(self.qty) < 1e-9:
+                self.qty, self.entry = 0.0, 0.0
+            elif (self.qty > 0) != (direction > 0):
+                self.entry = px          # flipped through zero
+        self.trades.append({"id": oid, "side": o["side"], "price": px,
+                            "amount": o["amount"], "fee": fee})
+
+    @property
+    def net(self) -> float:
+        """What the account actually made: realised P&L less every fee paid."""
+        return self.realized - self.fees
+
+    # --- the surface GridEngine calls ------------------------------------------
+
+    def get_price(self, symbol):
+        return self.price
+
+    def get_balance(self, asset="USDT"):
+        return self.free
+
+    def can_place_order(self, symbol):
+        return True
+
+    def get_orderbook_depth(self, symbol, limit=10):
+        return {"bids": [[self.price, 1e6]], "asks": [[self.price, 1e6]],
+                "bid_volume": 1e6, "ask_volume": 1e6, "imbalance": 1.0}
+
+    def place_limit_order(self, symbol, side, price, amount, max_attempts=3,
+                          params=None, post_only=True, allow_taker_fallback=False,
+                          purpose="gg"):
+        # Strictly through the market. Resting AT the touch is a legitimate maker
+        # order; only a bid above it or an offer below it would take liquidity.
+        crosses = (side == "buy" and price > self.price) or \
+                  (side == "sell" and price < self.price)
+        if post_only and crosses:
+            # A real post-only order is REJECTED here (-2019). Silently filling it
+            # would hide exactly the bug #77 was about.
+            self.crossing_orders.append({"side": side, "price": price,
+                                         "market": self.price})
+            return None
+        self._seq += 1
+        oid = str(self._seq)
+        self.orders[oid] = {"id": oid, "side": side, "price": float(price),
+                            "amount": float(amount), "status": "open",
+                            "filled": 0.0, "info": {"executedQty": "0"}}
+        return dict(self.orders[oid])
+
+    def fetch_order(self, order_id, symbol, **kw):
+        o = self.orders.get(str(order_id))
+        return dict(o) if o else None
+
+    def cancel_order(self, order_id, symbol):
+        o = self.orders.get(str(order_id))
+        if o and o["status"] == "open":
+            o["status"] = "canceled"
+            return True
+        return False
+
+    def get_open_orders(self, symbol):
+        return [dict(o) for o in self.orders.values() if o["status"] == "open"]
+
+    def get_open_order_ids(self, symbol):
+        return {o["id"] for o in self.orders.values() if o["status"] == "open"}
+
+    def get_positions(self, symbol):
+        if self.qty == 0:
+            return []
+        return [{"contracts": abs(self.qty), "entryPrice": self.entry,
+                 "side": "long" if self.qty > 0 else "short"}]
+
+    def close_position(self, symbol, *a, **kw):
+        if self.qty:
+            self.realized += (self.price - self.entry) * self.qty
+            self.qty, self.entry = 0.0, 0.0
+        return True
+
+    def cancel_all_open_orders(self, symbol):
+        n = 0
+        for o in self.orders.values():
+            if o["status"] == "open":
+                o["status"] = "canceled"
+                n += 1
+        return n
+
+    def cancel_everything(self, symbol):
+        return self.cancel_all_open_orders(symbol)
+
+    def enforce_order_limit(self, *a, **kw):
+        return 0
+
+
+# --------------------------------------------------------------------------------
+# reading a recorded run
+# --------------------------------------------------------------------------------
+
+def load_prices(path: Path, run: int = 0) -> list[float]:
+    """Prices from one run in a log. run=0 is the newest run in the file."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    starts = [m.start() for m in re.finditer(r"GRID BOT STARTING", text)]
+    if not starts:
+        raise SystemExit(f"{path} has no run in it")
+    if run >= len(starts):
+        raise SystemExit(f"{path} has {len(starts)} run(s); asked for index {run}")
+    chunk = text[starts[-1 - run]:]
+    end = chunk.find("GRID BOT STARTING", 1)
+    if end != -1:
+        chunk = chunk[:end]
+    return [float(p) for p in re.findall(r"PRICE=([\d.]+)", chunk)]
+
+
+# --------------------------------------------------------------------------------
+# the replay
+# --------------------------------------------------------------------------------
+
+def replay(prices: list[float], *, grid_count: int | None = None,
+           spacing_pct: float | None = None, quiet: bool = False) -> dict:
+    start = prices[0]
+    count = grid_count or settings.grid_count
+    span = (spacing_pct if spacing_pct is not None
+            else settings.range_min_spacing_pct) * count / 2
+    lower, upper = start * (1 - span), start * (1 + span)
+
+    paper = PaperExchange(settings.symbol, maker_fee=settings.maker_fee_pct / 100)
+    paper.price = start
+
+    grid = GridEngine(
+        paper, settings.symbol,
+        grid_lower=lower, grid_upper=upper, grid_count=count,
+        capital_per_grid_pct=settings.capital_per_grid_pct,
+        stop_loss_pct=settings.stop_loss_pct,
+        maker_fee_pct=settings.maker_fee_pct / 100,
+        taker_fee_pct=settings.taker_fee_pct / 100,
+        taker_fill_share=settings.taker_fill_share_pct / 100,
+        recenter_cooldown=0, replacement_cooldown=0, order_pacing_seconds=0,
+        capital_per_grid_usdt=settings.capital_per_grid_usdt,
+        leverage=settings.leverage,
+        trailing_sl_trigger_pct=settings.trailing_sl_trigger_pct,
+        max_exposure_pct=settings.max_exposure_pct,
+        min_profit_multiplier=settings.min_profit_multiplier,
+    )
+    grid.initialize(start, paper.free)
+    grid.activate(paper.free)
+
+    lines_at_start = len({l.price for l in grid.levels})
+    worst_lines, worst_at = lines_at_start, None
+
+    for i, p in enumerate(prices):
+        paper.tick(p)
+        grid.check_fills(paper.free)
+        n = len({l.price for l in grid.levels})
+        if n < worst_lines:
+            worst_lines, worst_at = n, i
+
+    return {
+        "ticks": len(prices),
+        "fills": grid.total_fills,
+        "cycles": grid.total_completed_cycles,
+        "grid_net": grid.total_pnl - grid.total_fees,
+        "paper_net": paper.net,
+        "paper_fees": paper.fees,
+        "open_qty": paper.qty,
+        "levels": len(grid.levels),
+        "lines_start": lines_at_start,
+        "lines_worst": worst_lines,
+        "lines_worst_tick": worst_at,
+        "lines_end": len({l.price for l in grid.levels}),
+        "crossing": paper.crossing_orders,
+        "spacing": grid.grid_spacing,
+    }
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("log", nargs="?", help="log file (default: newest in logs/)")
+    ap.add_argument("--run", type=int, default=0, help="0 = newest run in the file")
+    ap.add_argument("--sweep", action="store_true",
+                    help="replay the same path at a range of spacings")
+    a = ap.parse_args()
+
+    path = Path(a.log) if a.log else max(Path("logs").glob("grid_*.log"),
+                                         key=lambda p: p.stat().st_mtime)
+    prices = load_prices(path, a.run)
+    print(f"replaying {path.name} run -{a.run}: {len(prices)} ticks, "
+          f"{min(prices)}-{max(prices)} ({(max(prices)-min(prices))/min(prices):.3%})\n")
+
+    r = replay(prices)
+    print(f"  fills                {r['fills']}")
+    print(f"  completed cycles     {r['cycles']}")
+    print(f"  grid claims          {r['grid_net']:+.4f} USDT")
+    print(f"  actually made        {r['paper_net']:+.4f} USDT   "
+          f"(fees {r['paper_fees']:.4f}, open {r['open_qty']:+.0f})")
+    gap = r["grid_net"] - r["paper_net"]
+    if abs(gap) > 0.005:
+        print(f"  MISMATCH             {gap:+.4f} USDT — the grid's cycle arithmetic "
+              f"does not describe the fills that happened (#80)")
+
+    print(f"\n  ladder lines         {r['lines_start']} at start, "
+          f"{r['lines_worst']} worst, {r['lines_end']} at end")
+    if r["lines_worst"] < r["lines_start"]:
+        print(f"  LADDER LOST A LINE   first at tick {r['lines_worst_tick']} (#79)")
+    if r["crossing"]:
+        print(f"  CROSSING ORDERS      {len(r['crossing'])} post-only orders placed on "
+              f"the wrong side of the market (#77)")
+        for c in r["crossing"][:3]:
+            print(f"      {c['side']} {c['price']} with market at {c['market']}")
+
+    if a.sweep:
+        print(f"\n  {'spacing':>9} {'fills':>6} {'cycles':>7} {'actually made':>14}")
+        for pct in (0.0008, 0.0010, 0.0012, 0.0015, 0.0020, 0.0025, 0.0030):
+            s = replay(prices, spacing_pct=pct, quiet=True)
+            tag = "  <- config" if abs(pct - settings.range_min_spacing_pct) < 1e-9 else ""
+            print(f"  {pct:>8.2%} {s['fills']:>6} {s['cycles']:>7} "
+                  f"{s['paper_net']:>+14.4f}{tag}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
