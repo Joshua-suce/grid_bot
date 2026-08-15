@@ -255,7 +255,8 @@ def load_prices(path: Path, run: int = 0) -> list[float]:
 # --------------------------------------------------------------------------------
 
 def replay(prices: list[float], *, grid_count: int | None = None,
-           spacing_pct: float | None = None, quiet: bool = False) -> dict:
+           spacing_pct: float | None = None, quiet: bool = False,
+           min_profit_multiplier: float | None = None) -> dict:
     start = prices[0]
     count = grid_count or settings.grid_count
     span = (spacing_pct if spacing_pct is not None
@@ -278,7 +279,11 @@ def replay(prices: list[float], *, grid_count: int | None = None,
         leverage=settings.leverage,
         trailing_sl_trigger_pct=settings.trailing_sl_trigger_pct,
         max_exposure_pct=settings.max_exposure_pct,
-        min_profit_multiplier=settings.min_profit_multiplier,
+        # Overridable so a sweep can ask what the MARKET pays at a spacing, separately
+        # from whether the configured fee floor currently allows quoting there.
+        min_profit_multiplier=(settings.min_profit_multiplier
+                               if min_profit_multiplier is None
+                               else min_profit_multiplier),
     )
     clock = VirtualClock(step=max(settings.poll_interval, 1))
     real_time = _grid.time
