@@ -173,6 +173,27 @@ def test_no_crossing_orders_are_ever_placed():
     assert not r["crossing"], f"engine placed {len(r['crossing'])} crossing orders"
 
 
+def test_the_grids_own_pnl_matches_what_the_fills_actually_made():
+    """#80 end to end. The engine's total_pnl/total_fees and the paper book's netted
+    accounting are independent implementations; if the engine still priced level
+    round trips instead of position reductions they would diverge."""
+    r = replay(sawtooth(0.0690, 0.0710, 6))
+
+    assert abs(r["grid_net"] - r["paper_net"]) < 1e-6, (
+        f"grid claims {r['grid_net']:+.4f}, fills actually made {r['paper_net']:+.4f}")
+
+
+def test_a_one_way_market_does_not_manufacture_profit():
+    """A ladder eaten by a trend completes 'cycles' while the account is just
+    accumulating inventory. The money reported must not follow the cycle count."""
+    climb = [0.0690 + 0.0020 * i / 400 for i in range(401)]
+    r = replay(climb)
+
+    assert abs(r["grid_net"] - r["paper_net"]) < 1e-6
+    if r["cycles"] > 0:
+        assert r["grid_net"] <= r["paper_net"] + 1e-6
+
+
 @pytest.mark.skipif(not Path("logs/grid_2026-08-15.log").exists(),
                     reason="the recorded run is not in this checkout")
 def test_the_recorded_run_that_broke_the_ladder_no_longer_breaks_it():

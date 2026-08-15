@@ -179,6 +179,11 @@ class GridEngine:
         self.active = False
         self.total_pnl = 0.0
         self.total_fees = 0.0
+        # The netted position the account actually holds. total_pnl is realised from
+        # THIS, not from per-level round trips, so the bot's figures agree with the
+        # exchange (AUDIT #80).
+        self._pos_qty = 0.0
+        self._pos_entry = 0.0
         self.total_fills = 0
         self.total_completed_cycles = 0
         self._last_recenter_time = 0.0
@@ -472,6 +477,87 @@ class GridEngine:
     def _cycle_fee(self, quantity: float, buy_price: float, sell_price: float, is_taker: bool = False) -> float:
         fee_rate = self.taker_fee_pct if is_taker else self.maker_fee_pct
         return (buy_price + sell_price) * quantity * fee_rate
+
+    def _apply_to_position(self, side: str, qty: float, price: float) -> float:
+        """Net this fill into the running position and return the P&L it REALISED.
+
+        Binance USDM one-way mode holds a single netted position, so money is realised
+        only by a fill that REDUCES it. A level completing its own round trip is a
+        ladder event, not necessarily a cash event, and the two came apart badly on
+        2026-08-15: fill #2 covered the short and realised +0.25 while the grid called
+        it 'open' and booked nothing, then fill #3 ADDED to a long while the grid
+        called it 'complete' and booked a +0.25 that never happened. Reported +0.41
+        against an actual +0.24 -- 69% high (AUDIT #80).
+
+        Level-local (exit-entry)*qty arithmetic cannot be repaired by picking better
+        prices or quantities, because in a netted account the level is simply not the
+        thing that holds the position.
+        """
+        if qty <= 0 or price <= 0:
+            return 0.0
+        signed = qty if side == "buy" else -qty
+
+        # Opening, or adding to what is already there: no money changes hands, the
+        # entry just re-averages.
+        if self._pos_qty == 0 or (self._pos_qty > 0) == (signed > 0):
+            total = self._pos_qty + signed
+            self._pos_entry = (
+                (self._pos_entry * self._pos_qty + price * signed) / total
+                if total else 0.0
+            )
+            self._pos_qty = total
+            return 0.0
+
+        closing = min(abs(signed), abs(self._pos_qty))
+        direction = 1.0 if self._pos_qty > 0 else -1.0
+        realized = (price - self._pos_entry) * closing * direction
+        self._pos_qty += signed
+        if abs(self._pos_qty) < 1e-9:
+            self._pos_qty, self._pos_entry = 0.0, 0.0
+        elif (self._pos_qty > 0) != (direction > 0):
+            # Sold/bought clean through zero -- the remainder is a NEW position opened
+            # at this price, not a continuation of the one just closed.
+            self._pos_entry = price
+        return realized
+
+    def _seed_position_from_exchange(self) -> None:
+        """Adopt whatever the account already holds before trading starts.
+
+        The exchange is the authority on the position; the ledger is a local mirror.
+        Starting a session believing we are flat when 5348 DOGE of short is open --
+        exactly the state this bot woke up in on 2026-08-15 -- books the eventual
+        close of that inheritance as profit the session never made (AUDIT #80).
+        """
+        try:
+            positions = self.exchange.get_positions(self.symbol) or []
+        except Exception as exc:                              # network, auth, anything
+            logger.warning("POSITION SEED SKIPPED | {} — ledger starts from saved state", exc)
+            return
+        for pos in positions:
+            qty = float(pos.get("contracts") or 0)
+            if qty <= 0:
+                continue
+            signed = -qty if str(pos.get("side", "")).lower() == "short" else qty
+            entry = float(pos.get("entryPrice") or 0)
+            if entry <= 0:
+                continue
+            if abs(signed - self._pos_qty) > 1e-9:
+                logger.info(
+                    "POSITION SEEDED | ledger had {}, exchange holds {} @ {} — "
+                    "adopting the exchange's",
+                    round(self._pos_qty, 4), round(signed, 4), entry,
+                )
+            self.seed_position(signed, entry)
+            return
+
+    def seed_position(self, qty: float, entry: float) -> None:
+        """Adopt a position the exchange already holds, so the ledger starts truthful.
+
+        Without this a restart books the eventual close of a pre-existing position as
+        pure profit, because the ledger believes it opened flat.
+        """
+        self._pos_qty = float(qty)
+        self._pos_entry = float(entry) if qty else 0.0
 
     def initialize(self, current_price: float, balance: float, dynamic_spacing: bool = True) -> None:
         if dynamic_spacing:
@@ -1619,18 +1705,16 @@ class GridEngine:
         completed_cycle = level.fill_count > 0
         self._mark_cooldown(level)
 
-        if completed_cycle:
-            if level.side == "buy":
-                entry_price = level.entry_price if level.entry_price else (level.price + self.grid_spacing)
-            else:
-                entry_price = level.entry_price if level.entry_price else (level.price - self.grid_spacing)
-            exit_price = level.price
-            qty = level.quantity if level.quantity > 0 else (self._calc_usdt_per_grid(balance) / max(level.price, 1e-12))
-            profit = self._cycle_pnl(qty, entry_price, exit_price, is_short=level.side == "buy")
-            fee = self._cycle_fee(qty, entry_price, exit_price, is_taker=is_taker)
-        else:
-            profit = 0.0
-            fee = 0.0
+        qty = level.quantity if level.quantity > 0 else (
+            self._calc_usdt_per_grid(balance) / max(level.price, 1e-12))
+
+        # EVERY fill pays a fee. Charging only the ones the ladder called 'complete'
+        # made half of 2026-08-15's trading free in the bot's books -- 0.10 booked
+        # against 0.15 actually paid (AUDIT #80).
+        fee = qty * level.price * (self.taker_fee_pct if is_taker else self.maker_fee_pct)
+
+        # Money follows the netted position, not the ladder's idea of a round trip.
+        profit = self._apply_to_position(level.side, qty, level.price)
 
         fill_record = {
             "price": level.price,
@@ -1644,11 +1728,11 @@ class GridEngine:
 
         level.fill_count += 1
         self.total_fills += 1
+        self.total_pnl += profit
+        self.total_fees += fee
 
         if completed_cycle:
             level.total_pnl += profit
-            self.total_pnl += profit
-            self.total_fees += fee
             self.total_completed_cycles += 1
 
         logger.info(
@@ -1872,6 +1956,7 @@ class GridEngine:
     def activate(self, balance: float) -> None:
         if self.active:
             return
+        self._seed_position_from_exchange()
         placed = self.place_initial_orders(balance)
         total_open = len(self.get_tracked_order_ids())
         self.active = total_open > 0
@@ -2283,6 +2368,8 @@ class GridEngine:
             "active": self.active,
             "total_pnl": self.total_pnl,
             "total_fees": self.total_fees,
+            "pos_qty": self._pos_qty,
+            "pos_entry": self._pos_entry,
             "total_fills": self.total_fills,
             "total_completed_cycles": self.total_completed_cycles,
             "_last_recenter_time": self._last_recenter_time,
@@ -2461,6 +2548,8 @@ class GridEngine:
         self.active = data["active"]
         self.total_pnl = data.get("total_pnl", 0.0)
         self.total_fees = data.get("total_fees", 0.0)
+        self._pos_qty = float(data.get("pos_qty", 0.0) or 0.0)
+        self._pos_entry = float(data.get("pos_entry", 0.0) or 0.0)
         self.total_fills = data.get("total_fills", 0)
         self.total_completed_cycles = data.get("total_completed_cycles", 0)
         self._last_recenter_time = data.get("_last_recenter_time", 0.0)
