@@ -822,11 +822,31 @@ def run_bot() -> None:
         balance = exchange.get_balance()
         risk.initialize(balance)
 
+        # GRID_COUNT comes from CONFIG, not from the saved state. Taking it from state
+        # meant a config change was silently inert for as long as a state file existed:
+        # GRID_COUNT 8 -> 14 was edited, the bot restarted, and it ran 8 rungs all night
+        # while MAX_POSITION_PCT 0.12 -> 0.20 -- read from settings like everything else
+        # -- took effect immediately. Half a geometry change applied is worse than none:
+        # the cap doubled while the ladder stayed the same size, so the bot could carry
+        # twice the one-sided inventory before anything stopped it (AUDIT #76).
+        #
+        # The BOUNDS still come from state on purpose. They are where the live orders
+        # and the open position actually sit; recalculating them here would orphan the
+        # book. load_from_dict rebuilds the levels across those bounds when the count
+        # disagrees, and a recenter recomputes bounds from config soon enough.
+        saved_count = int(saved_state["grid"].get("grid_count") or settings.grid_count)
+        if saved_count != settings.grid_count:
+            logger.warning(
+                "GRID COUNT CHANGED | saved state has {} rungs, config says {} — "
+                "rebuilding the ladder at {} across the saved bounds",
+                saved_count, settings.grid_count, settings.grid_count,
+            )
+
         grid = GridEngine(
             exchange, settings.symbol,
             grid_lower=saved_state["grid"]["grid_lower"],
             grid_upper=saved_state["grid"]["grid_upper"],
-            grid_count=saved_state["grid"]["grid_count"],
+            grid_count=settings.grid_count,
             capital_per_grid_pct=settings.capital_per_grid_pct,
             stop_loss_pct=settings.stop_loss_pct,
             maker_fee_pct=settings.maker_fee_pct / 100,
