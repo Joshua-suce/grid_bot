@@ -28,6 +28,7 @@ from pathlib import Path
 
 import grid as _grid
 from config import settings
+from exchange import PostOnlyWouldCross
 from grid import GridEngine
 
 
@@ -175,11 +176,16 @@ class PaperExchange:
         crosses = (side == "buy" and price > self.price) or \
                   (side == "sell" and price < self.price)
         if post_only and crosses:
-            # A real post-only order is REJECTED here (-2019). Silently filling it
-            # would hide exactly the bug #77 was about.
+            # The real client raises PostOnlyWouldCross on -2019, and grid.py catches it
+            # as a deliberate no-op: leave the level unplaced and retry next pass, never
+            # take liquidity. Returning None instead sent the engine down its generic
+            # error branch -- error log, journal entry, Telegram alert -- which is a
+            # path production never takes, and made a normal retry look like 287
+            # failures (AUDIT #85).
             self.crossing_orders.append({"side": side, "price": price,
                                          "market": self.price})
-            return None
+            raise PostOnlyWouldCross(
+                f"post-only {side} {price} would cross market {self.price}")
         self._seq += 1
         oid = str(self._seq)
         self.orders[oid] = {"id": oid, "side": side, "price": float(price),

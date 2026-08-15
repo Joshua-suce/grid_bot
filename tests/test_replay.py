@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from exchange import PostOnlyWouldCross
 from replay import PaperExchange, load_prices, replay
 
 SYM = "DOGEUSDT"
@@ -79,10 +80,14 @@ def test_fees_are_charged_on_every_fill_and_subtracted_from_net():
 
 
 def test_a_post_only_order_through_the_market_is_rejected():
+    """The real client raises PostOnlyWouldCross on -2019 and grid.py catches it as a
+    quiet retry. Returning None instead sent the engine down its generic error branch,
+    which production never takes (#85)."""
     p = book(0.0700)
-    assert p.place_limit_order(SYM, "buy", 0.0705, 100) is None
-    assert p.place_limit_order(SYM, "sell", 0.0695, 100) is None
-    assert p.crossing_orders, "a crossing order was accepted silently"
+    for side, price in (("buy", 0.0705), ("sell", 0.0695)):
+        with pytest.raises(PostOnlyWouldCross):
+            p.place_limit_order(SYM, side, price, 100)
+    assert len(p.crossing_orders) == 2, "a crossing order was accepted silently"
 
 
 def test_resting_at_the_touch_is_not_crossing():
