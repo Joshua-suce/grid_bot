@@ -860,15 +860,48 @@ class GridEngine:
         # whose price has fallen below the market would post a crossing order.
         return abs(price - level.price) >= gap
 
+    def _ladder_holes(self) -> list[float]:
+        """Grid lines the ladder should have but no level occupies any more.
+
+        Every fill MIGRATES its level to the counter line (_handle_fill snaps to the
+        nearest free line of the opposite side), so the set of lines the ladder covers
+        is not conserved. Two levels can converge on one line while the line they came
+        from is left with no owner, and nothing ever puts an order back on it.
+
+        Measured 2026-08-15 09:40-14:53. Rung 0.07001 was vacated when a filled sell
+        migrated down to 0.06987 -- a line a held rung was already parked on, invisible
+        to _handle_fill's occupancy test because that only looks for queued
+        replacements, not levels in 'awaiting_counter'. The held rung was then stranded
+        (own line taken, counter line taken) and 0.07001 stayed empty for 5h13m while
+        price crossed it 62 times (AUDIT #79).
+        """
+        gap = abs(self.grid_spacing)
+        if gap <= 0:
+            return []
+        occupied = sorted({l.price for l in self.levels})
+        holes: list[float] = []
+        for a, b in zip(occupied, occupied[1:]):
+            n = int(round((b - a) / gap))
+            # Only a clean multiple of the spacing is a hole. A ragged gap means the
+            # levels have drifted off the lattice, and inventing lines inside it would
+            # put orders where the ladder never had any.
+            if n < 2 or n > self.grid_count + 1 or abs((b - a) - n * gap) > gap * 0.25:
+                continue
+            holes.extend(self._round_price(a + k * gap) for k in range(1, n))
+        return holes
+
     def _release_awaiting_levels(self, current_price: float | None = None) -> None:
         """Bring held rungs back, either as the counter leg or at their own rung.
 
-        Two ways out of the hold:
+        Three ways out of the hold:
           1. The counter-slot frees -- the rung becomes the replacement it was meant
              to be, which is what #61 intended.
           2. Price moves a full spacing away from the rung itself -- the classic grid
              re-arm. Without this the ladder starves, because in a ladder of buys below
              and sells above, EVERY fill's counter-target is another live rung.
+          3. Both are occupied but the ladder has a vacant line -- take it. Fills
+             migrate levels between lines, so two can pile onto one line and leave
+             another with no owner; without this the hole is permanent (#79).
 
         Slots claimed earlier in this pass are tracked, or two rungs release onto the
         same price: a just-released level has order_id None, so an occupancy check that
@@ -926,6 +959,36 @@ class GridEngine:
                 level.order_id = None
                 level.awaiting_side = None
                 level.awaiting_price = None
+                continue
+
+            # 3. Neither line is available, but the ladder is missing one somewhere --
+            #    take the missing line nearest price. Without this the rung is stranded
+            #    for good: its counter is occupied, its own line was taken by a level
+            #    that migrated onto it after a fill, and the line that level vacated has
+            #    no owner left to re-arm it. That is how the book ends up with a hole in
+            #    exactly the place price is trading (AUDIT #79).
+            if current_price is None:
+                continue
+            holes = [
+                h for h in self._ladder_holes()
+                if (h, "buy" if h < current_price else "sell") not in claimed
+            ]
+            if not holes:
+                continue
+            target = min(holes, key=lambda h: abs(h - current_price))
+            target_side = "buy" if target < current_price else "sell"
+            logger.info(
+                "LADDER HOLE FILLED | {} {} -> {} {} — no level was left holding that "
+                "line, and price {} is trading across it",
+                level.side.upper(), level.price, target_side.upper(), target, current_price,
+            )
+            claimed.add((target, target_side))
+            level.price = target
+            level.side = target_side
+            level.status = "pending"
+            level.order_id = None
+            level.awaiting_side = None
+            level.awaiting_price = None
 
     def _place_order_for_level(self, level: GridLevel, balance: float) -> bool:
         if level.status == "awaiting_counter":
