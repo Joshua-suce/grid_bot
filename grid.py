@@ -84,6 +84,40 @@ def calculate_dynamic_grid_count(atr_pct: float, base_count: int) -> int:
         return max(base_count - 2, 3)
 
 
+def order_was_filled(order: dict | None) -> bool:
+    """Did this order actually execute? Allowlist, never a denylist.
+
+    An absent order is ambiguous and a present one is only unambiguous when the exchange
+    says it completed. check_fills used to ask `status == "canceled"` and treat every
+    other answer as a fill -- so EXPIRED, REJECTED, and even NEW all booked profit.
+
+    Measured live on 2026-08-15 at 23:58:45. A recenter placed three reduce-only unwind
+    buys; Binance EXPIRED all three with executedQty=0 (reduce-only orders that can no
+    longer reduce are expired, not cancelled). The grid booked FILL #2/#3/#4 for
+    +0.375 +0.238 +0.095, three completed cycles, three rows in the trade journal, and
+    three trades against the daily counter. userTrades for that window is empty: nothing
+    executed. The risk layer printed the contradiction in the same second --
+    "verified pnl=+0.00 | grid estimated +0.71" -- and the +0.71 then sat in every
+    status line for the next three and a half hours (AUDIT #75).
+
+    This is trail_stop_fired's rule (AUDIT #26) applied to the path that books PnL.
+    """
+    if (order or {}).get("status") not in ("closed", "filled"):
+        return False
+    # A terminal order that moved no quantity is not a fill either, whatever it is
+    # called. `filled` is ccxt's normalised executedQty; absent means unknown, and an
+    # unknown quantity on a status that already says "closed" is treated as genuine.
+    filled = (order or {}).get("filled")
+    if filled is None:
+        filled = ((order or {}).get("info") or {}).get("executedQty")
+    if filled is None:
+        return True
+    try:
+        return float(filled) > 0
+    except (TypeError, ValueError):
+        return True
+
+
 def validate_grid_spacing(lower: float, upper: float, count: int, min_spacing_pct: float, price: float) -> bool:
     if count < 2:
         return False
@@ -812,6 +846,16 @@ class GridEngine:
         gap = abs(self.grid_spacing)
         if gap <= 0:
             return False
+        # NOTE (AUDIT #77, open): in a one-way market this condition is unreachable for
+        # the side the trend is eating. Sells fill as price climbs, and this then asks
+        # price to FALL a full spacing before the rung may return -- while the counter
+        # it waits on sits below price and never frees either. Measured 2026-08-15
+        # 00:00-03:23: DOGE ground +1.1%, three sells filled, none re-armed, the book
+        # went 8 orders -> 6 and the ladder had nothing above price left to trade.
+        #
+        # Not widened here. Re-arming a sell whose price is now BELOW the market posts
+        # a crossing order (_place_order_for_level uses level.side as-is), so the fix is
+        # in what the rung comes back AS, not in when -- see AUDIT.md.
         if level.side == "buy":
             return price >= level.price + gap
         return price <= level.price - gap
@@ -1429,10 +1473,26 @@ class GridEngine:
                         level.order_id = None
                         level.status = "pending"
                     continue
-                if order.get("status") == "canceled":
-                    logger.debug("Order {} was cancelled, placing replacement", level.order_id)
+                status = order.get("status")
+                if status == "open":
+                    # Still live -- it just missed the open-orders snapshot (a race, or a
+                    # page boundary). Touching it would place a duplicate.
+                    continue
+                if not order_was_filled(order):
+                    # ANY terminal status that is not a completed fill: cancelled,
+                    # expired, rejected. This used to test `== "canceled"` and treat
+                    # everything else as a fill, which is how three reduce-only orders
+                    # Binance EXPIRED with executedQty=0 were booked as +0.71 of profit
+                    # that never traded (AUDIT #75).
+                    logger.info(
+                        "ORDER {} | {} {} @ {} did not fill — replacing the level",
+                        str(status).upper(), level.side, level.quantity, level.price,
+                    )
                     if self._event_journal:
-                        self._event_journal.order_cancelled(self.symbol, level.side, level.price, level.order_id, "fill_check_cancelled")
+                        self._event_journal.order_cancelled(
+                            self.symbol, level.side, level.price, level.order_id,
+                            f"fill_check_{status}",
+                        )
                     level.order_id = None
                     level.status = "pending"
                     if not self._is_on_cooldown(level):
