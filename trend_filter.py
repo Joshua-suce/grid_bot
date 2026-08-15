@@ -256,10 +256,16 @@ class TrendFilter:
             f"{tf}={regime.value}(adx={self._adx_by_timeframe.get(tf, 0.0):.1f})"
             for tf, regime in self._timeframes.items()
         ]
+        informative = sum(
+            1 for r in self._timeframes.values() if r != MarketRegime.UNCERTAIN
+        )
         line = (
             f"{' '.join(parts)} | bands: range<={self.range_threshold:g} "
-            f"trend>={self.trend_threshold:g} | needs 2 of {len(self._timeframes)} to agree"
+            f"trend>={self.trend_threshold:g} | {informative} of {len(self._timeframes)} "
+            f"timeframe(s) voting"
         )
+        if not informative:
+            line += " — ALL ABSTAINED (every ADX inside the dead band)"
         if self._flat_override_active:
             line += (
                 f" | FLAT OVERRIDE: last {self.flat_range_window} candles span "
@@ -273,21 +279,38 @@ class TrendFilter:
             return MarketRegime.UNCERTAIN
 
         regimes = list(self._timeframes.values())
-        total = len(regimes)
 
-        if total == 1:
+        if len(regimes) == 1:
             return regimes[0]
 
-        trending = [r for r in regimes if r in (MarketRegime.UPTREND, MarketRegime.DOWNTREND)]
-        ranging_count = regimes.count(MarketRegime.RANGING)
-
-        if len(trending) >= 2:
-            directions = set(trending)
-            if len(directions) == 1:
-                return directions.pop()
+        # UNCERTAIN is an ABSTENTION, not a vote against. Requiring an absolute 2 of 3
+        # meant two abstaining timeframes could veto a verdict the third was sure of --
+        # and on DOGEUSDT that was not an edge case but the permanent state. Measured
+        # 2026-08-15 over 27 evaluations: 1h ADX 13.6-15.8, 30m 19.9-25.9, 1d 25.0-25.1.
+        # The 30m and 1d readings sat inside the 15-30 dead band 100% of the time, so
+        # only one timeframe could ever vote, two was unreachable, and the filter
+        # returned "uncertain" 27 times out of 27 while price ground +1.1% into the grid.
+        #
+        # A guard that cannot reach a verdict is worse than no guard: it reads as an
+        # undecided market rather than a broken vote (AUDIT #78).
+        informative = [r for r in regimes if r != MarketRegime.UNCERTAIN]
+        if not informative:
             return MarketRegime.UNCERTAIN
 
-        if ranging_count >= 2:
+        trending = [r for r in informative if r in (MarketRegime.UPTREND, MarketRegime.DOWNTREND)]
+        ranging_count = informative.count(MarketRegime.RANGING)
+
+        # TRENDING still needs two agreeing timeframes. That threshold is deliberate --
+        # a trend verdict PAUSES the grid, and one timeframe's opinion is not enough to
+        # stop trading on. Loosening it here would have silently reversed that choice.
+        if len(trending) >= 2:
+            directions = set(trending)
+            return directions.pop() if len(directions) == 1 else MarketRegime.UNCERTAIN
+
+        # RANGING is the permissive verdict -- it changes nothing the bot does, it only
+        # stops the log claiming the market is undecided when a timeframe was sure. One
+        # voter is enough for it, and abstentions no longer veto it.
+        if ranging_count and ranging_count >= len(trending):
             return MarketRegime.RANGING
 
         return MarketRegime.UNCERTAIN

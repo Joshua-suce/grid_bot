@@ -846,19 +846,19 @@ class GridEngine:
         gap = abs(self.grid_spacing)
         if gap <= 0:
             return False
-        # NOTE (AUDIT #77, open): in a one-way market this condition is unreachable for
-        # the side the trend is eating. Sells fill as price climbs, and this then asks
-        # price to FALL a full spacing before the rung may return -- while the counter
-        # it waits on sits below price and never frees either. Measured 2026-08-15
-        # 00:00-03:23: DOGE ground +1.1%, three sells filled, none re-armed, the book
-        # went 8 orders -> 6 and the ladder had nothing above price left to trade.
+        # A full spacing EITHER WAY frees the rung.
         #
-        # Not widened here. Re-arming a sell whose price is now BELOW the market posts
-        # a crossing order (_place_order_for_level uses level.side as-is), so the fix is
-        # in what the rung comes back AS, not in when -- see AUDIT.md.
-        if level.side == "buy":
-            return price >= level.price + gap
-        return price <= level.price - gap
+        # This used to ask a filled BUY to see price rise a spacing and a filled SELL to
+        # see price FALL one -- so in a one-way market the side the trend is eating can
+        # never come back. Sells fill as price climbs, and the counter they wait on sits
+        # below price and never frees either. Measured 2026-08-15 00:00-03:23: DOGE
+        # ground +1.1%, three sells filled, none re-armed, the book went 8 orders -> 6
+        # and the ladder had nothing left near price to trade (AUDIT #77).
+        #
+        # Widening this is only safe because the release path now re-sides the rung to
+        # match where price actually is -- see _release_awaiting_levels. Re-arming a sell
+        # whose price has fallen below the market would post a crossing order.
+        return abs(price - level.price) >= gap
 
     def _release_awaiting_levels(self, current_price: float | None = None) -> None:
         """Bring held rungs back, either as the counter leg or at their own rung.
@@ -899,16 +899,29 @@ class GridEngine:
                 level.awaiting_price = None
                 continue
 
-            own = (level.price, level.side)
+            # A rung's side is decided by where price is, not by what it was last time.
+            # Below the market a grid line is a bid; above it, an offer. Re-arming a
+            # stale SELL that price has since climbed past would post a crossing order,
+            # which is why the clearance test used to be one-directional (AUDIT #77).
+            own_side = "buy" if current_price is not None and level.price < current_price else "sell"
+            own = (level.price, own_side)
             if (current_price is not None
                     and own not in claimed
                     and self._price_has_cleared(level, current_price)):
-                logger.info(
-                    "RUNG RE-ARMED | {} {} — price {} has moved a full spacing clear "
-                    "while its counter {} stays busy",
-                    level.side.upper(), level.price, current_price, counter[0],
-                )
+                if own_side != level.side:
+                    logger.info(
+                        "RUNG FLIPPED | {} {} -> {} — price {} is now on the other side "
+                        "of this line, so it comes back as the side that can rest there",
+                        level.side.upper(), level.price, own_side.upper(), current_price,
+                    )
+                else:
+                    logger.info(
+                        "RUNG RE-ARMED | {} {} — price {} has moved a full spacing clear "
+                        "while its counter {} stays busy",
+                        level.side.upper(), level.price, current_price, counter[0],
+                    )
                 claimed.add(own)
+                level.side = own_side
                 level.status = "pending"
                 level.order_id = None
                 level.awaiting_side = None
