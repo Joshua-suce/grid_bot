@@ -335,12 +335,47 @@ def main() -> int:
     ap.add_argument("--run", type=int, default=0, help="0 = newest run in the file")
     ap.add_argument("--sweep", action="store_true",
                     help="replay the same path at a range of spacings")
+    ap.add_argument("--klines", action="store_true",
+                    help="drive from exchange candles instead of poll snapshots; "
+                         "snapshots are ~15s apart and hide most fills (#86)")
+    ap.add_argument("--timeframe", default="1m",
+                    help="candle size for --klines, or 'trades' for the raw tape (default 1m)")
     a = ap.parse_args()
 
     path = Path(a.log) if a.log else max(Path("logs").glob("grid_*.log"),
                                          key=lambda p: p.stat().st_mtime)
-    prices = load_prices(path, a.run)
-    print(f"replaying {path.name} run -{a.run}: {len(prices)} ticks, "
+    snapshots = load_prices(path, a.run)
+    prices, source = snapshots, "poll snapshots"
+
+    if a.klines:
+        # Snapshots are ~15s apart and everything between them is invisible: measured,
+        # that hid ~60% of real fills. Candle high/low are the extremes that reach
+        # resting orders, so they are what a grid replay actually needs (AUDIT #86).
+        from config import settings as _s
+        from exchange import Exchange
+        from klines import (fetch_klines, fetch_trade_path, path_from_klines,
+                            session_window, verify_against_log)
+        start, end = session_window(path, a.run)
+        ex = Exchange(_s.exchange_config, demo=_s.demo_mode)
+        if a.timeframe == "trades":
+            prices = fetch_trade_path(ex, _s.symbol, start, end)
+            if not prices:
+                raise SystemExit("no trades returned for that window")
+            source_n = f"{len(prices):,} trades"
+        else:
+            candles = fetch_klines(ex, _s.symbol, start, end, timeframe=a.timeframe)
+            if not candles:
+                raise SystemExit("no candles returned for that window")
+            prices = path_from_klines(candles)
+            source_n = f"{len(candles)} {a.timeframe} candles"
+        problem = verify_against_log(prices, snapshots)
+        if problem:
+            # A wrong window gives a plausible path for the wrong hours, and every
+            # conclusion off it is quietly false. Refuse rather than mislead.
+            raise SystemExit(f"REFUSING TO REPLAY: {problem}")
+        source = source_n
+
+    print(f"replaying {path.name} run -{a.run}: {len(prices)} ticks from {source}, "
           f"{min(prices)}-{max(prices)} ({(max(prices)-min(prices))/min(prices):.3%})\n")
 
     r = replay(prices)
