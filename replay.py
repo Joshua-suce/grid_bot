@@ -13,6 +13,26 @@ that live runs kept violating:
   * no post-only order is ever placed on the wrong side of the market  (#77)
   * the grid's own P&L claim matches the fills that actually happened  (#80)
 
+What it CANNOT do: rank grid spacings. --sweep runs, and prints a confident-looking
+table, but the table has no resolving power. Measured on 13.1h / 101,013 real trade
+ticks across three sessions, sweeping 0.08%-0.30%:
+
+    session        hours   0.08   0.10   0.12   0.15   0.20   0.25   0.30
+    2026-08-15 -0    2.3  -0.00  +1.66  -0.25  +0.89  +1.81  +2.27  +2.64
+    2026-08-15 -2    8.2  +3.58  +2.74  +3.41  +2.67  +1.15  +0.65  -0.15
+    2026-08-16 -2    2.6  +8.49  +3.95  +6.49  +2.84  +4.91  +7.36  +8.35
+
+Adjacent spacings on the SAME session differ by more than the best-to-worst spread of
+the pooled table (3.65 vs 1.90 USDT/day). The curves are not merely noisy, they are
+shaped differently per session and disagree on the winner. That is what a measurement
+looks like when it is reading the price path rather than the parameter.
+
+Three separate sweeps have now named three different "best" spacings -- 0.20% from a
+187h live survey, 0.08% from poll snapshots, 0.08% again from the tape but on a curve
+whose own neighbours swing wider than the result. Pooling more sessions will not fix
+this; the variance is between sessions, not within them. Do not report a winner off
+this harness.
+
 Usage:
     py replay.py                       # replay the newest log
     py replay.py logs/grid_2026-08-15.log
