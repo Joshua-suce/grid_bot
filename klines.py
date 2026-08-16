@@ -30,6 +30,14 @@ from pathlib import Path
 CACHE = Path("logs/klines")
 
 
+class TradeHistoryUnavailable(RuntimeError):
+    """The tape does not reach that far back. Binance serves ~2 days of aggTrades."""
+
+
+def _now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
 def session_window(log: Path, run: int = 0) -> tuple[int, int]:
     """First and last log timestamp of one run, as epoch milliseconds.
 
@@ -139,7 +147,21 @@ def fetch_trade_path(exchange, symbol: str, start_ms: int, end_ms: int,
     prices: list[float] = []
     since, seen = start_ms, 0
     for _ in range(max_requests):
-        batch = exchange.exchange.fetch_trades(symbol, since=since, limit=1000)
+        try:
+            batch = exchange.exchange.fetch_trades(symbol, since=since, limit=1000)
+        except Exception as e:
+            # Binance serves aggTrades for the RECENT 2 DAYS only (-4166). Anything
+            # older simply cannot be replayed from the tape, and the raw ccxt error
+            # ("Search window is restricted...") does not make it obvious that this is
+            # a data-availability wall rather than a bug in the caller.
+            if "-4166" in str(e) or "restricted to recent" in str(e):
+                raise TradeHistoryUnavailable(
+                    f"{symbol} trade history covers only the last ~2 days; "
+                    f"this window starts {(_now_ms() - start_ms)/86400000:.1f} days ago. "
+                    f"Use --timeframe 1m for older sessions, accepting that candles "
+                    f"cross a rung at most twice a minute."
+                ) from e
+            raise
         if not batch:
             break
         fresh = [t for t in batch if t["timestamp"] <= end_ms]

@@ -15,7 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from klines import path_from_klines, session_window, verify_against_log
+from klines import (TradeHistoryUnavailable, fetch_trade_path, path_from_klines,
+                    session_window, verify_against_log)
 
 
 def candle(o, h, l, c, ts=0):
@@ -116,6 +117,53 @@ def test_a_run_index_past_the_end_is_an_error(tmp_path):
                    "2026-08-15 02:00:00 | x\n", encoding="utf-8")
     with pytest.raises(SystemExit):
         session_window(log, 5)
+
+
+# --- the tape only reaches back so far --------------------------------------------
+
+class _Refusing:
+    """Binance past the aggTrades horizon."""
+
+    class exchange:
+        @staticmethod
+        def fetch_trades(*a, **k):
+            raise RuntimeError(
+                'binanceusdm {"code":-4166,'
+                '"msg":"Search window is restricted to recent 2 days only."}')
+
+
+class _Broken:
+    class exchange:
+        @staticmethod
+        def fetch_trades(*a, **k):
+            raise RuntimeError("connection reset")
+
+
+def test_a_window_older_than_two_days_says_so(tmp_path, monkeypatch):
+    """The raw ccxt error reads like a caller bug. It is a data wall, and a sweep
+    across many sessions has to be able to skip the ones out of range rather than
+    die on the first (this killed a whole spacing sweep)."""
+    monkeypatch.setattr("klines.CACHE", tmp_path)
+    with pytest.raises(TradeHistoryUnavailable) as e:
+        fetch_trade_path(_Refusing(), "DOGEUSDT", 0, 1)
+    assert "2 days" in str(e.value)
+    assert "1m" in str(e.value)            # points at the fallback that does work
+
+
+def test_other_failures_are_not_disguised_as_a_data_wall(tmp_path, monkeypatch):
+    """Swallowing every exception here would turn a network outage into 'no history',
+    and the sweep would quietly report on fewer sessions than it claimed."""
+    monkeypatch.setattr("klines.CACHE", tmp_path)
+    with pytest.raises(RuntimeError) as e:
+        fetch_trade_path(_Broken(), "DOGEUSDT", 0, 1)
+    assert not isinstance(e.value, TradeHistoryUnavailable)
+
+
+def test_a_cached_window_never_asks_the_exchange(tmp_path, monkeypatch):
+    """Out-of-range windows fetched while still fresh stay replayable."""
+    monkeypatch.setattr("klines.CACHE", tmp_path)
+    (tmp_path / "DOGEUSDT_trades_0_1.json").write_text("[0.07, 0.071]")
+    assert fetch_trade_path(_Refusing(), "DOGEUSDT", 0, 1) == [0.07, 0.071]
 
 
 def test_a_run_without_two_timestamps_is_an_error(tmp_path):
