@@ -210,33 +210,95 @@ def test_equity_is_not_kept_stale_by_the_free_balance_getter():
     back to back -- so equity was fetched once at startup and served from cache for the
     rest of the run. That equity feeds risk.check_all's drawdown check, i.e. the kill
     switch, so a falling account was measured against a number that never fell.
+
+    The pair is now served from ONE fetch_balance instead of two, which makes the original
+    bug unrepresentable -- free and total cannot carry different ages when a single
+    response writes both. So the regression is asserted as the property it always was
+    (equity tracks the account) rather than as a fetch count for equity alone.
     """
-    import types
-
-    ex = _bare_exchange()
-    truth = {"free": 4800.0, "total": 4900.0}
-    fetches = {"total": 0}
-    ex.get_balance = types.MethodType(lambda self, a="USDT": truth["free"], ex)
-
-    def total(self, a="USDT"):
-        fetches["total"] += 1
-        return truth["total"]
-
-    ex.get_total_equity = types.MethodType(total, ex)
+    ex, truth, fetches = _stubbed_balance_exchange()
 
     seen = []
     for i in range(1, 5):
         truth["total"] = 4900.0 - i * 25
         truth["free"] = 4800.0 - i * 25
-        ex.get_balance_cached()          # main.py:990 -- must not mask the next line
+        ex.get_balance_cached()          # must not mask the next line
         seen.append(ex.get_total_equity_cached())
         ex._balance_cache_at = {k: v - 10.0 for k, v in ex._balance_cache_at.items()}
 
-    assert fetches["total"] == 4, (
-        f"equity fetched {fetches['total']} times in 4 iterations -- the free-balance "
-        f"getter is still refreshing equity's freshness for it"
+    assert seen == [4875.0, 4850.0, 4825.0, 4800.0], (
+        f"equity went stale behind the free-balance getter: {seen}"
     )
-    assert seen == [4875.0, 4850.0, 4825.0, 4800.0], seen
+    assert fetches["n"] == 4, (
+        f"{fetches['n']} fetch_balance round trips for 4 free+equity pairs — the pair "
+        f"is one payload and should cost one call, not two"
+    )
+
+
+def _stubbed_balance_exchange():
+    """A cache-only Exchange whose single balance endpoint is counted."""
+    import types
+
+    ex = _bare_exchange()
+    truth = {"free": 4800.0, "total": 4900.0, "used": 30.0}
+    fetches = {"n": 0}
+
+    def info(self, asset="USDT"):
+        fetches["n"] += 1
+        return dict(truth)
+
+    ex.get_balance_info = types.MethodType(info, ex)
+    return ex, truth, fetches
+
+
+def test_used_margin_is_not_served_as_zero_from_cache():
+    """get_balance_info_cached returned `used` out of a key nothing ever wrote, so every
+    cache hit reported 0.0 -- and that is the number events.balance_snapshot recorded for
+    the life of the run. Only the uncached path was ever right."""
+    ex, truth, _ = _stubbed_balance_exchange()
+
+    first = ex.get_balance_info_cached()          # populates
+    second = ex.get_balance_info_cached()         # served from cache
+
+    assert first["used"] == truth["used"]
+    assert second["used"] == truth["used"], "cache hit reported used=0.0"
+    assert second == first
+
+
+def test_the_three_getters_cannot_disagree_within_one_refresh():
+    """The #39 failure in its general form: any two of these read back to back must
+    describe the same instant, whichever order they are called in."""
+    ex, truth, fetches = _stubbed_balance_exchange()
+
+    free = ex.get_balance_cached()
+    equity = ex.get_total_equity_cached()
+    info = ex.get_balance_info_cached()
+
+    assert (free, equity) == (info["free"], info["total"])
+    assert fetches["n"] == 1, f"three getters over one payload cost {fetches['n']} calls"
+
+
+def test_the_cached_dict_cannot_be_mutated_through_a_caller():
+    """A contract test, not a line test: both paths of _balance_snapshot_cached happen to
+    build a fresh dict today, so the defensive dict() around the return is belt-and-braces
+    and removing it changes nothing. What this pins is the contract -- cache the FIELDS,
+    hand out a copy -- so that caching the assembled dict and returning it, which is the
+    obvious next refactor, cannot silently let a caller rewrite what everyone else reads.
+    """
+    ex, _truth, _ = _stubbed_balance_exchange()
+
+    ex.get_balance_info_cached()["free"] = -1.0
+
+    assert ex.get_balance_cached() == 4800.0, "a caller edited the cache"
+
+
+def test_an_account_reporting_only_free_still_gets_an_equity():
+    """get_total_equity's long-standing fallback: some accounts report total=0. Losing it
+    would feed 0.0 equity to risk.check_all's drawdown check -- an instant kill switch."""
+    ex, truth, _ = _stubbed_balance_exchange()
+    truth["total"] = 0.0
+
+    assert ex.get_total_equity_cached() == truth["free"]
 
 
 def test_a_missing_order_does_not_trip_the_circuit_breaker():

@@ -103,6 +103,32 @@ def candles_for_lookback(timeframe: str, days: int) -> int:
     return days * mult + 100
 
 
+def sleep_until_next_poll(started: float, interval: float) -> float:
+    """Sleep the REMAINDER of the poll interval, not the whole of it. Returns seconds slept.
+
+    `time.sleep(poll_interval)` at the end of the iteration makes the real cadence
+    `work + interval`, so the configured number is a floor nobody ever hits and the drift
+    grows silently with every call added to the loop. Measured 2026-08-17: seven REST
+    round trips at ~400ms each, and a configured 10s poll running at 13-17s between
+    PRICE= lines -- the ladder swept about two thirds as often as configured.
+
+    This does not by itself win fills; a fill is detected within one sweep either way, and
+    the crossings a grid can capture are set by price path over spacing, not by polling.
+    What it buys is reaction time on the things that are latency-sensitive: the stop-loss
+    refresh, the risk kill switches, and the awaiting-counter release check all run once
+    per iteration.
+    """
+    elapsed = time.monotonic() - started
+    remaining = max(0.0, interval - elapsed)
+    if remaining <= 0.0:
+        logger.debug(
+            "POLL OVERRUN | iteration took {:.1f}s against a {}s interval — the loop is "
+            "the bottleneck, not the sleep", elapsed, interval,
+        )
+    time.sleep(remaining)
+    return remaining
+
+
 def _stop_price_of(order: dict) -> float:
     """Trigger price of a stop order, however this ccxt version chose to spell it."""
     for key in ("triggerPrice", "stopPrice"):
@@ -1399,6 +1425,7 @@ def run_bot() -> None:
     try:
         while True:
             try:
+                iteration_started = time.monotonic()
                 loop_count += 1
                 exchange.maybe_resync_time()
                 daily_reset_check(risk, notifier, exchange, settings.symbol, events, pnl_reconciler)
@@ -1410,7 +1437,7 @@ def run_bot() -> None:
                         if loop_count % 10 == 0:
                             logger.info("RECOVERY COOLDOWN | {}s remaining", remaining)
                             events.recovery_event("cooldown", risk.state.recovery_count, cooldown_remaining=remaining)
-                        time.sleep(settings.poll_interval)
+                        sleep_until_next_poll(iteration_started, settings.poll_interval)
                         continue
                     else:
                         logger.info("RECOVERY READY | recalculating grid around current price {}", price)
@@ -1437,7 +1464,7 @@ def run_bot() -> None:
 
                             if not validate_grid_spacing(grid_lower, grid_upper, dynamic_count, settings.range_min_spacing_pct, price):
                                 logger.error("Grid spacing validation failed during recovery — retrying next cycle")
-                                time.sleep(settings.poll_interval)
+                                sleep_until_next_poll(iteration_started, settings.poll_interval)
                                 continue
 
                             recovery_mult = risk.get_recovery_size_multiplier()
@@ -1625,8 +1652,17 @@ def run_bot() -> None:
                     # the realized-PnL bookkeeping did (AUDIT.md issues #7/#8).
                     pos_details = get_position_details(exchange, settings.symbol)
                     unrealized = sum(_position_unrealized_pnl(p, price) for p in pos_details)
-                    exchange.enforce_order_limit(settings.symbol, keep_count=grid.grid_count + 2, tracked_ids=grid.get_tracked_order_ids())
-                    fills = grid.check_fills(balance)
+                    # One open-order read per iteration, shared by the limit check and the
+                    # fill sweep. They ran back to back against the same book and each
+                    # paid its own ~400ms round trip.
+                    open_orders = exchange.get_open_orders(settings.symbol)
+                    if exchange.enforce_order_limit(
+                            settings.symbol, keep_count=grid.grid_count + 2,
+                            tracked_ids=grid.get_tracked_order_ids(), orders=open_orders):
+                        # It cancelled something, so that snapshot is now a lie about the
+                        # book -- and check_fills infers fills from ABSENCE from this list.
+                        open_orders = exchange.get_open_orders(settings.symbol)
+                    fills = grid.check_fills(balance, open_orders=open_orders)
                     if fills:
                         # Pull Binance's actual income ledger once per batch of fills so the
                         # PnL figures below reflect the exchange's own accounting rather than
@@ -1825,7 +1861,7 @@ def run_bot() -> None:
                             "last_update": datetime.now().isoformat(),
                         }
                         state_mgr.save(state_data)
-                        time.sleep(settings.poll_interval)
+                        sleep_until_next_poll(iteration_started, settings.poll_interval)
                         continue
                     elif not is_safe:
                         logger.warning("EXPOSURE WARNING | grid continues but new orders blocked")
@@ -1918,7 +1954,7 @@ def run_bot() -> None:
                     last_analytics_fill_count = grid.total_fills
 
                 consecutive_errors = 0
-                time.sleep(settings.poll_interval)
+                sleep_until_next_poll(iteration_started, settings.poll_interval)
 
             except KeyboardInterrupt:
                 raise
@@ -1957,6 +1993,12 @@ def run_bot() -> None:
                     # stop-loss orders too, so killing the bot over a defect that may
                     # sit in the tail of the iteration would leave an open position
                     # with nothing protecting it. Loud and running beats silent and flat.
+                    #
+                    # A FULL interval here on purpose, not the deadline sleep the normal
+                    # paths use. A deadline sleep shortens itself by the work already
+                    # done, so an iteration that raises late in its run would retry almost
+                    # immediately -- the loop would spin fastest on exactly the failures
+                    # that take longest to reach.
                     time.sleep(settings.poll_interval)
                     continue
 

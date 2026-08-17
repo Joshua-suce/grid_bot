@@ -286,11 +286,12 @@ class TrendFollower:
             return 0.0
         return qty
 
-    def check_fills(self, balance: float) -> list[dict]:
+    def check_fills(self, balance: float, open_orders: list[dict] | None = None) -> list[dict]:
         """Detect the entry filling, and enforce the trailing stop."""
         fills: list[dict] = []
         if self._order_id is not None:
-            open_ids = self.exchange.get_open_order_ids(self.symbol)
+            open_ids = ({o["id"] for o in open_orders} if open_orders is not None
+                        else self.exchange.get_open_order_ids(self.symbol))
             if self._order_id not in open_ids:
                 order = self.exchange.fetch_order(self._order_id, self.symbol)
                 if order and order.get("status") == "closed":

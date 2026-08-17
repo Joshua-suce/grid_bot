@@ -86,11 +86,15 @@ class Strategy(Protocol):
         """
         ...
 
-    def check_fills(self, balance: float) -> list[dict]:
+    def check_fills(self, balance: float, open_orders: list[dict] | None = None) -> list[dict]:
         """Detect and process fills since the last call.
 
         Returns one dict per fill with at least `price`, `side`, `quantity`, `profit`,
         `fee` and `completed_cycle`.
+
+        `open_orders` is the caller's own read of the book for this iteration, offered so
+        an implementation need not pay for a second identical round trip. It must be no
+        older than the caller's view; an implementation may ignore it and fetch its own.
         """
         ...
 

@@ -1784,8 +1784,12 @@ class GridEngine:
         self._last_replacement_time = now  # kept for state-file/telemetry compatibility
         self._level_cooldowns[id(level)] = now
 
-    def check_fills(self, balance: float) -> list[dict]:
-        open_orders = self.exchange.get_open_orders(self.symbol)
+    def check_fills(self, balance: float, open_orders: list[dict] | None = None) -> list[dict]:
+        # `open_orders` lets the caller pass a book it has already read this iteration.
+        # A fill is inferred from ABSENCE here, so the snapshot must be no older than the
+        # caller's own -- main.py re-reads it if enforce_order_limit cancelled anything.
+        if open_orders is None:
+            open_orders = self.exchange.get_open_orders(self.symbol)
         open_ids = {o["id"] for o in open_orders}
         fills = []
 

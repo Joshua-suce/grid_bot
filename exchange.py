@@ -487,14 +487,36 @@ class Exchange:
                 return float(balance.get(asset, {}).get("free", 0))
             raise
 
+    def _balance_snapshot_cached(self, asset: str = "USDT") -> dict[str, float]:
+        """One fetch_balance serving free, total and used together.
+
+        These were three separate cached getters over the same endpoint, and the trading
+        loop called two of them back to back (main.py:1618-1619) -- so every iteration
+        paid for two identical fetch_balance round trips, ~400ms each measured
+        2026-08-17, to read two fields of one payload.
+
+        get_balance_info_cached was worse than redundant: it served `used` out of a key
+        nothing ever wrote, so every cache hit reported used=0.0 and that is what
+        events.balance_snapshot recorded.
+
+        Caching the whole payload under one timestamp also retires AUDIT #39 properly.
+        That bug was one getter refreshing a shared clock for keys it had not fetched;
+        here the keys cannot disagree, because a single response writes all of them.
+        """
+        keys = ("free", "total", "used")
+        if all(self._cache_fresh(f"{k}_{asset}") for k in keys):
+            return {k: self._balance_cache[f"{k}_{asset}"] for k in keys}
+        info = self.get_balance_info(asset)
+        if info["total"] <= 0:
+            # get_total_equity's long-standing fallback: some accounts report only free.
+            info["total"] = info["free"]
+        for k in keys:
+            self._cache_put(f"{k}_{asset}", info[k])
+        return info
+
     def get_balance_cached(self, asset: str = "USDT") -> float:
         """Return cached free balance, fetching only if stale (>5s old)."""
-        cache_key = f"free_{asset}"
-        if cache_key in self._balance_cache and self._cache_fresh(cache_key):
-            return self._balance_cache[cache_key]
-        value = self.get_balance(asset)
-        self._cache_put(cache_key, value)
-        return value
+        return self._balance_snapshot_cached(asset)["free"]
 
     def get_total_equity(self, asset: str = "USDT") -> float:
         """Return the total asset equity, including used margin or reserved funds."""
@@ -516,12 +538,7 @@ class Exchange:
 
     def get_total_equity_cached(self, asset: str = "USDT") -> float:
         """Return cached total equity, fetching only if stale."""
-        cache_key = f"total_{asset}"
-        if cache_key in self._balance_cache and self._cache_fresh(cache_key):
-            return self._balance_cache[cache_key]
-        value = self.get_total_equity(asset)
-        self._cache_put(cache_key, value)
-        return value
+        return self._balance_snapshot_cached(asset)["total"]
 
     def get_balance_info(self, asset: str = "USDT") -> dict[str, float]:
         """Return both free and total balance values for clearer reconciliation."""
@@ -550,16 +567,8 @@ class Exchange:
             raise
 
     def get_balance_info_cached(self, asset: str = "USDT") -> dict[str, float]:
-        """Return cached balance info, fetching only if stale."""
-        now = time.time()
-        if self._cache_fresh(f"free_{asset}") and self._cache_fresh(f"total_{asset}"):
-            if f"free_{asset}" in self._balance_cache:
-                return {
-                    "free": self._balance_cache[f"free_{asset}"],
-                    "total": self._balance_cache.get(f"total_{asset}", 0.0),
-                    "used": self._balance_cache.get(f"used_{asset}", 0.0),
-                }
-        return self.get_balance_info(asset)
+        """Return cached balance info, fetching only if stale. A copy, not the cache."""
+        return dict(self._balance_snapshot_cached(asset))
 
     def get_income_history(
         self, symbol: str, since_ms: int | None = None, income_type: str | None = None, limit: int = 1000,
@@ -864,10 +873,18 @@ class Exchange:
             return False
         return True
 
-    def enforce_order_limit(self, symbol: str, keep_count: int = 10, tracked_ids: set[str] | None = None) -> int:
-        """Cancel oldest untracked open orders if near the limit. Returns number cancelled."""
+    def enforce_order_limit(self, symbol: str, keep_count: int = 10,
+                            tracked_ids: set[str] | None = None,
+                            orders: list[dict] | None = None) -> int:
+        """Cancel oldest untracked open orders if near the limit. Returns number cancelled.
+
+        `orders` lets the caller supply a book it has already read. This and check_fills
+        ran back to back against the same book and each fetched it (~400ms, measured
+        2026-08-17), which is a whole duplicate round trip per poll for no new data.
+        """
         tracked = tracked_ids or set()
-        orders = self.get_open_orders(symbol)
+        if orders is None:
+            orders = self.get_open_orders(symbol)
         count = len(orders)
         if count < MAX_OPEN_ORDERS - keep_count:
             self._open_order_count = count

@@ -416,8 +416,8 @@ class StrategyRouter:
             return 0
         return self.strategy.place_initial_orders(balance)
 
-    def check_fills(self, balance: float) -> list[dict]:
-        return self.strategy.check_fills(balance)
+    def check_fills(self, balance: float, open_orders: list[dict] | None = None) -> list[dict]:
+        return self.strategy.check_fills(balance, open_orders=open_orders)
 
     def set_position_limit(
         self, long_position: float, short_position: float, max_position_qty: float,
