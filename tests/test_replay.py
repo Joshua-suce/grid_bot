@@ -161,20 +161,29 @@ def sawtooth(low, high, rungs):
     return out
 
 
+# The saw-tooth fixtures pin their own ladder geometry. replay() derives the grid RANGE
+# from range_min_spacing_pct * grid_count, so a fixture that inherits those from .env is
+# really testing whichever ladder the operator last configured -- retuning GRID_COUNT for
+# margin moved the synthetic grid out from under a fixed price path, and the saw-tooth
+# began falling outside it. The engine refused every crossing price exactly as it should
+# (nothing reached the book); the fixture had simply stopped asking the question it names.
+SAWTOOTH_GRID = {"grid_count": 14, "spacing_pct": 0.002}
+
+
 def test_a_market_that_actually_swings_produces_cycles():
-    r = replay(sawtooth(0.0690, 0.0710, 6))
+    r = replay(sawtooth(0.0690, 0.0710, 6), **SAWTOOTH_GRID)
     assert r["fills"] > 0, "a 2.9% saw-tooth produced no fills at all"
     assert r["cycles"] > 0
 
 
 def test_the_ladder_keeps_every_line_through_a_swinging_market():
-    r = replay(sawtooth(0.0690, 0.0710, 6))
+    r = replay(sawtooth(0.0690, 0.0710, 6), **SAWTOOTH_GRID)
     assert r["lines_worst"] == r["lines_start"], (
         f"ladder fell from {r['lines_start']} lines to {r['lines_worst']}")
 
 
 def test_no_crossing_orders_are_ever_placed():
-    r = replay(sawtooth(0.0690, 0.0710, 6))
+    r = replay(sawtooth(0.0690, 0.0710, 6), **SAWTOOTH_GRID)
     assert not r["crossing"], f"engine placed {len(r['crossing'])} crossing orders"
 
 
@@ -182,7 +191,7 @@ def test_the_grids_own_pnl_matches_what_the_fills_actually_made():
     """#80 end to end. The engine's total_pnl/total_fees and the paper book's netted
     accounting are independent implementations; if the engine still priced level
     round trips instead of position reductions they would diverge."""
-    r = replay(sawtooth(0.0690, 0.0710, 6))
+    r = replay(sawtooth(0.0690, 0.0710, 6), **SAWTOOTH_GRID)
 
     assert abs(r["grid_net"] - r["paper_net"]) < 1e-6, (
         f"grid claims {r['grid_net']:+.4f}, fills actually made {r['paper_net']:+.4f}")
