@@ -203,9 +203,18 @@ def test_a_one_way_market_does_not_manufacture_profit():
                     reason="the recorded run is not in this checkout")
 def test_the_recorded_run_that_broke_the_ladder_no_longer_breaks_it():
     """2026-08-15 06:33-14:53. Live, this exact path drove the book from 14 grid
-    lines to 13 and left 0.07001 empty for 5h13m while price crossed it 62 times."""
+    lines to 13 and left 0.07001 empty for 5h13m while price crossed it 62 times.
+
+    Asserted against lines_start rather than a literal 14. The defect is "the ladder
+    loses a line and never gets it back", which is a property of the ladder and not of
+    how many lines it happens to be configured with -- pinning the count made a GRID_COUNT
+    change look like a #79 regression, which is both a false alarm and, worse, a test that
+    would go quiet if someone changed the count while the ladder really was dropping
+    lines."""
     r = replay(load_prices(Path("logs/grid_2026-08-15.log"), 0))
 
-    assert r["lines_worst"] == 14, (
-        f"ladder dropped to {r['lines_worst']} lines at tick {r['lines_worst_tick']}")
-    assert r["lines_end"] == 14
+    assert r["lines_start"] > 1, "no ladder to lose a line from"
+    assert r["lines_worst"] == r["lines_start"], (
+        f"ladder dropped from {r['lines_start']} to {r['lines_worst']} lines at tick "
+        f"{r['lines_worst_tick']}")
+    assert r["lines_end"] == r["lines_start"]
