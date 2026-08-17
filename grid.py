@@ -550,6 +550,72 @@ class GridEngine:
             self.seed_position(signed, entry)
             return
 
+    def reconcile_position_entry(self) -> bool:
+        """Re-adopt the exchange's average entry when our mirror has drifted. AUDIT #88.
+
+        _seed_position_from_exchange runs once, in activate(). After that _pos_entry is
+        a local mirror maintained only from fills THIS ladder placed and observed -- and
+        the exchange moves the position without asking: the scale-out trailing leg, the
+        hard stop, and any reduce-only close all change the blended average entry and
+        none of them arrive through _handle_fill.
+
+        Measured on 2026-08-16 22:21. The exchange held LONG 8516 @ 0.06952357 and the
+        ladder sold 1796 at 0.06959, which is 0.0000664 above that entry -- gross
+        +0.119. _apply_to_position reported +0.001293, and the income reconciler
+        independently verified +0.09. So the mirror's entry had drifted roughly
+        0.0000657 high and the engine booked 1% of a round trip it actually won.
+
+        _position_break_even already treats this data the right way -- it re-reads the
+        exchange every two seconds precisely because "internal per-level bookkeeping is
+        exactly the thing that drifts" (AUDIT #7/#8). It decides whether an order may
+        lose money. _apply_to_position decides what the money WAS, off the same
+        quantity, and never re-read at all.
+
+        ONLY the entry is adopted, and only while the quantities already agree. A
+        quantity disagreement means a fill exists that check_fills has not attributed
+        yet; the exchange's position already contains it, so adopting there would apply
+        it twice -- once here and once when the fill is processed. That case is logged
+        and left for the next poll, by which time the quantities agree.
+
+        Returns True when an adjustment was made (for tests and for the caller's log).
+        """
+        try:
+            positions = self.exchange.get_positions(self.symbol) or []
+        except Exception:
+            return False                        # unreadable: keep the mirror we have
+
+        signed, entry = 0.0, 0.0
+        for pos in positions:
+            qty = float(pos.get("contracts") or 0)
+            if qty <= 0:
+                continue
+            signed = -qty if str(pos.get("side", "")).lower() == "short" else qty
+            entry = float(pos.get("entryPrice") or 0)
+            break
+
+        if signed == 0.0 or entry <= 0:
+            return False                        # flat, or no usable entry to adopt
+
+        if abs(signed - self._pos_qty) > max(1e-9, abs(signed) * 1e-6):
+            logger.debug(
+                "POSITION MIRROR BEHIND | ledger {} vs exchange {} — a fill is still "
+                "unattributed; entry left alone this poll (AUDIT #88)",
+                round(self._pos_qty, 4), round(signed, 4),
+            )
+            return False
+
+        # Same quantity, different average: pure drift, and the exchange is right.
+        if abs(entry - self._pos_entry) <= entry * 1e-9:
+            return False
+        drift = entry - self._pos_entry
+        logger.info(
+            "POSITION ENTRY RESYNCED | {} -> {} ({:+.8f}) on {} — realised P&L was "
+            "being computed against a stale average (AUDIT #88)",
+            round(self._pos_entry, 8), round(entry, 8), drift, round(signed, 4),
+        )
+        self._pos_entry = entry
+        return True
+
     def seed_position(self, qty: float, entry: float) -> None:
         """Adopt a position the exchange already holds, so the ledger starts truthful.
 
@@ -1729,6 +1795,12 @@ class GridEngine:
         _price_now = self._current_price_or_none()
         self._release_awaiting_levels(_price_now)
         self._repair_ladder(_price_now)
+        # After the fills above are attributed the ledger should agree with the
+        # exchange. Where the average entry has drifted anyway -- a stop leg or a
+        # reduce-only close moved the position without passing through _handle_fill --
+        # adopt the exchange's, so the NEXT fill's realised P&L is measured against a
+        # true average rather than a stale one (AUDIT #88).
+        self.reconcile_position_entry()
 
         orphaned = [l for l in self.levels if l.order_id is None and l.status == "pending" and (l.quantity > 0 or l.fill_count == 0)]
         if orphaned:
