@@ -139,6 +139,7 @@ def reconcile_stop_orders(
     desired: list[tuple[str, float, float]],
     live: list[dict],
     over_coverage_tolerance: float = float("inf"),
+    price_tolerance_pct: float = 1e-4,
 ) -> tuple[dict[str, dict], float, float]:
     """Bring the exchange's stop book in line with `desired`, touching only what differs.
 
@@ -163,6 +164,23 @@ def reconcile_stop_orders(
     8891 short at 06:49 were still 4445/4446 at 10:31 with the position down to 5331 --
     a "50%" scale-out that was really 83/83, re-examined every two minutes for four hours
     and never once resized.
+
+    `price_tolerance_pct` bounds how far a live order's trigger may sit from the desired
+    one and still count as that leg. It must be kept at least as wide as the drift the
+    caller tolerates, or the pair churns: _sl_needs_update leaves a trail leg alone until
+    its trigger drifts 0.1%, but the 120-second trust-but-verify pass calls this function
+    regardless of belief, and at the old hardcoded 0.01% every ratchet larger than a
+    hundredth of a percent failed to match and was cancelled and re-placed. That, not the
+    quantity tolerance, is what put ~14 stop cancels an hour in the 2026-08-17 12:55
+    session: eight of the eleven trail re-placements between 13:07 and 15:51 moved the
+    trigger less than 0.1%, and three of those moved it less than 0.03%.
+
+    A kept leg records the trigger price the exchange ACTUALLY holds, not the one that was
+    desired when it was matched. Recording the desire made the drift invisible to
+    _sl_needs_update -- its comparison was then desired-against-desired, always zero -- so
+    the only thing that ever re-placed a drifting leg was the periodic verify. With the
+    real price recorded, drift accumulates against the caller's 0.1% test and the leg is
+    re-placed when it has genuinely gone stale, not on a timer.
     """
     unmatched = list(live)
     kept: dict[str, dict] = {}
@@ -172,11 +190,11 @@ def reconcile_stop_orders(
             else oqty * (1.0 + over_coverage_tolerance) + max(1e-8, oqty * 1e-6)
         )
         for order in unmatched:
-            if (abs(_stop_price_of(order) - oprice) <= max(oprice * 1e-4, 1e-9)
+            if (abs(_stop_price_of(order) - oprice) <= max(oprice * price_tolerance_pct, 1e-9)
                     and oqty - max(1e-8, oqty * 1e-6) <= _stop_qty_of(order) <= oversize_cap):
                 unmatched.remove(order)
                 kept[kind] = {"id": order.get("id"), "side": close_side,
-                              "qty": _stop_qty_of(order), "price": oprice}
+                              "qty": _stop_qty_of(order), "price": _stop_price_of(order)}
                 break
 
     for order in unmatched:
@@ -211,6 +229,32 @@ def reconcile_stop_orders(
     return kept, sum(o["qty"] for o in kept.values()), sum(q for _, q, _ in desired)
 
 
+# build_scale_out_orders is reached from _sl_needs_update's predicate path, so it runs
+# once per poll for as long as a position is open. Anything it logs unconditionally is a
+# heartbeat rather than an event: a 7 DOGE position on 2026-08-17 put 64 identical
+# STOP-LOSS NOT SPLIT lines into the log between 13:50:45 and 14:06:21, which is how a
+# genuine one-off gets buried. Report the state when it CHANGES, and stay quiet while it
+# simply goes on being true.
+_last_stop_sizing_note: str | None = None
+
+
+def _note_stop_sizing(level: str, message: str, *args) -> None:
+    """Log at `level` when this note differs from the last one, at DEBUG while it repeats."""
+    global _last_stop_sizing_note
+    rendered = message.format(*args)
+    if rendered == _last_stop_sizing_note:
+        logger.debug(rendered)
+        return
+    _last_stop_sizing_note = rendered
+    logger.log(level, rendered)
+
+
+def _clear_stop_sizing_note() -> None:
+    """A normal refresh re-arms the notes so the next abnormal one is heard at full volume."""
+    global _last_stop_sizing_note
+    _last_stop_sizing_note = None
+
+
 def build_scale_out_orders(
     side: str,
     qty: float,
@@ -240,7 +284,8 @@ def build_scale_out_orders(
         # short stop returns None, and the arithmetic below raised TypeError in the
         # loop (AUDIT #31). No stop is better than a crash; the next iteration re-reads
         # the position and places one if it is really there.
-        logger.warning(
+        _note_stop_sizing(
+            "WARNING",
             "STOP-LOSS | no {} stop available from the live strategy (trail={} hard={}) "
             "-- skipping this refresh", side, trail_price, hard_price,
         )
@@ -252,6 +297,39 @@ def build_scale_out_orders(
     qty = _round(qty)
     if qty <= 0:
         return []
+
+    # A position can be too small to protect AT ALL, not merely too small to split. Every
+    # remaining branch places at most one full-size stop at hard_price, so if that order
+    # is under the exchange's floor then no stop this function could return would be
+    # accepted -- the split guard below would just hand -4164 a differently-shaped order.
+    #
+    # AUDIT #89 stopped the split from deadlocking the grid and the same deadlock simply
+    # moved one step down. 2026-08-17 13:50:37, fill #46 left LONG 7.0 DOGE and 13:50:48
+    # placed SELL 7.0 @ 0.06713568 -- 0.47 USDT of notional. Testnet took it; the live
+    # venue answers -4164, coverage comes back short of desired, _refresh_sl_stops
+    # returns False and the caller blocks new exposure. The bot then sits idle on a
+    # position worth less than half a dollar, unable to trade the very remainder that
+    # would clear the condition.
+    #
+    # So say so and return nothing: `desired` empty is the one answer _refresh_sl_stops
+    # already treats as "covered", which keeps the ladder working. The exposure this
+    # gives up on is bounded by the floor itself -- under 5 USDT of notional against a
+    # ~4900 USDT account -- and the alternative is not "protected", it is "blocked AND
+    # unprotected". Stops already on the book are deliberately left alone: they are
+    # reduceOnly, so an oversized survivor from the larger position still closes this
+    # remainder, and the next fill that lifts the position back over the floor rebuilds
+    # the legs properly through reconcile_stop_orders.
+    if min_notional > 0 and qty * hard_price < min_notional:
+        _note_stop_sizing(
+            "WARNING",
+            "STOP-LOSS UNPROTECTABLE | {} {} is {:.2f} USDT of notional, under the {} USDT "
+            "exchange minimum — no stop of any size would be accepted for it. Leaving the "
+            "grid free to trade the remainder out rather than blocking on a position too "
+            "small to protect.",
+            side, qty, qty * hard_price, min_notional,
+        )
+        return []
+
     same_level = abs(trail_price - hard_price) <= 1e-9
     if same_level and startup_trail_price is not None and abs(startup_trail_price - hard_price) > 1e-9:
         trail_price = startup_trail_price
@@ -278,13 +356,15 @@ def build_scale_out_orders(
     # coverage at the hard level is strictly safer than no coverage at all.
     if min_notional > 0 and (trail_qty * trail_price < min_notional
                              or hard_qty * hard_price < min_notional):
-        logger.info(
+        _note_stop_sizing(
+            "INFO",
             "STOP-LOSS NOT SPLIT | {} {} would give legs of {}/{} — under the {} USDT "
             "minimum, so both would be rejected. Placing one full-size hard stop.",
             side, qty, trail_qty, hard_qty, min_notional,
         )
         return [("hard", qty, hard_price)]
 
+    _clear_stop_sizing_note()
     orders = []
     if trail_qty > 0:
         orders.append(("trail", trail_qty, trail_price))
@@ -1134,6 +1214,7 @@ def run_bot() -> None:
         sl_orders, covered_qty, desired_qty = reconcile_stop_orders(
             exchange, settings.symbol, close_side, desired, live,
             over_coverage_tolerance=SL_OVER_COVERAGE_TOLERANCE,
+            price_tolerance_pct=SL_PRICE_DRIFT_TOLERANCE,
         )
         _sl_last_verified = time.time()
 
@@ -1207,6 +1288,13 @@ def run_bot() -> None:
     # the trigger price moved; tolerate over-coverage until it drifts materially.
     SL_OVER_COVERAGE_TOLERANCE = 0.10
 
+    # How far a live trigger may drift from the desired one before the leg is re-placed.
+    # This is the caller's half of a pair: reconcile_stop_orders must match at least this
+    # loosely or the 120-second verify re-places legs this test would have left alone,
+    # which is where ~14 stop cancels an hour came from on 2026-08-17. One constant, both
+    # sides, so the two can no longer disagree.
+    SL_PRICE_DRIFT_TOLERANCE = 0.001
+
     def _sl_needs_update(side: str, qty: float) -> bool:
         if not sl_orders:
             return True
@@ -1219,7 +1307,7 @@ def run_bot() -> None:
             cur = sl_orders.get(kind)
             if cur is None:
                 return True
-            if abs(cur["price"] - oprice) > max(oprice * 0.001, 1e-8):
+            if abs(cur["price"] - oprice) > max(oprice * SL_PRICE_DRIFT_TOLERANCE, 1e-8):
                 return True
             if cur["qty"] < oqty - max(1e-8, oqty * 1e-6):
                 return True  # under-covered: the position outgrew its stop

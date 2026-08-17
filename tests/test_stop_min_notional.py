@@ -29,18 +29,27 @@ def total_qty(orders):
 # --- the case that deadlocks ---------------------------------------------------------
 
 def test_a_position_too_small_to_split_gets_one_full_stop():
-    """3 DOGE at ~0.067 is 0.20 USDT. Split it and both halves are rejected; the
-    position ends up with no stop at all and the grid blocks itself."""
-    orders = build_scale_out_orders("long", 3.0, 0.5, TRAIL, HARD, min_notional=FLOOR)
+    """100 DOGE at ~0.067 is 6.7 USDT whole and 3.4 per half. Split it and both halves
+    are rejected; the position ends up with no stop at all and the grid blocks itself.
+
+    This fixture used to say 3 DOGE, which was a poor exemplar of its own case: 0.20 USDT
+    is too small to place ANY stop, so the full-size fallback it asserts here would have
+    been rejected too. That is AUDIT #94 and it has its own module -- what belongs here
+    is a position the fallback genuinely rescues."""
+    orders = build_scale_out_orders("long", 100.0, 0.5, TRAIL, HARD, min_notional=FLOOR)
 
     assert kinds(orders) == ["hard"]
-    assert total_qty(orders) == 3.0
+    assert total_qty(orders) == 100.0
 
 
 def test_the_whole_position_is_still_covered_when_not_split():
     """Refusing to split must not mean refusing to protect. Full size at the hard
-    level is the safer of the two available outcomes, not a reduction in coverage."""
-    for qty in (3.0, 50.0, 100.0, 140.0):
+    level is the safer of the two available outcomes, not a reduction in coverage.
+
+    Every size here clears the floor whole -- below FLOOR/HARD there is no stop to place
+    and coverage is correctly zero (AUDIT #94)."""
+    for qty in (80.0, 100.0, 140.0):
+        assert qty * HARD > FLOOR, f"qty={qty} cannot be protected at all"
         orders = build_scale_out_orders("long", qty, 0.5, TRAIL, HARD, min_notional=FLOOR)
         assert total_qty(orders) == qty, f"lost coverage at qty={qty}"
 
@@ -104,9 +113,9 @@ def test_the_floor_is_opt_in():
 
 
 def test_a_short_position_is_handled_the_same_way():
-    orders = build_scale_out_orders("short", 3.0, 0.5, TRAIL, HARD, min_notional=FLOOR)
+    orders = build_scale_out_orders("short", 100.0, 0.5, TRAIL, HARD, min_notional=FLOOR)
     assert kinds(orders) == ["hard"]
-    assert total_qty(orders) == 3.0
+    assert total_qty(orders) == 100.0
 
 
 # --- interactions with the existing branches -----------------------------------------
