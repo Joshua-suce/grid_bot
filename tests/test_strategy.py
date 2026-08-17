@@ -36,6 +36,48 @@ def _engine() -> GridEngine:
     )
 
 
+def _main_code() -> str:
+    """main.py with comment text blanked out, every other offset preserved.
+
+    The scrapers below ask which strategy members main.py USES. A regex over raw file
+    text also reads prose: the phrase "grid.py" written in a comment yielded a member
+    named 'py' and failed three tests with a message about adding it to the Strategy
+    protocol, which is not remotely where the problem was. Tokenising finds comments
+    properly -- including a '#' inside a string literal, which naive splitting gets
+    wrong -- and blanking them in place leaves the regexes otherwise untouched.
+    """
+    import io
+    import pathlib
+    import tokenize
+
+    path = pathlib.Path(__file__).resolve().parents[1] / "main.py"
+    src = path.read_text(encoding="utf-8")
+    lines = src.splitlines()
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if tok.type == tokenize.COMMENT:
+            (row, c0), (_, c1) = tok.start, tok.end
+            line = lines[row - 1]
+            lines[row - 1] = line[:c0] + " " * (c1 - c0) + line[c1:]
+    return "\n".join(lines)
+
+
+def test_the_scraper_reads_code_and_not_prose():
+    """Guards _main_code itself. Writing "grid.py" in a main.py comment used to invent
+    a member called 'py' and fail three tests with a message about the Strategy
+    protocol -- an hour of looking in the wrong place. A real grid.<member> call must
+    still be seen, or the fix would have disarmed the very check it was protecting.
+    """
+    import re
+
+    code = _main_code()
+    assert "grid.py" not in code, "a comment mentioning grid.py still reaches the regex"
+
+    found = set(re.findall(r"\bgrid\.([a-zA-Z_][a-zA-Z0-9_]*)", code))
+    assert "py" not in found
+    assert found, "scraper found no members at all -- it is no longer reading main.py"
+    assert "active" in found, "a real attribute access was lost along with the comments"
+
+
 def _protocol_methods() -> list[str]:
     return [
         name for name in dir(Strategy)
@@ -91,8 +133,7 @@ def test_protocol_covers_what_main_actually_calls():
     import pathlib
     import re
 
-    source = pathlib.Path(__file__).resolve().parents[1] / "main.py"
-    used = set(re.findall(r"\bgrid\.([a-zA-Z_][a-zA-Z0-9_]*)", source.read_text()))
+    used = set(re.findall(r"\bgrid\.([a-zA-Z_][a-zA-Z0-9_]*)", _main_code()))
 
     covered = set(_protocol_methods()) | set(GRID_SPECIFIC_MEMBERS) | {
         "active", "state_corrupted", "total_fills", "total_pnl",
@@ -123,8 +164,7 @@ def test_main_never_reaches_into_a_private_member():
     import pathlib
     import re
 
-    source = pathlib.Path(__file__).resolve().parents[1] / "main.py"
-    private = sorted(set(re.findall(r"\bgrid\.(_[a-zA-Z0-9_]*)", source.read_text())))
+    private = sorted(set(re.findall(r"\bgrid\.(_[a-zA-Z0-9_]*)", _main_code())))
     assert private == [], (
         f"main.py reaches into private strategy members {private}, which the router "
         f"cannot forward. Add a public accessor to the Strategy protocol instead."
@@ -171,8 +211,7 @@ def _members_main_touches() -> list[str]:
     import pathlib
     import re
 
-    source = pathlib.Path(__file__).resolve().parents[1] / "main.py"
-    return sorted(set(re.findall(r"\bgrid\.([a-zA-Z_][a-zA-Z0-9_]*)", source.read_text())))
+    return sorted(set(re.findall(r"\bgrid\.([a-zA-Z_][a-zA-Z0-9_]*)", _main_code())))
 
 
 @pytest.mark.parametrize("active", ["grid", "trend"])
@@ -267,6 +306,8 @@ def _grid_calls_in_main() -> list[tuple[str, int, tuple]]:
     import ast
     import pathlib
 
+    # Parses the real syntax tree, so comments are already excluded and this one never
+    # needed _main_code(). Left reading the file directly on purpose.
     source = pathlib.Path(__file__).resolve().parents[1] / "main.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
     calls = []

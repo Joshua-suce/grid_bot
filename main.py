@@ -11,7 +11,8 @@ from loguru import logger
 from config import settings
 from logger import setup_logging
 from exchange import Exchange
-from grid import GridEngine, calculate_grid_range, calculate_dynamic_grid_count, validate_grid_spacing
+from grid import (GridEngine, MIN_NOTIONAL_USDT, calculate_grid_range,
+                  calculate_dynamic_grid_count, validate_grid_spacing)
 from trend_filter import TrendFilter, atr as calc_atr
 from risk import RiskManager
 from state import StateManager
@@ -204,6 +205,7 @@ def build_scale_out_orders(
     rounder=None,
     scale_out_done: bool = False,
     startup_trail_price: float = None,
+    min_notional: float = 0.0,
 ) -> list[tuple[str, float, float]]:
     """Compute the stop-market orders for scale-out stop-loss protection.
 
@@ -243,6 +245,31 @@ def build_scale_out_orders(
         return [("hard", qty, hard_price)]
     trail_qty = _round(qty * scale)
     hard_qty = _round(qty - trail_qty)
+
+    # Splitting a small position produces two legs the exchange will not accept.
+    # Binance rejects anything under 5 USDT of notional (-4164), and grid.py already
+    # enforces that on every limit order it places -- three separate checks. The
+    # protective orders ignored the same rule, and they are the ones that matter: a
+    # rejected stop is not a missed opportunity, it is an unprotected position.
+    #
+    # Worse, the failure is self-sustaining. reconcile_stop_orders reports coverage
+    # short of desired, _refresh_sl_stops returns False, and the caller blocks new
+    # exposure -- so the grid stops trading and can no longer work the position down
+    # to nothing. It waits, blocked, on a position too small to protect. Observed on
+    # 2026-08-16 20:52, where 3 DOGE became legs of 1.0 and 2.0: 0.07 and 0.14 USDT.
+    # Testnet accepted them; the live venue would not have.
+    #
+    # One full-size stop clears the floor wherever two halves do not, and full
+    # coverage at the hard level is strictly safer than no coverage at all.
+    if min_notional > 0 and (trail_qty * trail_price < min_notional
+                             or hard_qty * hard_price < min_notional):
+        logger.info(
+            "STOP-LOSS NOT SPLIT | {} {} would give legs of {}/{} — under the {} USDT "
+            "minimum, so both would be rejected. Placing one full-size hard stop.",
+            side, qty, trail_qty, hard_qty, min_notional,
+        )
+        return [("hard", qty, hard_price)]
+
     orders = []
     if trail_qty > 0:
         orders.append(("trail", trail_qty, trail_price))
@@ -1028,6 +1055,7 @@ def run_bot() -> None:
             rounder=lambda q: float(exchange.exchange.amount_to_precision(settings.symbol, q)),
             scale_out_done=_scale_out_done,
             startup_trail_price=grid.get_scale_out_trail_price(side),
+            min_notional=MIN_NOTIONAL_USDT,
         )
 
     def _refresh_sl_stops(side: str, qty: float) -> bool:
