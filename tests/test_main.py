@@ -245,7 +245,7 @@ class DirtyBookExchange:
     def get_positions(self, symbol):
         return []
 
-    def cancel_everything(self, symbol):
+    def cancel_everything(self, symbol, timeout_seconds=300.0, keep_stops=False):
         return 0
 
     def close_all_positions(self, symbol):
@@ -395,8 +395,19 @@ def test_positions_are_only_closed_without_saved_state():
 
 def test_orders_are_still_cancelled_unconditionally():
     """Untracked resting orders from a dead session are dangerous and the grid re-places
-    its own -- only the POSITION decision became conditional."""
+    its own, so the LIMIT sweep stays unconditional. Two things are allowed to be
+    conditional: the POSITION decision (AUDIT #37) and, since AUDIT #92, the STOP book --
+    stops guarding an inherited position are handed to reconcile_stop_orders instead of
+    being cancelled and re-placed 26 seconds later."""
     src = _main_source()
-    cancel_at = src.index("cancelled = exchange.cancel_everything(settings.symbol)")
+    cancel_at = src.index("cancelled = exchange.cancel_everything(")
     guard_at = src.index("if has_saved_grid:")
     assert cancel_at < guard_at, "order cancellation was moved behind the state check"
+
+    # The sweep itself must not be wrapped in a condition -- only its keep_stops
+    # argument may vary.
+    line = src[cancel_at:].splitlines()[0]
+    assert "keep_stops=" in line, "startup no longer chooses whether to keep stops"
+    assert not src[:cancel_at].rstrip().endswith(":"), (
+        "the cancel is now inside a conditional block"
+    )

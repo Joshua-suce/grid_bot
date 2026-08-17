@@ -1773,11 +1773,17 @@ def test_reduceonly_sell_params_and_market_close():
         stop_loss_pct=0.03,
         use_market_close_on_replace=False,
     )
-    # make a buy-level near entry so reconcile finds it
+    # make a buy-level near entry so reconcile finds it.
+    #
+    # The sell sits at 106, not 105. The hedge for this long lands on 105 (nearest buy
+    # 100, plus one 5.0 spacing), and a sell already resting on 105 is now left to do the
+    # job instead of having a second order stacked on its line -- the same-line duplicate
+    # that produced "tightest 0.00%" and a DEFORMED LADDER teardown live (AUDIT #90).
+    # This test is about market-close vs limit, so give the hedge a free line.
     grid.levels = [
         GridLevel(price=95.0, side="buy", quantity=2.0, entry_price=95.0),
         GridLevel(price=100.0, side="buy", quantity=2.0, entry_price=100.0),
-        GridLevel(price=105.0, side="sell", quantity=2.0, entry_price=100.0),
+        GridLevel(price=106.0, side="sell", quantity=2.0, entry_price=100.0),
     ]
 
     # First: with market-close disabled, reconcile_positions should call place_limit_order

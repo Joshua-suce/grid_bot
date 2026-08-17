@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import queue
+import threading
 import time
 
 from loguru import logger
@@ -40,6 +42,31 @@ def _pnl_lines(
 
 
 class TelegramNotifier:
+    """Fire-and-forget notifications.
+
+    Sends run on a background worker, never on the caller's thread. They used to run
+    inline, and a slow Telegram call therefore stopped the trading loop dead: measured
+    four times in the 2026-08-17 05:00 session at 16-18 seconds each --
+
+        06:54:39 ORDER PLACED -> 06:54:55 TG OK
+        08:20:48 FILL #41     -> 08:21:06 TG OK
+        08:50:18 ORDER PLACED -> 08:50:34 TG OK
+        09:10:41 ORDER PLACED -> 09:10:57 TG OK
+
+    -- with the next log line in each case arriving only after the send returned. That
+    is the whole explanation for a 10s poll interval running at a 15-16s cadence and
+    stretching to 22-28s in places, and for a 14-order startup taking 26 seconds. A
+    notification is worth nothing if the price it describes has moved on while it sent.
+    """
+
+    # Bounded on purpose. If Telegram is wedged, the choice is between dropping status
+    # messages and growing an unbounded backlog inside a process that has to keep
+    # trading; dropping is obviously right. Sized to hold a busy burst (a fill emits
+    # fill + position + balance) many times over.
+    QUEUE_LIMIT = 256
+    # How long close() waits for the backlog before giving up and shutting down anyway.
+    DRAIN_TIMEOUT_SECONDS = 5.0
+
     def __init__(self, bot_token: str, chat_id: str, enabled: bool = False, max_retries: int = 3):
         self.bot_token = bot_token
         self.chat_id = chat_id
@@ -48,6 +75,11 @@ class TelegramNotifier:
         self._client: httpx.Client | None = None
         self._last_event_time: dict[str, float] = {}
         self.order_event_cooldown: float = 30.0
+        self._queue: queue.Queue[str | None] = queue.Queue(maxsize=self.QUEUE_LIMIT)
+        self._worker: threading.Thread | None = None
+        self._worker_lock = threading.Lock()
+        self._dropped = 0
+        self._closed = False
 
         if self.enabled:
             self._client = httpx.Client(timeout=15)
@@ -73,7 +105,52 @@ class TelegramNotifier:
             logger.error("Telegram connection test failed: {}", e)
             return False
 
+    def _ensure_worker(self) -> None:
+        """Start the sender thread on first use, so a disabled notifier spawns nothing."""
+        with self._worker_lock:
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = threading.Thread(
+                    target=self._drain, name="telegram-notifier", daemon=True,
+                )
+                self._worker.start()
+
+    def _drain(self) -> None:
+        while True:
+            message = self._queue.get()
+            try:
+                if message is None:              # shutdown sentinel
+                    return
+                self._send_now(message)
+            except Exception as e:               # a notifier must never kill its thread
+                logger.debug("Telegram worker swallowed: {}", e)
+            finally:
+                self._queue.task_done()
+
     def send(self, message: str) -> bool:
+        """Queue a message. Returns whether it was accepted, NOT whether it was sent.
+
+        The caller is a trading loop; it cannot afford to wait on an HTTP round trip and
+        has nothing useful to do with the delivery result either way.
+        """
+        if not self.enabled or not self._client or self._closed:
+            return False
+        self._ensure_worker()
+        try:
+            self._queue.put_nowait(message)
+            return True
+        except queue.Full:
+            self._dropped += 1
+            # One line per 50 drops: a wedged Telegram must not itself become the thing
+            # flooding the log the trading loop writes to.
+            if self._dropped % 50 == 1:
+                logger.warning(
+                    "TELEGRAM BACKLOG | queue full ({} deep), {} message(s) dropped so "
+                    "far — trading is unaffected", self.QUEUE_LIMIT, self._dropped,
+                )
+            return False
+
+    def _send_now(self, message: str) -> bool:
+        """The blocking send. Runs on the worker thread only."""
         if not self.enabled or not self._client:
             return False
 
@@ -376,6 +453,22 @@ class TelegramNotifier:
         )
 
     def close(self) -> None:
+        """Stop accepting messages, give the backlog a bounded chance, then shut down.
+
+        Bounded because this runs on the shutdown path: the bot has orders to cancel and
+        stops to leave armed, and none of that should wait on a status message.
+        """
+        self._closed = True
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            try:
+                self._queue.put_nowait(None)
+            except queue.Full:
+                pass
+            worker.join(timeout=self.DRAIN_TIMEOUT_SECONDS)
+            if worker.is_alive():
+                logger.debug("Telegram worker still draining at shutdown — abandoning it")
+        self._worker = None
         if self._client:
             self._client.close()
             self._client = None

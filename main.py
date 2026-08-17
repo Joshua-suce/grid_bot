@@ -138,6 +138,7 @@ def reconcile_stop_orders(
     close_side: str,
     desired: list[tuple[str, float, float]],
     live: list[dict],
+    over_coverage_tolerance: float = float("inf"),
 ) -> tuple[dict[str, dict], float, float]:
     """Bring the exchange's stop book in line with `desired`, touching only what differs.
 
@@ -152,13 +153,27 @@ def reconcile_stop_orders(
     Live orders are matched to desired legs by trigger price and quantity. Whatever the
     exchange holds that no desired leg claims is cancelled -- that covers both stale legs
     and strays from an earlier crash.
+
+    `over_coverage_tolerance` bounds how much LARGER than the desired leg a live order
+    may be and still count as that leg. Unbounded (the default, and the only behaviour
+    this had) it livelocks against the caller: _sl_needs_update asks for a refresh once a
+    leg exceeds its desired size by more than SL_OVER_COVERAGE_TOLERANCE, this function
+    then matches the oversized leg to the smaller desire and keeps it, and the next poll
+    asks again. Observed for the whole of 2026-08-17: stops armed at 4445/4446 for an
+    8891 short at 06:49 were still 4445/4446 at 10:31 with the position down to 5331 --
+    a "50%" scale-out that was really 83/83, re-examined every two minutes for four hours
+    and never once resized.
     """
     unmatched = list(live)
     kept: dict[str, dict] = {}
     for kind, oqty, oprice in desired:
+        oversize_cap = (
+            float("inf") if over_coverage_tolerance == float("inf")
+            else oqty * (1.0 + over_coverage_tolerance) + max(1e-8, oqty * 1e-6)
+        )
         for order in unmatched:
             if (abs(_stop_price_of(order) - oprice) <= max(oprice * 1e-4, 1e-9)
-                    and _stop_qty_of(order) >= oqty - max(1e-8, oqty * 1e-6)):
+                    and oqty - max(1e-8, oqty * 1e-6) <= _stop_qty_of(order) <= oversize_cap):
                 unmatched.remove(order)
                 kept[kind] = {"id": order.get("id"), "side": close_side,
                               "qty": _stop_qty_of(order), "price": oprice}
@@ -706,10 +721,32 @@ def run_bot() -> None:
     saved_state = state_mgr.load()
     has_saved_grid = bool(saved_state and "grid" in saved_state)
 
-    logger.info("STARTUP CLEANUP | cancelling all orders...")
-    cancelled = exchange.cancel_everything(settings.symbol)
+    # Keep the stop book if anything is open. emergency_stop leaves stops armed on
+    # purpose so an inherited position stays protected while the bot is down; cancelling
+    # them here and re-placing an identical pair 26 seconds later (05:00:22 -> 05:00:48
+    # on 2026-08-17) threw that away and opened the one window the shutdown path had
+    # deliberately closed. The stop refresh in the loop reconciles them properly.
+    #
+    # An unreadable position counts as "open": a stray stop is reduceOnly and harmless
+    # when flat -- the flat branch of the loop sweeps it -- whereas cancelling one that
+    # was protecting something is not recoverable.
+    try:
+        _held_side, _held_qty = get_net_position(exchange, settings.symbol)
+        _keep_stops = _held_side in ("long", "short") and _held_qty > 0
+    except Exception as e:
+        logger.warning("STARTUP CLEANUP | could not read the position ({}) — keeping stops", e)
+        _keep_stops = True
+
+    logger.info(
+        "STARTUP CLEANUP | cancelling all orders{}...",
+        " (stops kept: a position is open)" if _keep_stops else "",
+    )
+    cancelled = exchange.cancel_everything(settings.symbol, keep_stops=_keep_stops)
     if cancelled:
-        logger.warning("Cancelled {} leftover orders (limits + stops) from previous sessions", cancelled)
+        logger.warning(
+            "Cancelled {} leftover orders ({}) from previous sessions",
+            cancelled, "limits only" if _keep_stops else "limits + stops",
+        )
     if has_saved_grid:
         logger.info(
             "STARTUP | saved grid state found — keeping any open position for the "
@@ -1096,6 +1133,7 @@ def run_bot() -> None:
 
         sl_orders, covered_qty, desired_qty = reconcile_stop_orders(
             exchange, settings.symbol, close_side, desired, live,
+            over_coverage_tolerance=SL_OVER_COVERAGE_TOLERANCE,
         )
         _sl_last_verified = time.time()
 

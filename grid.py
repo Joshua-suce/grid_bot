@@ -1518,6 +1518,45 @@ class GridEngine:
                 )
                 continue
 
+            # Do not re-site a level onto a line another level already holds. Every other
+            # re-siting path in this file checks for that -- _nearest_legal_exit refuses a
+            # target within the fee floor of a neighbour, _refill_missing_grid_lines
+            # refuses to manufacture a pair that cannot clear its own fees -- and this one
+            # did not.
+            #
+            # The clamp above pins the hedge to break-even, which is exactly where the
+            # ordinary ladder also wants to quote, so the collision is the common case
+            # rather than a rare one. On the 2026-08-17 05:00 restart it put the hedge at
+            # 0.07008 where a restored grid buy already rested: two levels on one line,
+            # tightest spacing 0.00%, and the next poll declared the ladder DEFORMED and
+            # tore down all 16 orders four seconds after GRID ACTIVATED.
+            #
+            # Deliberately narrow: the SAME line and the SAME side, not merely a close
+            # neighbour. A near neighbour is a spacing question the ladder already has
+            # machinery for, and refusing there would suppress a legitimate full-size
+            # cover -- with the AUDIT #41 state (short 9916 @ 0.07024719) the break-even
+            # cover lands at 0.07021 with a grid buy 0.00008 away, and that cover must
+            # still go out. An exact same-side duplicate is different in kind: it is not
+            # tight spacing, it is two orders where the ladder believes there is one.
+            #
+            # Skipping is not "leaving the position unhedged": the level already on that
+            # line is a resting order on the closing side at the same price, which is the
+            # job this hedge was going to do.
+            occupant = next(
+                (l for l in self.levels
+                 if l is not best_level and l.side == hedge_side
+                 and abs(l.price - hedge_price) <= 1e-12),
+                None,
+            )
+            if occupant is not None:
+                logger.info(
+                    "RECONCILE | {} hedge for the {} would land on {}, the line the {} "
+                    "level already holds — leaving that level to unwind the position "
+                    "rather than stacking a second order on its line",
+                    hedge_side, side, hedge_price, occupant.side,
+                )
+                continue
+
             if best_level.order_id is not None:
                 if not self.exchange.cancel_order(best_level.order_id, self.symbol):
                     logger.warning(
@@ -2264,7 +2303,19 @@ class GridEngine:
         # Only while flat. Recentring cancels resting orders, and with inventory open
         # those orders are the exits -- the same mistake that made recenter fire 89
         # times in one session and prevented a position from ever unwinding.
-        flat = self._net_long_qty <= 0 and self._net_short_qty <= 0
+        #
+        # _net_long_qty/_net_short_qty are written ONLY by set_position_limit, which
+        # main.py calls at main.py:1593 -- 139 lines AFTER it calls recenter at
+        # main.py:1454, in the same iteration. So on the first poll after a restart they
+        # are both still 0.0 while a restored position is wide open, and this guard read
+        # "flat" on precisely the iteration where a restored position is most likely to
+        # exist. On 2026-08-17 05:00:56, four seconds after GRID ACTIVATED, that let a
+        # deformation rebuild cancel 16 orders with 5342 DOGE of short open.
+        #
+        # _pos_qty is the authoritative mirror and is already correct here: activate()
+        # seeds it from the exchange before the loop runs at all.
+        flat = (self._net_long_qty <= 0 and self._net_short_qty <= 0
+                and abs(self._pos_qty) <= 1e-9)
         deformed = self.ladder_defects(current_price) if flat else []
 
         if (in_margin_band and not stranded_above and not stranded_below

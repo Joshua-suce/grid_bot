@@ -115,7 +115,11 @@ class Exchange:
         self._circuit_breaker = CircuitBreaker()
         self._last_spread: float = 0.0
         self._last_time_sync: float = 0.0
-        self._time_sync_interval: float = 20.0
+        # Measured drift on this host is ~46ms/hour (1412ms at 05:00 to 1587ms at 08:47
+        # on 2026-08-17), i.e. under a millisecond per minute against a recvWindow of
+        # seconds. At 20s this fired on every other poll of a 10s loop and bought
+        # nothing; the timestamp-error path re-syncs immediately anyway.
+        self._time_sync_interval: float = 60.0
         self._open_order_count: int = 0
         self._last_order_count_time: float = 0.0
         self._balance_cache: dict[str, float] = {}
@@ -996,13 +1000,23 @@ class Exchange:
         logger.info("Cancelled {} stop/conditional orders for {}", cancelled, symbol)
         return cancelled
 
-    def cancel_everything(self, symbol: str, timeout_seconds: float = 300.0) -> int:
+    def cancel_everything(self, symbol: str, timeout_seconds: float = 300.0,
+                          keep_stops: bool = False) -> int:
         """Cancel ALL open orders: limit, stop, conditional — everything.
 
         Blocks up to ``timeout_seconds`` re-verifying against the exchange and retrying,
         so a flaky write path can never report success while orders are still open
         (which is how duplicate grid levels historically piled up). Returns the number
         of orders confirmed cancelled.
+
+        ``keep_stops`` leaves the stop/conditional book alone. It exists for startup with
+        an inherited position. Shutdown deliberately leaves stops armed -- "a position is
+        still open, so its stop-loss legs stay on the exchange" -- and then startup
+        cancelled them and spent 26 seconds rebuilding an identical pair, with 5342 DOGE
+        of short unprotected in between (2026-08-17 05:00:22 -> 05:00:48). Handing the
+        live legs to reconcile_stop_orders instead closes that window entirely: it
+        already matches desired legs against what is on the book and touches only what
+        differs (AUDIT #54).
         """
         deadline = time.time() + timeout_seconds
 
@@ -1031,7 +1045,12 @@ class Exchange:
                 logger.warning("Batch cancel failed ({}); will retry individually", e)
 
         # 2) Stop/conditional (algo) orders — attempt once each.
-        stop_book = self.get_stop_orders(symbol)
+        stop_book = [] if keep_stops else self.get_stop_orders(symbol)
+        if keep_stops:
+            logger.info(
+                "CLEANUP | leaving the stop/conditional book for {} intact — an open "
+                "position keeps its protection until the refresh reconciles it", symbol,
+            )
         if stop_book is None:
             # Unreadable, not empty. The regular-order verification below still runs;
             # this just must not be mistaken for "there were no stops" (AUDIT #54).
