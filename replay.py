@@ -33,6 +33,21 @@ whose own neighbours swing wider than the result. Pooling more sessions will not
 this; the variance is between sessions, not within them. Do not report a winner off
 this harness.
 
+Two further reasons, found while building spacing_study.py (AUDIT #99):
+
+  * The three tightest columns place NO ORDERS. _is_level_profitable requires spacing
+    to clear the round trip times MIN_PROFIT_MULTIPLIER -- 0.126% at current settings --
+    so 0.08%, 0.10% and 0.12% are inert, and 0.08% is the column two of those sweeps
+    named the winner. Measured on 14,777 real ticks (2026-08-17): zero fills at all
+    three, against 14 at 0.15%. That column is an untraded position drifting.
+
+  * The table pools raw session totals, so an 8.2h session outvotes a 2.3h one on
+    length alone. Normalised per day the ranking changes hands.
+
+Use spacing_study.py instead: it differences within a session, puts an interval on the
+answer, and refuses when the interval spans zero. --sweep remains useful for what it was
+always good at -- driving the engine hard enough to expose ladder defects.
+
 Usage:
     py replay.py                       # replay the newest log
     py replay.py logs/grid_2026-08-15.log
