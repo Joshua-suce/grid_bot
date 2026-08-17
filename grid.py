@@ -184,6 +184,7 @@ class GridEngine:
         # exchange (AUDIT #80).
         self._pos_qty = 0.0
         self._pos_entry = 0.0
+        self._mirror_mismatch_polls = 0
         self.total_fills = 0
         self.total_completed_cycles = 0
         self._last_recenter_time = 0.0
@@ -550,6 +551,11 @@ class GridEngine:
             self.seed_position(signed, entry)
             return
 
+    # Polls of ledger-vs-exchange size disagreement tolerated before the mirror is
+    # rebuilt outright. check_fills attributes a fill on the very next poll, so
+    # anything past a couple of polls is a wrong ledger, not a race (AUDIT #88).
+    MIRROR_MISMATCH_TOLERANCE_POLLS = 3
+
     def reconcile_position_entry(self) -> bool:
         """Re-adopt the exchange's average entry when our mirror has drifted. AUDIT #88.
 
@@ -597,13 +603,47 @@ class GridEngine:
             return False                        # flat, or no usable entry to adopt
 
         if abs(signed - self._pos_qty) > max(1e-9, abs(signed) * 1e-6):
-            logger.debug(
-                "POSITION MIRROR BEHIND | ledger {} vs exchange {} — a fill is still "
-                "unattributed; entry left alone this poll (AUDIT #88)",
-                round(self._pos_qty, 4), round(signed, 4),
+            # A mismatch has two causes and they need opposite handling. TRANSIENTLY it
+            # means check_fills has not attributed a fill yet: the exchange's position
+            # already contains it, so adopting here and then processing the fill applies
+            # the same trade twice. PERSISTENTLY it means the mirror is simply wrong.
+            #
+            # The first draft of this treated both as the first case and deferred
+            # unconditionally, which never converges -- and that is not hypothetical.
+            # 2026-08-17 04:33, after a full session with the fix live:
+            #
+            #     ledger   LONG  1389 @ 0.06981
+            #     exchange SHORT 5342 @ 0.07015
+            #
+            # Different SIDE, 6731 apart. The quantities were never going to agree, so
+            # the resync never ran, and _apply_to_position kept pricing closes against a
+            # long that did not exist: fills #31/#34/#35 booked +0.74/+0.48/+0.73 while
+            # the income reconciler verified -0.02/-0.02/-0.03 on the same cycles.
+            #
+            # check_fills runs every poll, so an in-flight fill is attributed by the
+            # next one. Three consecutive polls of disagreement is not a race, it is a
+            # wrong ledger, and then the exchange's position is adopted whole.
+            self._mirror_mismatch_polls += 1
+            if self._mirror_mismatch_polls < self.MIRROR_MISMATCH_TOLERANCE_POLLS:
+                logger.debug(
+                    "POSITION MIRROR BEHIND | ledger {} vs exchange {} — poll {}/{}, "
+                    "a fill may still be unattributed (AUDIT #88)",
+                    round(self._pos_qty, 4), round(signed, 4),
+                    self._mirror_mismatch_polls, self.MIRROR_MISMATCH_TOLERANCE_POLLS,
+                )
+                return False
+            logger.warning(
+                "POSITION MIRROR REBUILT | ledger held {} @ {} but the exchange holds "
+                "{} @ {} after {} polls — adopting the exchange's. Realised P&L was "
+                "being computed against a position that does not exist (AUDIT #88)",
+                round(self._pos_qty, 4), round(self._pos_entry, 8),
+                round(signed, 4), round(entry, 8), self._mirror_mismatch_polls,
             )
-            return False
+            self._pos_qty, self._pos_entry = signed, entry
+            self._mirror_mismatch_polls = 0
+            return True
 
+        self._mirror_mismatch_polls = 0
         # Same quantity, different average: pure drift, and the exchange is right.
         if abs(entry - self._pos_entry) <= entry * 1e-9:
             return False

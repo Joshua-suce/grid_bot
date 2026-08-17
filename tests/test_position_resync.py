@@ -33,10 +33,11 @@ def pos(side, qty, entry):
 
 @pytest.fixture
 def engine(monkeypatch):
-    e = GridEngine.__new__(GridEngine)          # no __init__: this test needs 4 fields
+    e = GridEngine.__new__(GridEngine)          # no __init__: only the ledger matters
     e.symbol = "DOGEUSDT"
     e._pos_qty = 0.0
     e._pos_entry = 0.0
+    e._mirror_mismatch_polls = 0
     e.exchange = FakeExchange()
     return e
 
@@ -87,19 +88,20 @@ def test_an_entry_that_already_agrees_is_left_alone(engine):
 
 # --- refusing to double-count an unattributed fill ----------------------------------
 
-def test_a_quantity_disagreement_leaves_the_entry_alone(engine):
-    """A size mismatch means check_fills has not attributed a fill yet. The exchange's
-    position ALREADY contains it, so adopting the entry here and then processing the
-    fill would apply the same trade twice."""
+def test_a_quantity_disagreement_defers_at_first(engine):
+    """Transiently a size mismatch means check_fills has not attributed a fill yet. The
+    exchange's position ALREADY contains it, so adopting immediately and then processing
+    the fill would apply the same trade twice."""
     engine._pos_qty, engine._pos_entry = 8516.0, 0.0695893
     engine.exchange = FakeExchange(pos("long", 10312.0, 0.06952357))
 
     assert engine.reconcile_position_entry() is False
     assert engine._pos_entry == 0.0695893, "adopted an entry while a fill was in flight"
+    assert engine._pos_qty == 8516.0
 
 
 def test_it_resyncs_on_the_next_poll_once_the_fill_lands(engine):
-    """The deferral above must not be permanent -- once quantities agree it corrects."""
+    """The deferral must not outlive the race it exists for."""
     engine._pos_qty, engine._pos_entry = 8516.0, 0.0695893
     engine.exchange = FakeExchange(pos("long", 10312.0, 0.06952357))
     assert engine.reconcile_position_entry() is False
@@ -107,6 +109,76 @@ def test_it_resyncs_on_the_next_poll_once_the_fill_lands(engine):
     engine._pos_qty = 10312.0                    # the fill is attributed
     assert engine.reconcile_position_entry() is True
     assert engine._pos_entry == 0.06952357
+
+
+# --- a mismatch that never resolves is a wrong ledger, not a race -------------------
+
+def test_a_persistent_disagreement_rebuilds_the_mirror(engine):
+    """The live failure, 2026-08-17 04:33. Ledger LONG 1389 @ 0.06981, exchange SHORT
+    5342 @ 0.07015 -- different side, 6731 apart, and no fill was ever going to close
+    that. Deferring unconditionally meant the resync never ran for a whole session
+    while _apply_to_position priced closes against a long that did not exist.
+    """
+    engine._pos_qty, engine._pos_entry = 1389.0, 0.06981296
+    engine.exchange = FakeExchange(pos("short", 5342.0, 0.07015001))
+
+    for poll in range(engine.MIRROR_MISMATCH_TOLERANCE_POLLS - 1):
+        assert engine.reconcile_position_entry() is False, f"adopted on poll {poll}"
+
+    assert engine.reconcile_position_entry() is True
+    assert engine._pos_qty == -5342.0, "side not adopted"
+    assert engine._pos_entry == 0.07015001
+
+
+def test_the_rebuilt_mirror_prices_the_next_trade_correctly(engine):
+    """End to end, on the exact trade that exposed this.
+
+    The engine sold 1783 @ 0.07008. Against the phantom LONG that is a closing trade
+    and books a profit -- the live run recorded +0.74 on it. Against the real SHORT the
+    same sell ADDS exposure and realises nothing at all, which is why the income
+    reconciler verified -0.02, the fee and nothing else.
+
+    Not a magnitude error. The mirror had the engine booking profit on a trade that
+    closed no position.
+    """
+    engine._pos_qty, engine._pos_entry = 1389.0, 0.06981296
+    engine.exchange = FakeExchange(pos("short", 5342.0, 0.07015001))
+    phantom = GridEngine._apply_to_position(engine, "sell", 1783.0, 0.07008)
+
+    engine._pos_qty, engine._pos_entry = 1389.0, 0.06981296
+    for _ in range(engine.MIRROR_MISMATCH_TOLERANCE_POLLS):
+        engine.reconcile_position_entry()
+    real = GridEngine._apply_to_position(engine, "sell", 1783.0, 0.07008)
+
+    assert phantom > 0.3, "the phantom long booked a profit on this sell"
+    assert real == 0.0, "on the real short this sell adds exposure and realises nothing"
+    assert engine._pos_qty == pytest.approx(-7125.0), "short should have grown"
+
+
+def test_the_counter_resets_once_the_sizes_agree(engine):
+    """Two isolated races must not add up to a rebuild -- that would defeat the
+    double-count guard the deferral exists for."""
+    engine._pos_qty, engine._pos_entry = 8516.0, 0.06952357
+    engine.exchange = FakeExchange(pos("long", 10312.0, 0.06952357))
+    engine.reconcile_position_entry()
+    engine.reconcile_position_entry()
+
+    engine._pos_qty = 10312.0                    # resolved
+    engine.reconcile_position_entry()
+    assert engine._mirror_mismatch_polls == 0
+
+    engine._pos_qty = 8516.0                     # a fresh, unrelated race
+    assert engine.reconcile_position_entry() is False, "old strikes carried over"
+    assert engine._pos_qty == 8516.0
+
+
+def test_a_rebuild_resets_the_counter(engine):
+    engine._pos_qty, engine._pos_entry = 1389.0, 0.06981296
+    engine.exchange = FakeExchange(pos("short", 5342.0, 0.07015001))
+    for _ in range(engine.MIRROR_MISMATCH_TOLERANCE_POLLS):
+        engine.reconcile_position_entry()
+
+    assert engine._mirror_mismatch_polls == 0
 
 
 def test_a_hair_of_float_noise_is_not_a_quantity_disagreement(engine):
