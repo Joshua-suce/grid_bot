@@ -357,6 +357,61 @@ class GridEngine:
             return self._net_short_qty
         return 0.0
 
+    def _refresh_net_counters(self) -> bool:
+        """Re-read the exchange's net position into the reduce-only mirror. AUDIT #98.
+
+        _net_long_qty/_net_short_qty are written ONLY by set_position_limit, which
+        main.py calls at :1773 -- more than a hundred lines AFTER check_fills, in the
+        same iteration. So every order placed during the fill sweep is sized against the
+        position as it stood BEFORE the fill that triggered it, and the worst case is the
+        common one: the exit for a level is placed in the same breath as its own entry.
+
+        2026-08-17 14:06:46, fill #47 bought 1782 into a 302 long. One second later the
+        exit went out as SELL 302 -- the pre-fill size -- against a real 1789. It filled
+        at 14:50:30 for 302 and booked +0.045; at 1778 the same crossing was worth about
+        +0.27. Again at 15:19:57: fill #51 bought 1778 into 1494, and the exit went out
+        at 1494 against a real 3272.
+
+        This asks the exchange rather than incrementing a local guess, because an
+        increment cannot see a PARTIAL fill. That same 1782 order had already put 295
+        into the position before it completed, so adding its full size would have claimed
+        2084 against a real 1789 -- and a reduce-only order larger than the position is
+        rejected -2022, which turns a missed opportunity into an unplaceable exit.
+
+        Only called on a poll that saw a fill (11 of ~640 iterations that session), so the
+        extra read costs nothing measurable. Failure is not an error: the mirror
+        set_position_limit left is exactly what this code used before, so a bad read
+        degrades to the old behaviour rather than blocking the fill.
+        """
+        try:
+            positions = self.exchange.get_positions(self.symbol) or []
+        except Exception as e:
+            logger.debug(
+                "NET COUNTER REFRESH | positions unreadable ({}) — keeping the mirror "
+                "set_position_limit left behind", e,
+            )
+            return False
+
+        long_qty = short_qty = 0.0
+        for pos in positions:
+            qty = float(pos.get("contracts", 0) or 0)
+            side = str(pos.get("side", "")).lower()
+            # One-way mode spells a short either as side='short' or as a negative
+            # contracts count; get_position_breakdown normalises both and so must this,
+            # or a short reads as a long of the same size and reduceOnly goes out
+            # backwards.
+            if qty < 0:
+                side, qty = ("short" if side == "long" else "long"), abs(qty)
+            if qty <= 0:
+                continue
+            if side == "short":
+                short_qty += qty
+            else:
+                long_qty += qty
+
+        self._net_long_qty, self._net_short_qty = long_qty, short_qty
+        return True
+
     def _exit_order_params(self, side: str, quantity: float) -> tuple[dict | None, float]:
         """Build order params + quantity for a level that may be closing a position.
 
@@ -1933,6 +1988,11 @@ class GridEngine:
 
         # Money follows the netted position, not the ladder's idea of a round trip.
         profit = self._apply_to_position(level.side, qty, level.price)
+
+        # This fill just moved the position, and the replacement order placed further
+        # down this same method is sized against the reduce-only mirror. Refresh it here
+        # or that exit is sized against the position as it was before this fill (#98).
+        self._refresh_net_counters()
 
         fill_record = {
             "price": level.price,

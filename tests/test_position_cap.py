@@ -22,6 +22,11 @@ from grid import GridEngine, MIN_NOTIONAL_USDT
 class _Ex:
     def __init__(self):
         self.placed = []
+        # _handle_fill re-reads the net position before it sizes the replacement order
+        # (AUDIT #98), so a test that wants the engine to believe a position is open has
+        # to open it HERE as well. A mirror the exchange contradicts is not a state the
+        # bot can be in for longer than one fill.
+        self.positions = []
 
     class exchange:
         @staticmethod
@@ -31,7 +36,7 @@ class _Ex:
 
     def get_price(self, s): return 0.0700
     def get_balance(self, s="USDT"): return 5000.0
-    def get_positions(self, s): return []
+    def get_positions(self, s): return list(self.positions)
     def get_open_orders(self, s): return []
     def get_open_order_ids(self, s): return set()
     def fetch_order(self, i, s): return None
@@ -92,7 +97,11 @@ def test_exits_are_never_blocked():
     """#42's lesson: refusing exit orders traps inventory. A reduceOnly replacement
     must go out even with that side blocked."""
     g, ex = _engine()
-    g._net_short_qty = 50000.0          # a short is open, so a BUY reduces it
+    # A short is open, so a BUY reduces it. The exchange has to say so too: the engine
+    # re-reads the position before sizing the exit, and a BUY against an account that is
+    # genuinely flat is not an exit at all -- blocking that one is correct (AUDIT #98).
+    ex.positions = [{"side": "short", "contracts": 50000.0, "entryPrice": 0.0700}]
+    g._net_short_qty = 50000.0
     g.set_position_limit(0.0, 50000.0, 17467.0)
     assert g._block_buys or g._block_sells
 
