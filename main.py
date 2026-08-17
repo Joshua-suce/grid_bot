@@ -14,6 +14,7 @@ from exchange import Exchange
 from grid import (GridEngine, MIN_NOTIONAL_USDT, calculate_grid_range,
                   calculate_dynamic_grid_count, validate_grid_spacing)
 from trend_filter import TrendFilter, atr as calc_atr
+from exposure_registry import ExposureRegistry
 from risk import RiskManager
 from state import StateManager
 from telegram_notifier import TelegramNotifier
@@ -824,6 +825,12 @@ def run_bot() -> None:
     # different: with saved state it is inventory with a ladder to unwind through, and
     # the same rule as AUDIT #32 applies -- do not book a loss to tidy up (AUDIT #37).
     state_mgr = StateManager(settings.state_dir, settings.symbol, demo=settings.demo_mode)
+    # max_exposure_pct is a limit on the ACCOUNT, but every part of the check that
+    # enforces it is per-process and per-symbol. Two instances on the same account each
+    # permit the full cap unless they can see one another (AUDIT #97).
+    exposure_registry = ExposureRegistry(
+        settings.state_dir, demo=settings.demo_mode, symbol=settings.symbol,
+    )
     saved_state = state_mgr.load()
     has_saved_grid = bool(saved_state and "grid" in saved_state)
 
@@ -1645,6 +1652,17 @@ def run_bot() -> None:
                     balance = exchange.get_balance_cached()
                     equity = exchange.get_total_equity_cached()
                     exposure = grid.get_exposure_pct(equity)
+                    # `exposure` stays this symbol's own figure -- that is what the event
+                    # records mean. The RISK CAP is an account limit, so it is evaluated
+                    # against every instance's exposure combined (AUDIT #97).
+                    exposure_registry.publish(exposure, exposure * equity)
+                    account_exposure = exposure_registry.account_exposure_pct(exposure)
+                    if account_exposure > exposure + 1e-9 and loop_count % 20 == 1:
+                        logger.info(
+                            "ACCOUNT EXPOSURE | {} {:.1%} + [{}] = {:.1%} against a {:.0%} cap",
+                            settings.symbol, exposure, exposure_registry.describe_others(),
+                            account_exposure, risk.max_exposure_pct,
+                        )
                     # Sourced from the exchange's own positions (unrealized_pnl is
                     # Binance's real mark-price-based figure when available -- see
                     # get_position_details/_position_unrealized_pnl) rather than the
@@ -1842,7 +1860,8 @@ def run_bot() -> None:
                         grid.block_side("sell", "PnL feed stale")
 
                     is_safe, is_fatal = risk.check_all(
-                        equity, grid_sl_price, price, exposure, side=position_side or "long",
+                        equity, grid_sl_price, price, account_exposure,
+                        side=position_side or "long",
                         daily_realized_pnl=pnl_reconciler.daily_net_pnl,
                     )
                     if not is_safe and is_fatal:
@@ -1909,9 +1928,14 @@ def run_bot() -> None:
                         held_sl = (grid.get_short_stop_loss_price() if held_side == "short"
                                    else grid.get_stop_loss_price())
                         was_paused_recovery = risk.is_in_recovery()
+                        held_own = grid.get_exposure_pct(balance)
+                        # A paused strategy still HOLDS its position, so it still spends
+                        # account budget and still has to be seen by the other instances.
+                        exposure_registry.publish(held_own, held_own * equity)
                         held_safe, held_fatal = risk.check_all(
                             equity, held_sl or 0.0, price,
-                            grid.get_exposure_pct(balance), side=held_side,
+                            exposure_registry.account_exposure_pct(held_own),
+                            side=held_side,
                             daily_realized_pnl=pnl_reconciler.daily_net_pnl,
                         )
                         if not held_safe and held_fatal and not was_paused_recovery:
