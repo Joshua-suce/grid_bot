@@ -2833,7 +2833,18 @@ class GridEngine:
     def load_from_dict(self, data: dict, current_price: float | None = None) -> None:
         self.grid_lower = data["grid_lower"]
         self.grid_upper = data["grid_upper"]
-        self.grid_count = data["grid_count"]
+        # grid_count is NOT restored. It comes from the config this engine was built
+        # with, and taking it from the file silently undid AUDIT #76 one layer down:
+        # main.py deliberately constructs with settings.grid_count and logs
+        # "GRID COUNT CHANGED | saved state has 14 rungs, config says 4 -- rebuilding
+        # the ladder at 4", and then this line put 14 straight back. Observed live on
+        # 2026-08-18 06:22, which ran a 14-rung ladder committing 875 USDT a side --
+        # 89% of the position cap -- against the 250 the config asked for (AUDIT #108).
+        #
+        # The BOUNDS still come from state on purpose: that is where the live orders
+        # and the open position actually sit. The level rebuild below spreads the
+        # configured count across them.
+        saved_count = int(data.get("grid_count") or self.grid_count)
         self.grid_spacing = data["grid_spacing"]
         self.active = data["active"]
         self.total_pnl = data.get("total_pnl", 0.0)
@@ -2886,12 +2897,22 @@ class GridEngine:
         self._refill_missing_grid_lines(current_price)
 
         if len(self.levels) != self.grid_count:
-            self.state_corrupted = True
-            logger.warning(
-                "GRID STATE CORRUPT | expected {} levels but restored {} — "
-                "rebuilding levels from grid bounds",
-                self.grid_count, len(self.levels),
-            )
+            if saved_count != self.grid_count:
+                # A deliberate config change, not damage. Marking it corrupt would have
+                # main.py delete the state file and throw away the PnL and risk history
+                # alongside a ladder that is doing exactly what it was told.
+                logger.info(
+                    "GRID COUNT APPLIED | state holds {} levels, config asks for {} — "
+                    "rebuilding across the saved bounds",
+                    len(self.levels), self.grid_count,
+                )
+            else:
+                self.state_corrupted = True
+                logger.warning(
+                    "GRID STATE CORRUPT | expected {} levels but restored {} — "
+                    "rebuilding levels from grid bounds",
+                    self.grid_count, len(self.levels),
+                )
             self._rebuild_levels(current_price)
 
     def _refill_missing_grid_lines(self, current_price: float | None = None) -> None:
