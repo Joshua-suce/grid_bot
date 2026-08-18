@@ -322,7 +322,23 @@ def build_scale_out_orders(
 
     scale = min(max(scale_out_pct, 0.0), 0.95)
     def _round(v: float) -> float:
-        return float(rounder(v)) if rounder else float(v)
+        """Never hand the rounder a non-positive amount.
+
+        The live rounder is ccxt's amount_to_precision, which RAISES on anything that
+        does not survive the amount step -- "amount of DOGE/USDT:USDT must be greater
+        than minimum amount precision of 1" -- rather than returning 0. Every test here
+        passed a plain rounding lambda that returned 0 happily, so a zero-sized leg was
+        harmless in the suite and fatal in production (AUDIT #109).
+        """
+        if v <= 0:
+            return 0.0
+        try:
+            return float(rounder(v)) if rounder else float(v)
+        except Exception:
+            # Below the exchange's amount step. That is "no order", not a crash: the
+            # min-notional guards below turn it into an honest empty/partial answer,
+            # and _refresh_sl_stops reports the position uncovered.
+            return 0.0
     qty = _round(qty)
     if qty <= 0:
         return []
@@ -363,9 +379,17 @@ def build_scale_out_orders(
     if same_level and startup_trail_price is not None and abs(startup_trail_price - hard_price) > 1e-9:
         trail_price = startup_trail_price
         same_level = False
-    if scale_out_done or same_level:
+    # scale == 0 means "no trailing leg", which is the same shape as a leg that has
+    # already fired. Falling through instead computed _round(qty * 0) and handed the
+    # exchange rounder a zero -- the 2026-08-18 06:26 failure, which left a SHORT 1785
+    # position with no stop for 21 minutes while the sell side sat blocked.
+    if scale_out_done or same_level or scale <= 0:
         return [("hard", qty, hard_price)]
     trail_qty = _round(qty * scale)
+    if trail_qty <= 0:
+        # The split rounded the trailing leg out of existence. One full-size stop is
+        # strictly better protection than one leg plus nothing.
+        return [("hard", qty, hard_price)]
     hard_qty = _round(qty - trail_qty)
 
     # Splitting a small position produces two legs the exchange will not accept.

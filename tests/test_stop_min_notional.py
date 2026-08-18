@@ -161,10 +161,19 @@ def test_a_zero_scale_out_gives_one_full_size_hard_stop():
     INSIDE the grid -- it would fire on ordinary movement and force taker exits all day.
 
     build_scale_out_orders has always handled scale=0; the config field was bounded gt=0,
-    so the one configuration that makes a tight stop safe could not be expressed."""
-    orders = build_scale_out_orders("long", 1777.0, 0.0, TRAIL, HARD, min_notional=FLOOR)
+    so the one configuration that makes a tight stop safe could not be expressed.
+
+    The rounder is NOT optional here. Passing none made this test pass against code that
+    failed in production for 21 minutes: the live rounder is ccxt's amount_to_precision,
+    which raises on a zero amount instead of returning it, and scale=0 computed exactly
+    that (AUDIT #109). See tests/test_stop_rounder_zero.py."""
+    from tests.test_stop_rounder_zero import ccxt_like
+
+    orders = build_scale_out_orders("long", 1777.0, 0.0, TRAIL, HARD, rounder=ccxt_like,
+                                    min_notional=FLOOR)
 
     assert kinds(orders) == ["hard"]
+    assert orders[0][1] == 1777.0
     assert total_qty(orders) == 1777.0
 
 
