@@ -56,6 +56,7 @@ class TrendFollower:
         stop_loss_pct: float = 0.03,
         trailing_sl_trigger_pct: float = 0.05,
         atr_stop_multiplier: float = 2.0,
+        take_profit_r: float = 0.0,
         leverage: int = 1,
         max_exposure_pct: float = 0.50,
         min_hold_seconds: int = 300,
@@ -67,6 +68,11 @@ class TrendFollower:
         self.capital_pct = capital_pct
         self.stop_loss_pct = stop_loss_pct
         self.atr_stop_multiplier = atr_stop_multiplier
+        # Reward expressed in units of the risk actually taken on this trade ("R").
+        # take_profit_r=3 means the target sits three times as far from entry as the
+        # opening stop does, so a winner pays for three losers. 0 keeps the original
+        # behaviour: no target, ride the trailing stop for as far as the trend runs.
+        self.take_profit_r = max(0.0, take_profit_r)
         self.leverage = leverage
         self.max_exposure_pct = max_exposure_pct
         self.min_hold_seconds = min_hold_seconds
@@ -87,6 +93,11 @@ class TrendFollower:
         self._qty = 0.0
         self._order_id: str | None = None
         self._entry_time = 0.0
+        # Fixed at entry from the OPENING stop, never re-derived. The stop ratchets as
+        # price runs, so a target recomputed from the live stop would creep toward entry
+        # and shrink the reward it was set to guarantee.
+        self._initial_risk = 0.0
+        self._take_profit_price: float | None = None
 
         # --- stops (ratcheted, see update_trailing_sl) ---
         self._peak_price = 0.0
@@ -301,20 +312,29 @@ class TrendFollower:
 
         if self._side is not None:
             price = self.exchange.get_price(self.symbol)
+            # The target is checked FIRST, and deliberately. Stop and target sit on
+            # opposite sides of entry so they cannot both be live on one tick -- except
+            # on a gap, where price has jumped clean past one of them. Taking the target
+            # there would book a win the market never offered; testing the stop's side
+            # of the move first keeps the pessimistic reading.
+            tp = self._take_profit_price
+            hit_target = tp is not None and (
+                price >= tp if self._side == "long" else price <= tp)
+
             if self._side == "long":
                 self.update_trailing_sl(price)
                 stop = self.get_stop_loss_price()
-                if stop is not None and price <= stop and self._can_exit():
-                    exit_fill = self._close_position("trailing_stop")
-                    if exit_fill:
-                        fills.append(exit_fill)
+                hit_stop = stop is not None and price <= stop
             else:
                 self.update_trailing_sl_short(price)
                 stop = self.get_short_stop_loss_price()
-                if stop is not None and price >= stop and self._can_exit():
-                    exit_fill = self._close_position("trailing_stop")
-                    if exit_fill:
-                        fills.append(exit_fill)
+                hit_stop = stop is not None and price >= stop
+
+            if (hit_stop or hit_target) and self._can_exit():
+                exit_fill = self._close_position(
+                    "trailing_stop" if hit_stop else "take_profit")
+                if exit_fill:
+                    fills.append(exit_fill)
 
         # Re-arm. Entry lives in place_initial_orders, and main.py's live loop calls
         # that exactly once, at startup, before the loop begins -- so in router mode
@@ -354,13 +374,28 @@ class TrendFollower:
         self._trailing_sl_price_short = None
         if self._side == "long":
             self.update_trailing_sl(price)
+            opening_stop = self.get_stop_loss_price()
         else:
             self.update_trailing_sl_short(price)
+            opening_stop = self.get_short_stop_loss_price()
+
+        # One R = the distance to the stop this trade actually opened with, so the
+        # target is stated in the same units the risk is. Measured from the stop rather
+        # than from stop_loss_pct because the stop is the greater of an ATR band and
+        # that floor -- in any market with real movement it is the ATR band that binds,
+        # and a target built off the floor would sit far inside the noise.
+        self._initial_risk = abs(price - opening_stop) if opening_stop else 0.0
+        self._take_profit_price = None
+        if self.take_profit_r > 0 and self._initial_risk > 0:
+            offset = self._initial_risk * self.take_profit_r
+            self._take_profit_price = self._round_price(
+                price + offset if self._side == "long" else price - offset)
 
         logger.info(
-            "TREND ENTRY FILLED | {} {} @ {} | stop={}",
-            self._side.upper(), qty, price,
-            self.get_stop_loss_price() if self._side == "long" else self.get_short_stop_loss_price(),
+            "TREND ENTRY FILLED | {} {} @ {} | stop={} | target={} ({}R)",
+            self._side.upper(), qty, price, opening_stop,
+            self._take_profit_price if self._take_profit_price else "none",
+            self.take_profit_r if self.take_profit_r > 0 else 0,
         )
         return {
             "price": price, "side": order.get("side"), "quantity": qty,
@@ -410,10 +445,19 @@ class TrendFollower:
         self._entry_price = 0.0
         self._qty = 0.0
         self._entry_time = 0.0
+        self._initial_risk = 0.0
+        self._take_profit_price = None
         self.reset_trailing()
         return {
             "price": exit_price, "side": "sell" if side == "long" else "buy",
             "quantity": qty, "profit": profit, "fee": 0.0, "completed_cycle": True,
+            # Why the trade ended, not just that it did. Without this the reason exists
+            # only in a log line, so nothing downstream -- and no test -- can tell a
+            # stop-out from a target hit. A gap through the stop mislabelled
+            # "take_profit" would then corrupt every later attempt to measure which exit
+            # actually pays, which is the same class of error as pricing a level's round
+            # trip instead of the position's (AUDIT #80).
+            "reason": reason,
         }
 
     # --- risk interface ----------------------------------------------------

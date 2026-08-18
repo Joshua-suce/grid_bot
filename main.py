@@ -56,6 +56,7 @@ def _install_strategy(engine: GridEngine, exchange: Exchange, events, notifier):
         stop_loss_pct=settings.stop_loss_pct,
         trailing_sl_trigger_pct=settings.trailing_sl_trigger_pct,
         atr_stop_multiplier=settings.trend_atr_stop_multiplier,
+        take_profit_r=settings.trend_take_profit_r,
         leverage=settings.leverage,
         max_exposure_pct=settings.max_exposure_pct,
         min_hold_seconds=settings.trend_min_hold_seconds,

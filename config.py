@@ -274,6 +274,24 @@ class Settings(BaseSettings):
         default=2.0, ge=0.5, le=10.0,
         description="Trend follower's trailing stop distance, in ATR multiples",
     )
+    trend_take_profit_r: float = Field(
+        default=0.0, ge=0.0, le=20.0,
+        description=(
+            "Take-profit for the trend follower, in units of the risk taken on that "
+            "trade (R). One R is the distance from entry to the stop the trade OPENED "
+            "with, so 3.0 puts the target three times as far away as the stop: one "
+            "winner pays for three losers.\n"
+            "\n"
+            "0 disables it and restores the original behaviour -- no target, ride the "
+            "trailing stop for as long as the trend runs. That is the classical choice "
+            "and it is not obviously worse: a fixed target caps the rare very large "
+            "winner, and trend following is usually paid BY that winner. Set this when "
+            "a defined reward:risk matters more than an open-ended one.\n"
+            "\n"
+            "Note the ratio is a ceiling, not a promise. The trailing stop ratchets up "
+            "as price runs and can still close the trade below the target."
+        ),
+    )
     trend_min_hold_seconds: int = Field(
         default=300, ge=0, le=86400,
         description="Minimum time a trend position is held before its stop can fire",
