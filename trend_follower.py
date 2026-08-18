@@ -195,11 +195,49 @@ class TrendFollower:
         self.active = False
         logger.info("TREND FOLLOWER PAUSED | position={} qty={}", self._side, self._qty)
 
-    def emergency_stop(self, reason: str = "emergency") -> None:
-        """`reason` only picks the log level -- see GridEngine.emergency_stop."""
-        self._cancel_entry("emergency_stop")
+    def _has_open_position(self) -> bool:
+        """Is there a live position on this symbol that stops are protecting?
+
+        Deliberately asks about the SYMBOL, not about this strategy's own `_side`. In
+        one-way mode the grid and the follower share a single net position, so a
+        position the follower did not open is still a position its cancel would strip
+        the protection from. Mirrors GridEngine._has_open_position, including its answer
+        on an unreadable book: assume there IS one, because a few orphan reduce-only
+        stops are recoverable and an unhedged position is not (AUDIT #113).
+        """
         try:
-            self.exchange.cancel_everything(self.symbol, timeout_seconds=30)
+            for pos in self.exchange.get_positions(self.symbol):
+                if abs(float(pos.get("contracts", 0) or 0)) > 0:
+                    return True
+            return False
+        except Exception as e:
+            logger.warning(
+                "POSITION CHECK FAILED | {} — assuming a position so stops are not "
+                "cancelled out from under it", e)
+            return True
+
+    def emergency_stop(self, reason: str = "emergency") -> None:
+        """`reason` only picks the log level -- see GridEngine.emergency_stop.
+
+        The stop book survives an open position, exactly as it does in the grid. The
+        router calls emergency_stop on EVERY strategy, so on a shutdown this ran two
+        seconds after GridEngine.emergency_stop had deliberately left the stops armed
+        and logged "STOPS LEFT ARMED" -- and cancelled them, because cancel_everything
+        defaults to keep_stops=False. Observed live on 2026-08-18 15:41:47, one line
+        after that message, on a SHORT 5350 DOGE that then sat with no stop at all.
+
+        The bug is only reachable with STRATEGY_MODE=router: with the grid alone,
+        nothing runs after it (AUDIT #113).
+        """
+        self._cancel_entry("emergency_stop")
+        holding = self._has_open_position()
+        try:
+            self.exchange.cancel_everything(
+                self.symbol, timeout_seconds=30, keep_stops=holding)
+            if holding:
+                logger.warning(
+                    "STOPS LEFT ARMED | a position is still open on {}, so its "
+                    "stop-loss legs stay on the exchange", self.symbol)
         except Exception as e:
             logger.error("TREND FOLLOWER | cancel_everything failed: {}", e)
         self.active = False

@@ -1,119 +1,153 @@
-"""A position that outlives the bot keeps its stops. AUDIT #65.
+"""A shutdown must never strip the stops off an open position. AUDIT #113.
 
-pause/shutdown deliberately does not flatten -- inventory has a ladder to unwind through
-and booking a loss to tidy up is #32/#37's mistake. But `emergency_stop` called
-`cancel_everything`, which takes the algo orders too. So the position stayed and its
-protection did not.
+GridEngine.emergency_stop has preserved them since #65: an inherited position stays
+protected while the bot is down, and the restart reconciler adopts the live legs rather
+than re-placing them.
 
-Found live twice:
+The router calls emergency_stop on EVERY strategy. TrendFollower.emergency_stop called
+cancel_everything with keep_stops defaulting to False, so on 2026-08-18 15:41 it ran two
+seconds after the grid had deliberately left the stops armed:
 
-    8215 DOGE long  sat unhedged after the 11:35 shutdown
-    2522 DOGE short sat unhedged after the 17:34 shutdown
+    15:41:45  grid:emergency_stop      | STOPS LEFT ARMED | a position is still open...
+    15:41:47  exchange:cancel_everything | CANCEL EVERYTHING | 1 total orders cancelled
+    15:41:47  trend_follower:emergency_stop | TREND FOLLOWER STOPPED | shutdown
 
-Grid orders still go on shutdown -- they are this process's working state and would be
-duplicated on restart. Stops are not working state, they are protection, and #54's
-reconciler adopts live stop legs on restart rather than blindly re-placing them.
+That one order was the stop. Verified after the fact against the exchange: SHORT 5350
+DOGE open, fetch_open_orders and the raw fapi endpoint both returning zero orders.
+
+Only reachable with STRATEGY_MODE=router -- with the grid alone nothing runs after it,
+which is why it appeared the same day the router was switched on.
 """
+
+from unittest.mock import MagicMock
 
 import pytest
 
-from grid import GridEngine
+from trend_follower import TrendFollower
 
 
-class _Ex:
-    class exchange:
-        @staticmethod
-        def amount_to_precision(s, a): return f"{float(a):.0f}"
-        @staticmethod
-        def price_to_precision(s, p): return f"{float(p):.5f}"
-
-    def __init__(self, contracts=0.0, positions_raise=False):
-        self.contracts = contracts
-        self.positions_raise = positions_raise
-        self.calls = []
-
-    def get_price(self, s): return 0.0698
-    def get_balance(self, s="USDT"): return 4896.0
-    def get_open_orders(self, s): return []
-    def get_open_order_ids(self, s): return set()
-    def can_place_order(self, s): return True
-    def place_limit_order(self, *a, **k): return {"id": "x"}
-
-    def get_positions(self, s):
-        if self.positions_raise:
-            raise ConnectionError("positions unreadable")
-        return [{"side": "long", "contracts": self.contracts}]
-
-    def cancel_everything(self, symbol, timeout_seconds=300.0):
-        self.calls.append("cancel_everything")
-        return 3
-
-    def cancel_all_open_orders(self, symbol):
-        self.calls.append("cancel_all_open_orders")
-        return 3
+class Inner:
+    def amount_to_precision(self, symbol, amount):
+        return str(int(float(amount)))
 
 
-def _engine(ex):
-    g = GridEngine(exchange=ex, symbol="DOGEUSDT", grid_lower=0.0686,
-                   grid_upper=0.0710, grid_count=8, capital_per_grid_pct=0.018,
-                   capital_per_grid_usdt=5.0, stop_loss_pct=0.03,
-                   max_exposure_pct=0.5, leverage=25)
-    g.initialize(0.0698, balance=4896.0)
-    return g
+def follower(positions, raises=False):
+    ex = MagicMock()
+    ex.exchange = Inner()
+    if raises:
+        ex.get_positions.side_effect = RuntimeError("book unreadable")
+    else:
+        ex.get_positions.return_value = positions
+    ex.get_open_orders.return_value = []
+    tf = TrendFollower(ex, "DOGEUSDT", stop_loss_pct=0.005,
+                       trailing_sl_trigger_pct=0.05, atr_stop_multiplier=2.0)
+    return tf, ex
 
 
-def test_stops_survive_shutdown_while_a_position_is_open():
-    ex = _Ex(contracts=2522.0)
-    g = _engine(ex)
-
-    g.emergency_stop(reason="shutdown")
-
-    assert ex.calls == ["cancel_all_open_orders"], (
-        "cancel_everything takes the stop legs too — the position is left unprotected "
-        "for as long as the bot stays down"
-    )
+def keep_stops_arg(ex):
+    _, kwargs = ex.cancel_everything.call_args
+    return kwargs.get("keep_stops")
 
 
-def test_stops_survive_a_kill_switch_trip_too():
-    """The kill switch stops trading; it does not make an open position safe to strip."""
-    ex = _Ex(contracts=-2522.0)
-    g = _engine(ex)
+# --- the live failure -------------------------------------------------------------------
 
-    g.emergency_stop(reason="daily_loss_limit")
+def test_an_open_position_keeps_its_stops():
+    """The exact case: SHORT 5350 open when shutdown runs."""
+    tf, ex = follower([{"contracts": 5350.0}])
 
-    assert ex.calls == ["cancel_all_open_orders"]
+    tf.emergency_stop("shutdown")
 
-
-def test_everything_is_cancelled_when_flat():
-    """No position means no protection to preserve, and stray stops should not linger."""
-    ex = _Ex(contracts=0.0)
-    g = _engine(ex)
-
-    g.emergency_stop(reason="shutdown")
-
-    assert ex.calls == ["cancel_everything"]
+    assert keep_stops_arg(ex) is True
 
 
-def test_an_unreadable_position_book_is_treated_as_holding():
-    """Assuming a position exists costs a few orphan stop orders. Assuming none exists
-    costs an unhedged position. The asymmetry decides it."""
-    ex = _Ex(positions_raise=True)
-    g = _engine(ex)
+def test_a_position_this_strategy_did_not_open_still_counts():
+    """One-way mode: the grid and the follower share one net position. The follower has
+    no _side here -- it never entered — and must still protect what is there."""
+    tf, ex = follower([{"contracts": 5350.0}])
+    assert tf._side is None
 
-    g.emergency_stop(reason="shutdown")
+    tf.emergency_stop("shutdown")
 
-    assert ex.calls == ["cancel_all_open_orders"]
+    assert keep_stops_arg(ex) is True
 
 
-def test_grid_levels_are_still_released_either_way():
-    """Grid orders are working state; they must not survive into the next process."""
-    ex = _Ex(contracts=2522.0)
-    g = _engine(ex)
-    for level in g.levels:
-        level.order_id = "live"
-        level.status = "pending"
+def test_a_flat_symbol_still_clears_everything():
+    """The other half. A stray stop on a flat book is noise, and leaving it forever
+    would eventually trip the order-count limit."""
+    tf, ex = follower([])
 
-    g.emergency_stop(reason="shutdown")
+    tf.emergency_stop("shutdown")
 
-    assert all(l.order_id is None for l in g.levels)
-    assert g.active is False
+    assert keep_stops_arg(ex) is False
+
+
+def test_a_zero_contract_entry_reads_as_flat():
+    tf, ex = follower([{"contracts": 0.0}])
+
+    tf.emergency_stop("shutdown")
+
+    assert keep_stops_arg(ex) is False
+
+
+def test_a_short_counts_even_though_its_size_is_negative():
+    tf, ex = follower([{"contracts": -5350.0}])
+
+    tf.emergency_stop("shutdown")
+
+    assert keep_stops_arg(ex) is True
+
+
+# --- unreadable is not the same as flat ---------------------------------------------------
+
+def test_an_unreadable_book_keeps_the_stops():
+    """A few orphan reduce-only stops are recoverable. An unhedged position is not."""
+    tf, ex = follower(None, raises=True)
+
+    tf.emergency_stop("shutdown")
+
+    assert keep_stops_arg(ex) is True
+
+
+# --- and the grid's own behaviour is unchanged --------------------------------------------
+
+def test_the_grid_still_keeps_stops_over_a_position():
+    from grid import GridEngine
+
+    ex = MagicMock()
+    ex.exchange.amount_to_precision.side_effect = lambda s, a: str(int(float(a)))
+    ex.get_positions.return_value = [{"contracts": 5350.0}]
+    g = GridEngine(ex, "DOGEUSDT", grid_lower=0.068, grid_upper=0.072, grid_count=8,
+                   capital_per_grid_pct=0.018, stop_loss_pct=0.005,
+                   capital_per_grid_usdt=5.0, leverage=25)
+
+    g.emergency_stop("shutdown")
+
+    ex.cancel_all_open_orders.assert_called_once()
+    ex.cancel_everything.assert_not_called()
+
+
+def test_no_strategy_cancels_everything_unconditionally():
+    """Pinned at source. A third strategy added to the router with a bare
+    cancel_everything() would reintroduce this the moment it is registered.
+
+    The two existing strategies reach the guarantee differently and both are fine: the
+    grid BRANCHES to cancel_all_open_orders while holding, the follower passes
+    keep_stops. What must hold either way is that the call is gated on a position check
+    -- an earlier version of this test demanded the keyword specifically and failed the
+    grid for being correct in the other style.
+    """
+    from pathlib import Path
+
+    import grid as grid_mod
+    import trend_follower as tf_mod
+
+    for mod in (grid_mod, tf_mod):
+        src = Path(mod.__file__).read_text(encoding="utf-8")
+        at = src.find("def emergency_stop")
+        while at != -1:
+            body = src[at:src.index("\n    def ", at + 1)]
+            if "cancel_everything(" in body:
+                assert "_has_open_position()" in body, (
+                    f"{mod.__name__}.emergency_stop calls cancel_everything without "
+                    f"first asking whether a position is open")
+            at = src.find("def emergency_stop", at + 1)
