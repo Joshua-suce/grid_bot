@@ -53,6 +53,7 @@ def _install_strategy(engine: GridEngine, exchange: Exchange, events, notifier):
     trend = TrendFollower(
         exchange, settings.symbol,
         capital_pct=settings.trend_capital_pct,
+        capital_usdt=settings.trend_capital_usdt,
         stop_loss_pct=settings.stop_loss_pct,
         trailing_sl_trigger_pct=settings.trailing_sl_trigger_pct,
         atr_stop_multiplier=settings.trend_atr_stop_multiplier,

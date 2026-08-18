@@ -55,6 +55,7 @@ class TrendFollower:
         exchange,
         symbol: str,
         capital_pct: float = 0.10,
+        capital_usdt: float = 0.0,
         stop_loss_pct: float = 0.03,
         trailing_sl_trigger_pct: float = 0.05,
         atr_stop_multiplier: float = 2.0,
@@ -69,6 +70,9 @@ class TrendFollower:
         self.exchange = exchange
         self.symbol = symbol
         self.capital_pct = capital_pct
+        # Fixed own-capital sizing, mirroring CAPITAL_PER_GRID_USDT. When set it
+        # WINS over the percent path rather than competing with it (AUDIT #110).
+        self.capital_usdt = max(0.0, capital_usdt)
         self.stop_loss_pct = stop_loss_pct
         self.atr_stop_multiplier = atr_stop_multiplier
         # The trail may ride WIDER than the stop the trade opened with. They were one
@@ -307,7 +311,10 @@ class TrendFollower:
     def _entry_qty(self, balance: float, price: float) -> float:
         if price <= 0 or balance <= 0:
             return 0.0
-        notional = balance * self.capital_pct * self.leverage
+        if self.capital_usdt > 0:
+            notional = self.capital_usdt * self.leverage
+        else:
+            notional = balance * self.capital_pct * self.leverage
         max_notional = balance * self.max_exposure_pct
         notional = min(notional, max_notional)
         qty = self._round_amount(notional / price)

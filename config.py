@@ -270,6 +270,19 @@ class Settings(BaseSettings):
         default=0.10, gt=0, le=0.50,
         description="Fraction of equity the trend follower commits to one position",
     )
+    trend_capital_usdt: float = Field(
+        default=0.0, ge=0.0, le=10000.0,
+        description=(
+            "Own capital committed to ONE trend trade, in USDT. Notional is this times "
+            "LEVERAGE, exactly as CAPITAL_PER_GRID_USDT works for a grid rung. "
+            "AUTHORITATIVE when set: TREND_CAPITAL_PCT is ignored rather than taken as "
+            "a maximum, because a setting that silently loses to a larger percent path "
+            "reads as a note in the log and not as 'your number is not being used' "
+            "(the AUDIT #63 mistake, which this deliberately does not repeat). "
+            "0 keeps the percent-of-equity behaviour. "
+            "The exposure and position caps still apply on top of either path."
+        ),
+    )
     trend_atr_stop_multiplier: float = Field(
         default=2.0, ge=0.5, le=10.0,
         description="Trend follower's trailing stop distance, in ATR multiples",
