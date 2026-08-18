@@ -510,8 +510,70 @@ class Exchange:
 
         _retry also covers the timestamp drift these each open-coded, so that goes with
         it rather than being duplicated three ways.
+
+        FALLBACK. ccxt's fetch_balance calls fapi/v3/account -- the heaviest account
+        endpoint there is, returning full state including every position, for one number.
+        On 2026-08-18 01:41 Binance's demo backend answered -1007 on the whole v3 account
+        family while v2 was healthy:
+
+            FAILED  fapi/v3/account   -1007
+            FAILED  fapi/v3/balance   -1007
+            OK      fapi/v2/balance   balance=5000.00  avail=5000.00
+            OK      fapi/v2/account   wallet=5000.00
+
+        set_leverage and the clock sync had both just succeeded, so this was never "the
+        exchange is down" -- it was one API version down, with a working alternative
+        sitting next to it, and the bot refusing to start over it. Retries cannot help
+        with that: they ask the same broken endpoint three more times.
         """
-        return self._retry(self.exchange.fetch_balance, label="fetch_balance")
+        try:
+            return self._retry(self.exchange.fetch_balance, label="fetch_balance")
+        except (ccxt.RequestTimeout, ccxt.NetworkError, ccxt.ExchangeNotAvailable) as e:
+            fallback = self._fetch_balance_v2()
+            if fallback is None:
+                raise
+            logger.warning(
+                "BALANCE FALLBACK | fapi/v3/account is not answering ({}) — read the "
+                "balance from fapi/v2/balance instead. Position and order endpoints are "
+                "unaffected; only this figure took the alternate route.", e,
+            )
+            return fallback
+
+    def _fetch_balance_v2(self) -> dict | None:
+        """The same numbers from fapi/v2/balance, in ccxt's unified shape, or None.
+
+        `total` is wallet balance PLUS unrealised PnL, because that is what v3 reports as
+        total and what equity has to mean -- risk.check_all measures drawdown against it,
+        so a `total` that silently excluded open PnL would read a losing position as no
+        drawdown at all.
+        """
+        # Deliberately NOT through _retry, which gates on the circuit breaker. The
+        # primary's failures are what opened it -- three per call, threshold five -- so
+        # routing the fallback through the same gate means the breaker the broken
+        # endpoint tripped also refuses the healthy one, and the fallback can never run
+        # on the second call. Observed exactly that: get_balance() fell back and
+        # returned 5000.0, then get_total_equity() raised "Circuit breaker open".
+        #
+        # A success here is recorded, which closes the breaker -- correctly, because it
+        # is proof the exchange is reachable. The breaker exists to stop hammering a
+        # dead venue, and this is evidence the venue is alive.
+        try:
+            rows = self.exchange.fapiPrivateV2GetBalance()
+            self._circuit_breaker.record_success()
+        except Exception as e:
+            logger.error("BALANCE FALLBACK FAILED | fapi/v2/balance also unreachable: {}", e)
+            return None
+
+        out: dict[str, dict[str, float]] = {}
+        for row in rows or []:
+            asset = row.get("asset")
+            if not asset:
+                continue
+            wallet = float(row.get("balance") or 0.0)
+            total = wallet + float(row.get("crossUnPnl") or 0.0)
+            free = float(row.get("availableBalance") or 0.0)
+            out[asset] = {"free": free, "total": total, "used": max(0.0, total - free)}
+        return out or None
 
     def get_balance(self, asset: str = "USDT") -> float:
         """Return the available free asset balance."""
