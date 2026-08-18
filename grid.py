@@ -2807,6 +2807,7 @@ class GridEngine:
         Returns the number of levels reset.
         """
         reset = 0
+        resided = 0
         for level in self.levels:
             level.order_id = None
             if level.side == "sell" and level.status == "replaced":
@@ -2817,6 +2818,48 @@ class GridEngine:
             elif level.status != "pending":
                 level.status = "pending"
                 reset += 1
+
+            # Re-derive which side of the market this line sits on.
+            #
+            # The saved side was decided against spot as it was when the ladder was
+            # built. Once price drifts past a rung, that rung is tagged for the wrong
+            # side of the market and can never be placed: post-only rejects a sell below
+            # the bid and a buy above the ask with -2019, on every attempt, forever.
+            #
+            # Observed 2026-08-18. The restored ladder's centre was 0.069940 and spot
+            # opened at 0.07027, so 0.06994 was still a "sell" sitting BELOW the market:
+            #     17:43:10  PLACED 7 initial grid orders (1 failed, 0 awaiting counter)
+            #     17:43:15  PLACED 0 initial grid orders (1 failed, 0 awaiting counter)
+            # the same level both times. Three sell rungs covered spot instead of four,
+            # and when the innermost filled at 17:57 the book above price was 0.07060 and
+            # 0.07093 only. Price reached 0.07051 -- nine ticks short -- and nothing
+            # filled for 2h28m.
+            #
+            # Safe HERE and nowhere else: main.py calls this only when the exchange
+            # reports no position, so no level holds inventory. With a position open a
+            # side flip would turn a reduce-only exit into an order that ADDS exposure,
+            # which is why the reconcile path beside it leaves sides alone (AUDIT #115).
+            #
+            # `> 0` and not merely `is not None`: a failed price read surfacing as 0.0
+            # would otherwise re-tag the whole ladder as sells.
+            if current_price is not None and current_price > 0:
+                want = "buy" if level.price < current_price else "sell"
+                if level.side != want:
+                    level.side = want
+                    level.entry_price = level.price if want == "buy" else 0.0
+                    # The flat account proves whatever cycle queued this is over; an exit
+                    # left queued against a re-sided level waits on inventory that no
+                    # longer exists.
+                    level.awaiting_side = None
+                    level.awaiting_price = None
+                    resided += 1
+
+        if resided:
+            logger.warning(
+                "LEVEL SIDES RESYNCED | {} level(s) were tagged for the wrong side of "
+                "{} and could never have been placed post-only",
+                resided, round(current_price, 8),
+            )
 
         before = len(self.levels)
         self._dedupe_levels()
