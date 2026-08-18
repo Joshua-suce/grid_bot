@@ -585,6 +585,19 @@ def daily_reset_check(
         risk.reset_daily()
 
 
+# Two very different things wear the same "problem" hat, and they need opposite handling.
+# "The exchange says 5x and your config says 25x" is a real misconfiguration: restarting
+# changes nothing and a human has to fix it, so the process stops. "I could not reach the
+# endpoint to ask" is an OUTAGE, and stopping over it means a backend timeout takes the
+# bot down until somebody notices (AUDIT #104). Naming the second one lets the caller
+# tell them apart.
+ACCOUNT_UNREADABLE = (
+    "account configuration could not be read, so leverage, margin mode and "
+    "position mode are all unverified — refusing to size orders against "
+    "assumptions nothing confirmed"
+)
+
+
 def verify_account_config(exchange: Exchange, cfg, balance: float) -> list[str]:
     """Check the EXCHANGE agrees with the assumptions the sizing and stop math make.
 
@@ -601,11 +614,7 @@ def verify_account_config(exchange: Exchange, cfg, balance: float) -> list[str]:
     problems: list[str] = []
     acct = exchange.get_account_config(cfg.symbol)
     if acct is None:
-        return [
-            "account configuration could not be read, so leverage, margin mode and "
-            "position mode are all unverified — refusing to size orders against "
-            "assumptions nothing confirmed"
-        ]
+        return [ACCOUNT_UNREADABLE]
 
     logger.info(
         "ACCOUNT CONFIG | leverage={}x | margin={} | position mode={} | max notional={:,.0f}",
@@ -818,6 +827,14 @@ def run_bot() -> None:
             "bot's sizing assumptions:\n"
             + "\n".join(f"• {p}" for p in account_problems)
         )
+        # Unreadable is not the same as wrong. A real mismatch needs a human, so exiting
+        # 0 is right -- supervise.py honours it and stays down instead of restarting into
+        # the same misconfiguration forever. But an unreachable endpoint is temporary,
+        # and exiting 0 there hands the supervisor a "someone decided to stop" it has no
+        # way to question. 2026-08-18 02:04, with every signed Binance endpoint answering
+        # HTTP 408, that is precisely what happened (AUDIT #104).
+        if ACCOUNT_UNREADABLE in account_problems:
+            raise SystemExit(1)
         return
 
     # Read the state file BEFORE deciding what to do with any open position.
