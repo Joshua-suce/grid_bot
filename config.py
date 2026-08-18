@@ -199,10 +199,18 @@ class Settings(BaseSettings):
         description="Max position size as fraction of equity (stops unlimited accumulation)",
     )
     sl_scale_out_pct: float = Field(
-        default=0.50, gt=0, le=0.95,
+        default=0.50, ge=0, le=0.95,
         description=(
             "Fraction of the open position closed at the trailing stop-loss; the remainder "
-            "is kept until the hard stop-loss level. Reduces the impact of market-stop dumps."
+            "is kept until the hard stop-loss level. Reduces the impact of market-stop dumps.\n"
+            "\n"
+            "0 disables the split: one full-size hard stop and no trailing leg. That is the "
+            "right setting whenever STOP_LOSS_PCT is tight, because the trailing leg is "
+            "anchored at peak*(1-STOP_LOSS_PCT) -- so a 0.5% stop puts it 0.5% under the "
+            "peak, which is two grid steps and INSIDE the ladder. It would then fire on "
+            "ordinary movement and force taker exits all day. The bound was gt=0, so the "
+            "one configuration that makes a tight stop safe could not be expressed; "
+            "build_scale_out_orders has always handled scale=0 correctly."
         ),
     )
     max_recovery_count: int = Field(

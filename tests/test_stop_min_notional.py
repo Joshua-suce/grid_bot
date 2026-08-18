@@ -148,3 +148,31 @@ def test_rounding_is_applied_before_the_notional_test():
     assert step(150.0 * 0.5) * TRAIL < FLOOR, "rounded half does not"
     assert kinds(orders) == ["hard"], "measured the unrounded size"
     assert total_qty(orders) == 150.0
+
+
+# --- disabling the split entirely -------------------------------------------------------
+
+def test_a_zero_scale_out_gives_one_full_size_hard_stop():
+    """SL_SCALE_OUT_PCT=0 means "no trailing leg, one hard stop", and it is the only safe
+    setting when STOP_LOSS_PCT is tight.
+
+    The trailing leg is anchored at peak*(1-STOP_LOSS_PCT). At the old 3% that sits well
+    under the ladder; at 0.5% it sits 0.5% under the peak, which is two grid steps and
+    INSIDE the grid -- it would fire on ordinary movement and force taker exits all day.
+
+    build_scale_out_orders has always handled scale=0; the config field was bounded gt=0,
+    so the one configuration that makes a tight stop safe could not be expressed."""
+    orders = build_scale_out_orders("long", 1777.0, 0.0, TRAIL, HARD, min_notional=FLOOR)
+
+    assert kinds(orders) == ["hard"]
+    assert total_qty(orders) == 1777.0
+
+
+def test_the_config_permits_a_zero_scale_out():
+    """A pydantic bound of gt=0 would reject it before the engine ever saw it."""
+    from config import Settings
+
+    field = Settings.model_fields["sl_scale_out_pct"]
+    lows = [m for m in field.metadata if hasattr(m, "ge") or hasattr(m, "gt")]
+    assert any(getattr(m, "ge", None) == 0 for m in lows), (
+        f"sl_scale_out_pct still cannot be set to 0: {lows}")
