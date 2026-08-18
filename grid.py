@@ -2965,6 +2965,57 @@ class GridEngine:
                     self.grid_count, len(self.levels),
                 )
             self._rebuild_levels(current_price)
+        else:
+            # _rebuild_levels recomputes grid_spacing itself; this is the path where it
+            # does not run, and nothing else repairs the restored scalar.
+            self._resync_spacing_to_levels()
+
+    def _resync_spacing_to_levels(self) -> None:
+        """Derive grid_spacing from the ladder that actually exists.
+
+        grid_spacing is restored verbatim from the file while the levels beside it are
+        deduped, refilled and re-sided. Nothing reconciled the two: _rebuild_levels
+        recomputes it but only fires when the level count disagrees with config, and
+        _refill_missing_grid_lines deliberately inserts into the ladder's ACTUAL gaps
+        without touching it. So a state file that survives a GRID_COUNT change carries
+        the OLD count's spacing forever.
+
+        Observed live 2026-08-18: the file held 0.0006586412, which is exactly
+        (upper-lower)/3 -- the value _rebuild_levels writes for grid_count=4 -- against a
+        restored 8-rung ladder whose real mean gap was 0.0002828571. 2.33x too wide, and
+        the four rungs that ladder was built from (0.06895/0.06961/0.07027/0.07093) were
+        all still in it.
+
+        It is not a cosmetic field. Replacements are posted at level.price +/-
+        grid_spacing (see _handle_fill), so the exit for the 0.07027 fill went to 0.06961
+        -- two rungs down, 0.94% away -- instead of the adjacent 0.06994. Price then
+        ranged 0.07022-0.07051 for 2h28m and touched nothing. The profit floor compares
+        against grid_spacing too, so every cycle was scored on a gap the ladder does not
+        have (AUDIT #114).
+
+        Mean, not a step: _initialize_dynamic builds a deliberately non-uniform ladder,
+        so no single value indexes it. This mirrors what that function computes.
+        """
+        if len(self.levels) < 2:
+            return
+        gaps = [self.levels[i + 1].price - self.levels[i].price
+                for i in range(len(self.levels) - 1)]
+        measured = sum(gaps) / len(gaps)
+        if measured <= 0:
+            logger.warning(
+                "GRID SPACING | {} levels average a gap of {} — keeping the restored "
+                "{}", len(self.levels), measured, self.grid_spacing,
+            )
+            return
+        stale = self.grid_spacing
+        self.grid_spacing = measured
+        if stale > 0 and abs(stale - measured) / measured > 0.05:
+            logger.warning(
+                "GRID SPACING RESYNCED | state held {:.8f} but the {} restored levels "
+                "average {:.8f} ({:.2f}x) — replacement orders and the profit floor "
+                "would have used the stale value",
+                stale, len(self.levels), measured, stale / measured,
+            )
 
     def _refill_missing_grid_lines(self, current_price: float | None = None) -> None:
         """Re-add pending levels on empty grid lines after duplicate price+side
