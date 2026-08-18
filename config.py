@@ -274,6 +274,25 @@ class Settings(BaseSettings):
         default=2.0, ge=0.5, le=10.0,
         description="Trend follower's trailing stop distance, in ATR multiples",
     )
+    trend_trail_atr_multiplier: float = Field(
+        default=0.0, ge=0.0, le=20.0,
+        description=(
+            "Trailing-stop distance in ATR multiples, for the trail ONLY. 0 means "
+            "same as TREND_ATR_STOP_MULTIPLIER, which is how it behaved when the "
+            "two were one number. "
+            "Separating them is what makes TREND_TAKE_PROFIT_R reachable: the "
+            "target sits at R times the stop the trade OPENED with, while the "
+            "trail follows one stop-width behind the extreme -- so with both "
+            "equal, price must run R widths without ever giving back a single "
+            "one, and it rarely does. Measured over 62 days of DOGEUSDT on 5m "
+            "bars with a 3R target: at 2x/2x the target was reached 3 times in "
+            "70 trades for a realised win:loss of 1.46:1; widening the trail to "
+            "3x gave 5 in 45 and 2.44:1 (AUDIT #105). "
+            "Wider is not free -- it gives back more of an open winner before "
+            "closing, and in that same measurement no width made the average "
+            "trade profitable."
+        ),
+    )
     trend_take_profit_r: float = Field(
         default=0.0, ge=0.0, le=20.0,
         description=(

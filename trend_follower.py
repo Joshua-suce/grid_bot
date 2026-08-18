@@ -56,6 +56,7 @@ class TrendFollower:
         stop_loss_pct: float = 0.03,
         trailing_sl_trigger_pct: float = 0.05,
         atr_stop_multiplier: float = 2.0,
+        trail_atr_multiplier: float = 0.0,
         take_profit_r: float = 0.0,
         leverage: int = 1,
         max_exposure_pct: float = 0.50,
@@ -68,6 +69,16 @@ class TrendFollower:
         self.capital_pct = capital_pct
         self.stop_loss_pct = stop_loss_pct
         self.atr_stop_multiplier = atr_stop_multiplier
+        # The trail may ride WIDER than the stop the trade opened with. They were one
+        # number, and that coupling is what put the take-profit out of reach: the target
+        # sits at take_profit_r x the opening stop while the trail follows one stop-width
+        # behind the extreme, so price has to run R widths without ever giving back one.
+        # Measured on 62 days of DOGEUSDT 5m, target 3R, 70 handoffs: at a trail equal to
+        # the stop the target was hit 3 times out of 70 and the realised win:loss came to
+        # 1.46:1. At 3x it was 5 of 45 and 2.44:1 (AUDIT #105).
+        #
+        # 0 means "same as the opening stop", which is the behaviour this replaces.
+        self.trail_atr_multiplier = trail_atr_multiplier or atr_stop_multiplier
         # Reward expressed in units of the risk actually taken on this trade ("R").
         # take_profit_r=3 means the target sits three times as far from entry as the
         # opening stop does, so a winner pays for three losers. 0 keeps the original
@@ -128,11 +139,22 @@ class TrendFollower:
             return "short"
         return None
 
-    def _stop_distance(self, price: float) -> float:
+    def _stop_distance(self, price: float, multiplier: float | None = None) -> float:
         """ATR-scaled, floored at stop_loss_pct so a quiet market cannot produce a stop
-        so tight that noise closes the position immediately."""
-        atr_stop = price * self._atr_pct * self.atr_stop_multiplier
+        so tight that noise closes the position immediately.
+
+        `multiplier` defaults to the opening stop's. The ratchet passes the trail's,
+        which may be wider -- see trail_atr_multiplier.
+        """
+        mult = self.atr_stop_multiplier if multiplier is None else multiplier
+        atr_stop = price * self._atr_pct * mult
         return max(atr_stop, price * self.stop_loss_pct)
+
+    def _ratchet_distance(self, price: float, opening: bool) -> float:
+        """The opening stop defines 1R, so it must keep using the entry multiplier even
+        though the same method sets it. Only later moves use the wider trail."""
+        return self._stop_distance(
+            price, None if opening else self.trail_atr_multiplier)
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -504,7 +526,8 @@ class TrendFollower:
             self._peak_price = current_price
         if self._peak_price <= 0:
             return
-        candidate = self._peak_price - self._stop_distance(self._peak_price)
+        candidate = self._peak_price - self._ratchet_distance(
+            self._peak_price, self._trailing_sl_price is None)
         trigger = self._peak_price * (1 - self._trailing_sl_trigger)
         candidate = max(candidate, trigger)
         if self._trailing_sl_price is None:
@@ -517,7 +540,8 @@ class TrendFollower:
             self._trough_price = current_price
         if self._trough_price <= 0:
             return
-        candidate = self._trough_price + self._stop_distance(self._trough_price)
+        candidate = self._trough_price + self._ratchet_distance(
+            self._trough_price, self._trailing_sl_price_short is None)
         trigger = self._trough_price * (1 + self._trailing_sl_trigger)
         candidate = min(candidate, trigger)
         if self._trailing_sl_price_short is None:
