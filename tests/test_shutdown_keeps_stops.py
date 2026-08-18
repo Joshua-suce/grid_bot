@@ -127,27 +127,37 @@ def test_the_grid_still_keeps_stops_over_a_position():
 
 
 def test_no_strategy_cancels_everything_unconditionally():
-    """Pinned at source. A third strategy added to the router with a bare
-    cancel_everything() would reintroduce this the moment it is registered.
+    """Pinned at source, across EVERY module rather than a hardcoded pair.
+
+    router.py:398 fans emergency_stop out over self.strategies.values(), so a third
+    strategy registered there inherits this bug for free. The first version of this test
+    scanned only grid.py and trend_follower.py while its docstring claimed it would
+    catch exactly that -- a guard that does not cover the case it advertises is worse
+    than no guard, because it is read as coverage.
 
     The two existing strategies reach the guarantee differently and both are fine: the
     grid BRANCHES to cancel_all_open_orders while holding, the follower passes
     keep_stops. What must hold either way is that the call is gated on a position check
-    -- an earlier version of this test demanded the keyword specifically and failed the
-    grid for being correct in the other style.
+    -- an earlier version demanded the keyword specifically and failed the grid for
+    being correct in the other style.
     """
     from pathlib import Path
 
-    import grid as grid_mod
-    import trend_follower as tf_mod
-
-    for mod in (grid_mod, tf_mod):
-        src = Path(mod.__file__).read_text(encoding="utf-8")
+    root = Path(__file__).resolve().parent.parent
+    checked = []
+    for path in sorted(root.glob("*.py")):
+        src = path.read_text(encoding="utf-8")
         at = src.find("def emergency_stop")
         while at != -1:
-            body = src[at:src.index("\n    def ", at + 1)]
+            nxt = src.find("\n    def ", at + 1)  # -1 when it is the file's last method
+            body = src[at:nxt if nxt != -1 else len(src)]
             if "cancel_everything(" in body:
+                checked.append(path.name)
                 assert "_has_open_position()" in body, (
-                    f"{mod.__name__}.emergency_stop calls cancel_everything without "
+                    f"{path.name}.emergency_stop calls cancel_everything without "
                     f"first asking whether a position is open")
             at = src.find("def emergency_stop", at + 1)
+
+    assert {"grid.py", "trend_follower.py"} <= set(checked), (
+        f"the scan found no emergency_stop to check in one of the known strategies, so "
+        f"a pass here means nothing — saw {sorted(set(checked))}")
