@@ -174,9 +174,27 @@ def test_the_stop_loss_floor_still_binds():
 # --- config ------------------------------------------------------------------------
 
 def test_the_config_default_changes_nothing():
-    from config import settings
+    """The DECLARED default, not the loaded value. Asserting on `settings` couples this
+    to whatever .env happens to say, so the test broke the moment the knob was actually
+    used -- which is the one situation it should have stayed quiet for."""
+    from config import Settings
 
-    assert settings.trend_trail_atr_multiplier == 0.0
+    assert Settings.model_fields["trend_trail_atr_multiplier"].default == 0.0
+
+
+def test_a_configured_trail_is_within_the_declared_bounds():
+    """Whatever .env is set to now must be something the follower will accept."""
+    from config import Settings, settings
+
+    field = Settings.model_fields["trend_trail_atr_multiplier"]
+    lo = next(m.ge for m in field.metadata if hasattr(m, "ge"))
+    hi = next(m.le for m in field.metadata if hasattr(m, "le"))
+
+    assert lo <= settings.trend_trail_atr_multiplier <= hi
+    if settings.trend_trail_atr_multiplier:
+        assert settings.trend_trail_atr_multiplier >= settings.trend_atr_stop_multiplier, (
+            "a trail NARROWER than the opening stop would tighten the stop the moment "
+            "price moves, which is the opposite of what the knob is for")
 
 
 def test_main_passes_the_knob_to_the_follower():
