@@ -1153,6 +1153,7 @@ def run_bot() -> None:
             lookback_days=settings.range_lookback_days,
             atr_multiplier=settings.range_atr_multiplier,
             timeframe=settings.grid_timeframe,
+            mode=settings.range_mode,
         )
 
         atr_series = calc_atr(ohlcv["high"], ohlcv["low"], ohlcv["close"], period=14)
@@ -1536,6 +1537,7 @@ def run_bot() -> None:
                                 lookback_days=settings.range_lookback_days,
                                 atr_multiplier=settings.range_atr_multiplier,
                                 timeframe=settings.grid_timeframe,
+                                mode=settings.range_mode,
                             )
 
                             atr_series = calc_atr(ohlcv["high"], ohlcv["low"], ohlcv["close"], period=14)

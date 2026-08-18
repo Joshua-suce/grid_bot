@@ -54,7 +54,28 @@ def calculate_grid_range(
     lookback_days: int = 14,
     atr_multiplier: float = 1.5,
     timeframe: str = "1h",
+    mode: str = "atr",
+    realised_window: int = 24,
+    realised_multiplier: float = 5.0,
 ) -> tuple[float, float]:
+    """Half-width of the ladder, from recent volatility.
+
+    Two estimators. "atr" is ATR(14) x atr_multiplier, the long-standing behaviour.
+    "realised" is the mean CANDLE RANGE over realised_window bars x realised_multiplier.
+
+    The second one predicts the next 24 hours' actual span better, which is what the
+    range is FOR: too wide and the rungs sit where price never goes -- 2026-08-18 ran a
+    2.83% ladder while price travelled 0.43% in four hours and filled once. Measured
+    walk-forward on DOGEUSDT 1h, three folds of 363 test bars each:
+
+        fold   ATRx3.5 MAE   realised MAE   better by
+           1       1.4004%        1.3535%        3.3%
+           2       1.3363%        1.2473%        6.7%
+           3       1.0183%        0.8310%       18.4%
+
+    Better in every fold, and the multiplier that falls out is stable across them
+    (4.94-5.07), which is why it is a constant and not something to tune (AUDIT #111).
+    """
     candles_per_day = TIMEFRAME_CANDLES_PER_DAY.get(timeframe, 24)
     recent = ohlcv.tail(lookback_days * candles_per_day)
     if len(recent) < 20:
@@ -65,8 +86,38 @@ def calculate_grid_range(
     atr_series = calc_atr(recent["high"], recent["low"], recent["close"], period=14)
     current_atr = float(atr_series.iloc[-1]) if not np.isnan(atr_series.iloc[-1]) else current_price * 0.02
 
-    lower = current_price - (current_atr * atr_multiplier)
-    upper = current_price + (current_atr * atr_multiplier)
+    half = current_atr * atr_multiplier
+    if mode == "realised":
+        window = recent.tail(realised_window)
+        if len(window) >= max(2, realised_window // 2):
+            mean_range = float(
+                ((window["high"] - window["low"]) / window["close"]).mean())
+            if mean_range > 0:
+                # realised_multiplier was fitted against the FULL next-24h span, and
+                # this function returns a HALF-width. Halve it or the ladder comes out
+                # twice as wide as the estimator says -- which is the exact failure the
+                # mode exists to fix, so it would have been quiet and wrong.
+                half = current_price * mean_range * realised_multiplier / 2.0
+                logger.info(
+                    "GRID RANGE | realised: mean 1h range {:.3%} over {} bars x {}/2 "
+                    "= {:.3%} half-width (ATR path would have given {:.3%})",
+                    mean_range, len(window), realised_multiplier,
+                    half / current_price, current_atr * atr_multiplier / current_price,
+                )
+
+    # A zero half-width puts every rung on one line and leaves grid_spacing at 0, which
+    # disables the fee-floor and deformation checks that divide by it. Both estimators
+    # can reach it: ATR is 0.0 (not NaN) on a perfectly flat window, and so is the mean
+    # candle range. Fall back to the same 5% the too-few-candles path uses -- "not
+    # enough information to size this" is the same answer in both cases.
+    if half <= 0:
+        logger.warning(
+            "GRID RANGE | measured volatility is zero over the lookback — falling back "
+            "to a 5% half-width rather than collapsing every rung onto one price")
+        half = current_price * 0.05
+
+    lower = current_price - half
+    upper = current_price + half
 
     logger.info(
         "GRID RANGE CALCULATED | lower={} upper={} ATR={} current={}",

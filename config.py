@@ -99,6 +99,17 @@ class Settings(BaseSettings):
         default=0.01, ge=0.0005, le=0.05,
         description="Minimum grid spacing as fraction of price (1.0% = 0.01)",
     )
+    range_mode: str = Field(
+        default="atr",
+        description=(
+            "How the grid's half-width is estimated. 'atr' is ATR(14) x "
+            "RANGE_ATR_MULTIPLIER, the long-standing behaviour. 'realised' is the mean "
+            "candle range over the last 24 bars x 5, which predicts the next day's "
+            "actual span better in every walk-forward fold tested -- and the range is "
+            "for exactly that. Too wide and the rungs sit where price never goes "
+            "(AUDIT #111)."
+        ),
+    )
     min_profit_multiplier: float = Field(
         default=3.0, ge=1.0, le=10.0,
         description=(

@@ -143,12 +143,15 @@ def simulate(symbol: str, *, take_profit_r: float, atr_mult: float, floor_pct: f
     peak = trough = 0.0
     trail: float | None = None
 
+    # Aligned once onto the walk index. Scanning atr_series.index on every bar made
+    # this O(n^2) -- 18k five-minute bars turned a sweep into a ten-minute timeout.
+    atr_on_walk = atr_series.reindex(fine.index, method="ffill")
+
     def atr_pct_at(ts, price):
-        prior = atr_series.index[atr_series.index <= ts]
-        if not len(prior) or price <= 0:
+        if price <= 0:
             return 0.0
-        a = atr_series.loc[prior[-1]]
-        return 0.0 if pd.isna(a) else a / price
+        a = atr_on_walk.get(ts)
+        return 0.0 if a is None or pd.isna(a) else a / price
 
     # Each timeframe's verdict is held forward onto the walk index -- a 1d call stands
     # for the 288 five-minute bars it covers, which is what the live filter sees between

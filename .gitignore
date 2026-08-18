@@ -14,6 +14,9 @@ state/*.json.old
 state/*.corrupt*
 state/*.bak.*
 state/*.empty
+# atomic-write scratch files; a crash mid-save can leave one behind
+state/.state_*.tmp
+state/*.tmp
 
 # Cached OHLCV for backtests (regenerable via backtest.fetch_ohlcv)
 data/
