@@ -361,7 +361,16 @@ class Exchange:
             raise ccxt.NetworkError("Circuit breaker open")
         last_err = None
         attempts = max_attempts or self.max_retries
-        for attempt in range(1, attempts + 1):
+        # A clock resync is a REPAIR, not a retry-and-hope, so it earns its attempt back
+        # rather than spending one. Spending it means the clock gets fixed and then there
+        # is nothing left to use the fix with -- at max_retries=1 the call resynced and
+        # raised anyway, which is exactly what the balance getters' own unconditional
+        # resync used to prevent before they were folded in here (AUDIT #102). Bounded,
+        # so a backend that answers -1021 forever still terminates.
+        resync_budget = 2
+        attempt = 0
+        while attempt < attempts:
+            attempt += 1
             try:
                 result = fn(*args, **kwargs)
                 self._circuit_breaker.record_success()
@@ -370,6 +379,9 @@ class Exchange:
                 last_err = e
                 if self._is_timestamp_error(e):
                     self._sync_time()
+                    if resync_budget > 0:
+                        resync_budget -= 1
+                        attempts += 1
                     delay = self.retry_delay * attempt
                     logger.warning(
                         "{} timestamp drift (attempt {}/{}): synced time, retrying in {}s",
@@ -475,17 +487,35 @@ class Exchange:
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         return df
 
+    def _fetch_balance(self) -> dict:
+        """fetch_balance THROUGH the retry wrapper. AUDIT #102.
+
+        Every other read on this class goes through _retry -- ticker, order book, ohlcv,
+        income, open orders, positions, fetch_order. The three balance readers were the
+        only ones calling ccxt directly, each with its own hand-rolled timestamp retry
+        and nothing else. So the one endpoint with no protection was the one the startup
+        sequence has to read before it can do anything at all.
+
+        2026-08-18 01:24:20, on a fresh start:
+
+            ERROR | Could not read balance to verify account configuration:
+                    binanceusdm {"code":-1007,"msg":"Timeout waiting for response from
+                    backend server. Send status unknown; execution status unknown."}
+            [supervise] exited 0 after 20s
+            [supervise] clean exit -- not restarting
+
+        -1007 is a backend timeout, which ccxt raises as RequestTimeout, which _retry
+        already handles -- three attempts with a widening delay. It never got there. One
+        hiccup on one call and the bot was down until a human noticed.
+
+        _retry also covers the timestamp drift these each open-coded, so that goes with
+        it rather than being duplicated three ways.
+        """
+        return self._retry(self.exchange.fetch_balance, label="fetch_balance")
+
     def get_balance(self, asset: str = "USDT") -> float:
         """Return the available free asset balance."""
-        try:
-            balance = self.exchange.fetch_balance()
-            return float(balance.get(asset, {}).get("free", 0))
-        except Exception as e:
-            if self._is_timestamp_error(e):
-                self._sync_time()
-                balance = self.exchange.fetch_balance()
-                return float(balance.get(asset, {}).get("free", 0))
-            raise
+        return float(self._fetch_balance().get(asset, {}).get("free", 0))
 
     def _balance_snapshot_cached(self, asset: str = "USDT") -> dict[str, float]:
         """One fetch_balance serving free, total and used together.
@@ -520,51 +550,30 @@ class Exchange:
 
     def get_total_equity(self, asset: str = "USDT") -> float:
         """Return the total asset equity, including used margin or reserved funds."""
-        try:
-            balance = self.exchange.fetch_balance()
-            total = float(balance.get(asset, {}).get("total", 0))
-            if total > 0:
-                return total
-            return float(balance.get(asset, {}).get("free", 0))
-        except Exception as e:
-            if self._is_timestamp_error(e):
-                self._sync_time()
-                balance = self.exchange.fetch_balance()
-                total = float(balance.get(asset, {}).get("total", 0))
-                if total > 0:
-                    return total
-                return float(balance.get(asset, {}).get("free", 0))
-            raise
+        asset_bal = self._fetch_balance().get(asset, {})
+        total = float(asset_bal.get("total", 0))
+        return total if total > 0 else float(asset_bal.get("free", 0))
 
     def get_total_equity_cached(self, asset: str = "USDT") -> float:
         """Return cached total equity, fetching only if stale."""
         return self._balance_snapshot_cached(asset)["total"]
 
     def get_balance_info(self, asset: str = "USDT") -> dict[str, float]:
-        """Return both free and total balance values for clearer reconciliation."""
-        try:
-            balance = self.exchange.fetch_balance()
-            asset_bal = balance.get(asset, {})
-            result = {
-                "free": float(asset_bal.get("free", 0)),
-                "total": float(asset_bal.get("total", 0)),
-                "used": float(asset_bal.get("used", 0)),
-            }
-            self._cache_put(f"free_{asset}", result["free"])
-            self._cache_put(f"total_{asset}", result["total"])
-            self._cache_put(f"used_{asset}", result["used"])
-            return result
-        except Exception as e:
-            if self._is_timestamp_error(e):
-                self._sync_time()
-                balance = self.exchange.fetch_balance()
-                asset_bal = balance.get(asset, {})
-                return {
-                    "free": float(asset_bal.get("free", 0)),
-                    "total": float(asset_bal.get("total", 0)),
-                    "used": float(asset_bal.get("used", 0)),
-                }
-            raise
+        """Return free, total and used for clearer reconciliation.
+
+        The old timestamp-retry branch here returned WITHOUT writing the cache, so a
+        drift-and-resync left every later cached read serving whatever was there before.
+        Going through _retry removes the second path entirely.
+        """
+        asset_bal = self._fetch_balance().get(asset, {})
+        result = {
+            "free": float(asset_bal.get("free", 0)),
+            "total": float(asset_bal.get("total", 0)),
+            "used": float(asset_bal.get("used", 0)),
+        }
+        for key, value in result.items():
+            self._cache_put(f"{key}_{asset}", value)
+        return result
 
     def get_balance_info_cached(self, asset: str = "USDT") -> dict[str, float]:
         """Return cached balance info, fetching only if stale. A copy, not the cache."""

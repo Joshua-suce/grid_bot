@@ -786,8 +786,18 @@ def run_bot() -> None:
     try:
         startup_balance = exchange.get_balance()
     except Exception as e:
+        # SystemExit(1), not `return`. A bare return leaves run_bot normally and the
+        # process exits 0, which supervise.py reads as "a clean exit is a decision
+        # someone made; honour it" -- and stays down. That is right for a deliberate
+        # shutdown and wrong for a backend timeout: on 2026-08-18 01:24 one -1007 on
+        # this very call put the bot down for the night, twenty seconds after starting.
+        #
+        # The read is retried three times before it can get here (AUDIT #102), so
+        # reaching this point means the exchange is genuinely unreachable. That is
+        # exactly what the supervisor's backoff is for, and its breaker still stops a
+        # crash loop after the configured number of attempts.
         logger.error("Could not read balance to verify account configuration: {}", e)
-        return
+        raise SystemExit(1)
 
     account_problems = verify_account_config(exchange, settings, startup_balance)
     if not leverage_ok and not account_problems:
