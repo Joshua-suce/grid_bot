@@ -705,6 +705,33 @@ def verify_account_config(exchange: Exchange, cfg, balance: float) -> list[str]:
     # account actually pays more, rungs go closer together than a cycle can pay for and
     # every completed cycle loses the difference -- silently, because the arithmetic all
     # agrees with itself. Demo and live are not on the same fee schedule.
+    # MIN_NOTIONAL_USDT is hardcoded to 5.0 -- DOGE's number -- and every order the grid
+    # or the trend follower declines to place below the floor is declined against it.
+    # Nothing ever asked the exchange whether it was true. If the real minimum is HIGHER,
+    # orders sized at the floor come back -4164 and the ladder simply never fills, with
+    # the bot's arithmetic agreeing with itself the whole way down (AUDIT #107).
+    exchange_min = exchange.get_min_notional(cfg.symbol)
+    if exchange_min is None:
+        logger.warning(
+            "MIN NOTIONAL UNVERIFIED | sizing against the built-in {:.2f} USDT floor "
+            "without confirming it against the exchange", MIN_NOTIONAL_USDT,
+        )
+    elif exchange_min > MIN_NOTIONAL_USDT:
+        problems.append(
+            f"the exchange requires {exchange_min:.2f} USDT per order on {cfg.symbol} but "
+            f"the bot's floor is {MIN_NOTIONAL_USDT:.2f}. Every order sized between the "
+            f"two would be rejected -4164, so rungs would silently fail to place while "
+            f"the sizing arithmetic still agreed with itself"
+        )
+    elif exchange_min < MIN_NOTIONAL_USDT:
+        logger.info(
+            "MIN NOTIONAL | exchange allows {:.2f} USDT on {}, bot floors at {:.2f} — "
+            "conservative, nothing is rejected by it",
+            exchange_min, cfg.symbol, MIN_NOTIONAL_USDT,
+        )
+    else:
+        logger.info("MIN NOTIONAL | {:.2f} USDT, matches the bot's floor", exchange_min)
+
     fees = exchange.get_commission_rates(cfg.symbol)
     if fees is None:
         logger.warning(

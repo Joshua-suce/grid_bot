@@ -311,6 +311,38 @@ class Exchange:
             logger.warning("Commission rates for {} came back unparseable", symbol)
             return None
 
+    def get_min_notional(self, symbol: str) -> float | None:
+        """The exchange's own minimum order value for this symbol, or None.
+
+        MIN_NOTIONAL_USDT is hardcoded to 5.0 in grid.py and trend_follower.py, and
+        until now nothing ever asked the exchange whether that was true. It is DOGE's
+        number. On a symbol whose minimum is higher, every order the grid sizes at the
+        floor comes back -4164 and the ladder simply never fills -- with the arithmetic
+        agreeing with itself the whole way down, which is the failure mode the fee check
+        exists to catch for fees (AUDIT #107).
+
+        Read from the loaded market rather than a private endpoint: it is public data
+        and needs no credentials, so it still answers when the signed API does not.
+        """
+        try:
+            market = self.exchange.market(symbol)
+        except Exception as e:
+            logger.warning("Could not read market info for {}: {}", symbol, e)
+            return None
+        cost_min = ((market or {}).get("limits", {}).get("cost", {}) or {}).get("min")
+        if cost_min is None:
+            # Some builds carry it only in the raw filter list.
+            for f in (market.get("info", {}) or {}).get("filters", []) or []:
+                if f.get("filterType") == "MIN_NOTIONAL":
+                    cost_min = f.get("notional") or f.get("minNotional")
+                    break
+        try:
+            return float(cost_min) if cost_min is not None else None
+        except (TypeError, ValueError):
+            logger.warning("Minimum notional for {} came back unparseable: {!r}",
+                           symbol, cost_min)
+            return None
+
     def get_maint_margin_ratio(self, symbol: str, notional: float) -> float | None:
         """Maintenance margin rate for `notional`, from the symbol's leverage brackets.
 

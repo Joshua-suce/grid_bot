@@ -219,7 +219,12 @@ def test_t_values_match_the_table():
 
 
 def test_t_converges_to_the_normal_limit():
-    assert t_critical_95(100_000) == pytest.approx(1.960)
+    """Against the constant, not a copy of it. Asserting on a literal 1.960 is the same
+    duplication one layer up, and it broke the moment the two Z95 definitions were
+    reconciled to 1.959964 (AUDIT #107)."""
+    from spacing_study import Z95
+
+    assert t_critical_95(100_000) == pytest.approx(Z95, abs=1e-4)
     assert t_critical_95(35) < t_critical_95(30)
     assert t_critical_95(35) > t_critical_95(40)
 

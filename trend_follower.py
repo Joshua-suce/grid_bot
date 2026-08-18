@@ -34,7 +34,9 @@ import time
 
 from loguru import logger
 
-MIN_NOTIONAL_USDT = 5.0
+# One definition for the production path. This was an independent copy of grid.py's,
+# so a symbol change had two places to remember and no way to notice missing one.
+from grid import MIN_NOTIONAL_USDT  # noqa: E402  (AUDIT #107)
 
 LONG_REGIMES = {"uptrend"}
 SHORT_REGIMES = {"downtrend"}

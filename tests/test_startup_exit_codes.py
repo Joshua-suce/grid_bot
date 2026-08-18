@@ -37,7 +37,7 @@ def cfg():
 
 class FakeExchange:
     """Only what verify_account_config actually reaches for: the account config, the
-    maintenance-margin rate (isolated only) and the fee schedule."""
+    maintenance-margin rate (isolated only), the fee schedule and the order floor."""
 
     def __init__(self, config):
         self._config = config
@@ -52,6 +52,13 @@ class FakeExchange:
         from config import settings
 
         return {"maker_pct": settings.maker_fee_pct, "taker_pct": settings.taker_fee_pct}
+
+    def get_min_notional(self, symbol):
+        # verify_account_config checks the order floor against the
+        # exchange now, same as it checks leverage and fees (AUDIT #107).
+        from grid import MIN_NOTIONAL_USDT
+
+        return MIN_NOTIONAL_USDT
 
 
 def test_an_unreadable_account_reports_the_named_problem():

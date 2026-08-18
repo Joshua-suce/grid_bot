@@ -242,6 +242,12 @@ class DirtyBookExchange:
         return {"maker_pct": main_module.settings.maker_fee_pct,
                 "taker_pct": main_module.settings.taker_fee_pct}
 
+    def get_min_notional(self, symbol):
+        # verify_account_config checks the order floor against the
+        # exchange now, same as it checks leverage and fees (AUDIT #107).
+        from grid import MIN_NOTIONAL_USDT
+
+        return MIN_NOTIONAL_USDT
     def get_positions(self, symbol):
         return []
 

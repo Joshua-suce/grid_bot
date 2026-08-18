@@ -55,7 +55,11 @@ from grid import GridEngine
 from router import StrategyRouter
 from trend_follower import TrendFollower
 
-MIN_NOTIONAL_USDT = 5.0
+# grid's, not a third copy. The harness already imports grid, so this costs nothing
+# and removes the last place the floor could drift from what the bot actually enforces.
+# It stays symbol-blind either way -- see the NOTE in run_backtest.py: ETH's real
+# minimum is 20 and BTC's is 50 (AUDIT #107).
+MIN_NOTIONAL_USDT = grid_module.MIN_NOTIONAL_USDT
 
 
 # --------------------------------------------------------------------------

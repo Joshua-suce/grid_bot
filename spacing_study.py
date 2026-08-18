@@ -61,7 +61,9 @@ _T95 = {
     27: 2.052, 28: 2.048, 29: 2.045, 30: 2.042, 40: 2.021, 50: 2.009,
     60: 2.000, 80: 1.990, 100: 1.984, 120: 1.980,
 }
-Z95 = 1.960
+# Imported rather than restated: this was 1.960 here and 1.959964 in
+# taker_share.py, two values for one constant (AUDIT #107).
+from taker_share import Z95  # noqa: E402
 Z80 = 0.8416          # one-sided 80% power
 
 
