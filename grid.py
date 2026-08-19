@@ -1485,14 +1485,75 @@ class GridEngine:
         finally:
             self._open_orders_fetch_time = 0.0
 
+    def _wrong_side_of(self, level: GridLevel, current_price: float | None) -> bool:
+        """Can this rung's order not be posted at all, as tagged?
+
+        post-only rejects anything that would cross: a sell under the bid, a buy over the
+        ask, both with -2019. Such a rung is not a failure to be retried, it is an order
+        the exchange cannot accept while price is where it is.
+        """
+        if current_price is None or current_price <= 0:
+            return False
+        return ((level.side == "sell" and level.price < current_price)
+                or (level.side == "buy" and level.price > current_price))
+
+    def _reside_safe_levels(self, current_price: float | None) -> int:
+        """Re-side idle rungs stranded on the wrong side of spot. Returns how many.
+
+        AUDIT #115 re-sided levels in reset_levels_to_pending, which main.py calls ONLY
+        when the exchange reports no position. With a position open reconcile_state runs
+        instead, and that reconciles order ids and re-places orphans without ever
+        re-deriving level.side -- so the same defect survived on the holding path.
+
+        Observed 2026-08-19 00:19: the restored ladder carried 0.06994 and 0.0703 tagged
+        "sell" with spot at 0.07004, and startup reported "PLACED 2 initial grid orders
+        (1 failed)". The same line appears on every start whose spot sits above a rung the
+        file calls a sell.
+
+        Flipping while holding is only safe in the direction that does NOT add exposure.
+        Short: a flip TO buy reduces, so allow it; a flip TO sell would add, so refuse.
+        Long: the mirror. That asymmetry is the whole reason this could not simply reuse
+        the flat-path rule -- there, with no inventory, no flip can add anything.
+
+        Rungs in awaiting_counter are never touched: they hold inventory whose exit is
+        already queued, and re-siding one would strand that exit (AUDIT #118).
+        """
+        if current_price is None or current_price <= 0:
+            return 0
+        resided = 0
+        for level in self.levels:
+            if level.order_id is not None or level.status != "pending":
+                continue
+            want = "buy" if level.price < current_price else "sell"
+            if level.side == want:
+                continue
+            if self._pos_qty < 0 and want == "sell":
+                continue                      # would add to the short
+            if self._pos_qty > 0 and want == "buy":
+                continue                      # would add to the long
+            level.side = want
+            level.entry_price = level.price if want == "buy" else 0.0
+            level.awaiting_side = None
+            level.awaiting_price = None
+            resided += 1
+        return resided
+
     def place_initial_orders(self, balance: float) -> int:
         placed = 0
         failed = 0
         held = 0
+        stranded = 0
         first = True
         _price_now = self._current_price_or_none()
         self._release_awaiting_levels(_price_now)
         self._repair_ladder(_price_now)
+        resided = self._reside_safe_levels(_price_now)
+        if resided:
+            logger.info(
+                "LEVEL SIDES RESYNCED | {} idle rung(s) re-sided against {} — they were "
+                "tagged for the wrong side of the market and could not have been posted",
+                resided, round(_price_now, 8),
+            )
         for level in self.levels:
             if level.order_id is not None:
                 continue
@@ -1500,6 +1561,13 @@ class GridEngine:
                 # Not a failure -- its exit is already on the book. Counted separately so
                 # a held rung is never mistaken for one that could not place.
                 held += 1
+                continue
+            if self._wrong_side_of(level, _price_now):
+                # Also not a failure. _reside_safe_levels could not flip this one without
+                # adding to an open position, so post-only would reject it every attempt.
+                # Counting it as "failed" is what made a structural, self-clearing state
+                # look like a broken order path on every single start.
+                stranded += 1
                 continue
             if self.order_pacing_seconds > 0 and not first:
                 time.sleep(self.order_pacing_seconds)
@@ -1510,9 +1578,11 @@ class GridEngine:
                 failed += 1
 
         logger.info(
-            "PLACED {} initial grid orders ({} failed, {} awaiting counter) | "
-            "vol_mult={:.2f} | exposure={:.1%}",
-            placed, failed, held, self._volatility_mult, self.get_exposure_pct(balance),
+            "PLACED {} initial grid orders ({} failed, {} awaiting counter, {} stranded "
+            "the wrong side of {}) | vol_mult={:.2f} | exposure={:.1%}",
+            placed, failed, held, stranded,
+            round(_price_now, 8) if _price_now else "?",
+            self._volatility_mult, self.get_exposure_pct(balance),
         )
         return placed
 
