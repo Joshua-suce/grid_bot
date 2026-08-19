@@ -192,6 +192,13 @@ class GridEngine:
     # restart legitimately starts it at zero.
     _last_deform_warn_time = 0.0
 
+    # Same reason, and the same mistake made twice: _flip_captures_a_spread reaches
+    # _position_break_even, which reads this cache, and tests/test_oneway_starvation.py
+    # also builds its engine with __new__. Four of its tests raised AttributeError the
+    # first time the gate landed (AUDIT #119).
+    _break_even_cache: "tuple[str, float] | None" = None
+    _break_even_time = 0.0
+
     def __init__(
         self,
         exchange: Exchange,
@@ -1036,6 +1043,50 @@ class GridEngine:
             return price > break_even
         return False
 
+    def _flip_captures_a_spread(self, price: float, side: str) -> bool:
+        """Would flipping a held rung onto its OWN line close inventory for real profit?
+
+        A grid earns one spacing per cycle. It earns that because the counter sits a
+        spacing away from the fill. When a held rung instead comes back FLIPPED on its
+        own line, the two legs are the same price and the cycle captures whatever the
+        average entry has drifted -- typically a fraction of a rung -- while still paying
+        a full round trip of fees.
+
+        Measured on ADAUSDT 2026-08-19 04:52-08:07. Four flips, all onto the line the
+        rung had just filled at:
+
+            05:03:58  FILL #1 | SELL @ 0.1743
+            05:10:17  RUNG FLIPPED | SELL 0.1743 -> BUY
+            05:10:18  ORDER PLACED | BUY 717.0 ADAUSDT @ 0.1743
+
+        Sold at 0.1743, bought back at 0.1743. Across the session: 8 fills, 7 with
+        profit=0.000000, gross 0.05 against fees 0.20, net -0.15. The one cycle that
+        earned anything made 0.053 -- from the drift between the average short entry
+        (0.174874) and the close (0.1748), not from a rung -- against 0.05 of round-trip
+        fees. Net 0.003 where the 0.2507% spacing should have paid 0.263.
+
+        _books_a_loss is not enough of a gate: it only asks whether the leg loses money,
+        and a leg that beats break-even by a hundredth of a rung passes it while still
+        handing the exchange more in fees than it takes in spread. This asks for the fee
+        floor -- the same bar every other cycle in the ladder has to clear (AUDIT #119).
+
+        Flat means there is no inventory to close and nothing to undercut, so the flip is
+        just a re-siting and is allowed. A flip that ADDS exposure rather than closing is
+        the position cap's business, not this gate's.
+        """
+        be = self._position_break_even()
+        if be is None:
+            return True
+        pos_side, break_even = be
+        if break_even <= 0:
+            return True
+        floor = self.round_trip_fee_pct * self._min_profit_multiplier
+        if pos_side == "short" and side == "buy":
+            return (break_even - price) / break_even >= floor
+        if pos_side == "long" and side == "sell":
+            return (price - break_even) / break_even >= floor
+        return True
+
     def _nearest_legal_exit(self, level: "GridLevel") -> float | None:
         """The closest price this level can sit at without booking a loss, or None.
 
@@ -1301,12 +1352,24 @@ class GridEngine:
             # Below the market a grid line is a bid; above it, an offer. Re-arming a
             # stale SELL that price has since climbed past would post a crossing order,
             # which is why the clearance test used to be one-directional (AUDIT #77).
+            #
+            # A FLIP onto this line additionally has to capture a real spread. The flip
+            # exists so a rung price has climbed past can still rest (#77), but on its
+            # own line the two legs of the cycle are the same price: it closes inventory
+            # for whatever the average entry has drifted and pays a full round trip of
+            # fees to do it. _flip_captures_a_spread holds it to the fee floor, the same
+            # bar every other cycle clears. Blocked flips fall through to the hole path
+            # below, and failing that stay held -- an idle rung costs nothing, a
+            # zero-spread rung costs a fee every time (AUDIT #119).
             own_side = "buy" if current_price is not None and level.price < current_price else "sell"
             own = (level.price, own_side)
+            flipping = own_side != level.side
             if (current_price is not None
                     and own not in claimed
-                    and self._price_has_cleared(level, current_price)):
-                if own_side != level.side:
+                    and self._price_has_cleared(level, current_price)
+                    and (not flipping
+                         or self._flip_captures_a_spread(level.price, own_side))):
+                if flipping:
                     logger.info(
                         "RUNG FLIPPED | {} {} -> {} — price {} is now on the other side "
                         "of this line, so it comes back as the side that can rest there",
