@@ -220,6 +220,7 @@ class GridEngine:
         max_exposure_pct: float = 0.50,
         use_market_close_on_replace: bool = False,
         min_profit_multiplier: float = 3.0,
+        rung_loss_cap_pct: float = 0.01,
         event_journal: object | None = None,
         notifier: object | None = None,
     ):
@@ -298,6 +299,7 @@ class GridEngine:
         # every level and handed ~39% of gross back to the exchange. Fees are the
         # dominant cost at this trade frequency, so the floor belongs in config.
         self._min_profit_multiplier: float = min_profit_multiplier
+        self._rung_loss_cap_pct: float = max(0.0, rung_loss_cap_pct)
         self._regime: str = "uncertain"
         self._open_orders_fetch_time: float = 0.0
         self._open_orders_map: dict[tuple[float, str], dict] = {}
@@ -1087,6 +1089,49 @@ class GridEngine:
             return (price - break_even) / break_even >= floor
         return True
 
+    def _stuck_exit_ceiling(self, side: str) -> float | None:
+        """Worst price an exit may take while the ladder is stuck, or None. AUDIT #122.
+
+        AUDIT #32's rule -- never book a loss, the levels will unwind the inventory --
+        rests on those levels being able to TRADE while they wait. Waiting is free only
+        while the other side of the ladder still earns. Once the position has eaten the
+        position cap that side is blocked, no rung on it can be placed, and waiting earns
+        nothing: it is a directional bet with the income switched off.
+
+        ADAUSDT 2026-08-19, the sequence in full:
+
+            14:56:27  POSITION LIMIT | short 6307.0 >= 5608.77 -- sell orders blocked
+            15:06:28  KILL SWITCH: price 0.1776 above stop loss 0.17753
+            16:30:22  SKIP BUY @ 0.1752 | below break-even 0.17475982
+            16:31:42  POSITION LIMIT | short 6307.0 >= 5433.6 -- sell orders blocked
+            19:44:58  Cancelled 0 open orders   (empty book for 3h13m)
+
+        At 14:56 price was 0.176 -- 0.59% past break-even. Refusing that loss is what
+        produced a 3.3% one by 19:44, plus three hours in which no rung could trade at
+        all. The hard stop is not a substitute: it fired at 15:06 and the position was
+        still open at shutdown.
+
+        So: while the OPPOSITE side is cap-blocked, an exit may price up to
+        rung_loss_cap_pct past break-even. Outside that state nothing changes, and
+        rung_loss_cap_pct = 0 restores the old behaviour exactly.
+
+        A buy exits a short and the SELL side is what grows that short, so the buy side
+        is stuck exactly when sells are capped. The long case is the mirror.
+        """
+        if self._rung_loss_cap_pct <= 0:
+            return None
+        be = self._position_break_even()
+        if be is None:
+            return None
+        pos_side, break_even = be
+        if break_even <= 0:
+            return None
+        if pos_side == "short" and side == "buy" and self._block_sells:
+            return break_even * (1.0 + self._rung_loss_cap_pct)
+        if pos_side == "long" and side == "sell" and self._block_buys:
+            return break_even * (1.0 - self._rung_loss_cap_pct)
+        return None
+
     def _nearest_legal_exit(self, level: "GridLevel") -> float | None:
         """The closest price this level can sit at without booking a loss, or None.
 
@@ -1431,29 +1476,44 @@ class GridEngine:
             return False
         if self._would_realise_a_loss(level.side, level.price):
             be = self._position_break_even()
-            moved = self._nearest_legal_exit(level)
-            if moved is not None and moved != level.price:
-                logger.info(
-                    "MOVED {} {} -> {} | the open {} makes the original price a loss; "
-                    "quoting at break-even instead of leaving the level dead (AUDIT #42)",
-                    level.side.upper(), level.price, moved, be[0] if be else None,
+            ceiling = self._stuck_exit_ceiling(level.side)
+            if ceiling is not None and (
+                (level.side == "buy" and level.price <= ceiling)
+                or (level.side == "sell" and level.price >= ceiling)
+            ):
+                logger.warning(
+                    "STUCK LADDER EXIT | {} @ {} loses against break-even {}, but the "
+                    "other side is cap-blocked so no rung can trade. Taking the small "
+                    "loss inside the {:.2%} cap rather than holding for the hard stop "
+                    "(AUDIT #122)",
+                    level.side.upper(), level.price,
+                    round(be[1], 8) if be else None, self._rung_loss_cap_pct,
                 )
                 self._be_block_logged.discard((level.side, level.price))
-                level.price = moved
             else:
-                # Genuinely nowhere legal to sit. Say so ONCE -- this used to repeat
-                # every poll: ~1,300 identical lines in one session (AUDIT #42).
-                key = (level.side, level.price)
-                if key not in self._be_block_logged:
-                    self._be_block_logged.add(key)
+                moved = self._nearest_legal_exit(level)
+                if moved is not None and moved != level.price:
                     logger.info(
-                        "SKIP {} @ {} | below break-even {} on the open {} and nowhere "
-                        "legal to move it — level idle until the position resolves "
-                        "(AUDIT #32/#42)",
-                        level.side.upper(), level.price,
-                        round(be[1], 8) if be else None, be[0] if be else None,
+                        "MOVED {} {} -> {} | the open {} makes the original price a loss; "
+                        "quoting at break-even instead of leaving the level dead (AUDIT #42)",
+                        level.side.upper(), level.price, moved, be[0] if be else None,
                     )
-                return False
+                    self._be_block_logged.discard((level.side, level.price))
+                    level.price = moved
+                else:
+                    # Genuinely nowhere legal to sit. Say so ONCE -- this used to repeat
+                    # every poll: ~1,300 identical lines in one session (AUDIT #42).
+                    key = (level.side, level.price)
+                    if key not in self._be_block_logged:
+                        self._be_block_logged.add(key)
+                        logger.info(
+                            "SKIP {} @ {} | below break-even {} on the open {} and nowhere "
+                            "legal to move it — level idle until the position resolves "
+                            "(AUDIT #32/#42)",
+                            level.side.upper(), level.price,
+                            round(be[1], 8) if be else None, be[0] if be else None,
+                        )
+                    return False
         self._be_block_logged.discard((level.side, level.price))
         if not self._is_level_profitable(level.price):
             logger.info(

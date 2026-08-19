@@ -1147,6 +1147,7 @@ def run_bot() -> None:
             trailing_sl_trigger_pct=settings.trailing_sl_trigger_pct,
             max_exposure_pct=settings.max_exposure_pct,
             min_profit_multiplier=settings.min_profit_multiplier,
+            rung_loss_cap_pct=settings.rung_loss_cap_pct,
             event_journal=events,
             notifier=notifier,
         )
@@ -1236,6 +1237,7 @@ def run_bot() -> None:
             trailing_sl_trigger_pct=settings.trailing_sl_trigger_pct,
             max_exposure_pct=settings.max_exposure_pct,
             min_profit_multiplier=settings.min_profit_multiplier,
+            rung_loss_cap_pct=settings.rung_loss_cap_pct,
             event_journal=events,
             notifier=notifier,
         )
@@ -1650,6 +1652,7 @@ def run_bot() -> None:
                                 trailing_sl_trigger_pct=settings.trailing_sl_trigger_pct,
                                 max_exposure_pct=settings.max_exposure_pct,
                                 min_profit_multiplier=settings.min_profit_multiplier,
+                                rung_loss_cap_pct=settings.rung_loss_cap_pct,
                                 event_journal=events,
                                 notifier=notifier,
                             )

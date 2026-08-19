@@ -119,6 +119,18 @@ class Settings(BaseSettings):
         ),
     )
 
+    rung_loss_cap_pct: float = Field(
+        default=0.01, ge=0.0, le=0.10,
+        description=(
+            "How far past break-even an exit may price WHILE THE OTHER SIDE OF THE "
+            "LADDER IS CAP-BLOCKED. AUDIT #32 refuses to book any loss, on the grounds "
+            "that the levels will unwind the inventory -- true only while those levels "
+            "can still trade. Once the position eats the position cap the other side is "
+            "blocked, no rung can be placed, and waiting earns nothing. 0.0 restores the "
+            "never-book-a-loss behaviour."
+        ),
+    )
+
     # --- Grid Recentering ---
     recenter_enabled: bool = Field(
         default=True, description="Recenter grid when price moves outside bounds",
@@ -352,7 +364,7 @@ class Settings(BaseSettings):
         description="Minimum time a trend position is held before its stop can fire",
     )
     router_handoff_grace_seconds: int = Field(
-        default=21600, ge=0, le=604800,
+        default=1800, ge=0, le=604800,
         description=(
             "How long the outgoing strategy is given to unwind its own position before "
             "the router force-closes it to complete a switch. Market-dumping a grid's "
