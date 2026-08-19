@@ -184,6 +184,14 @@ def validate_grid_spacing(lower: float, upper: float, count: int, min_spacing_pc
 
 
 class GridEngine:
+    # Class-level so it survives GridEngine.__new__(GridEngine). Several tests build the
+    # engine that way on purpose -- tests/test_startup_ladder_teardown.py reproduces the
+    # exact 05:00:56 startup shape by setting only the fields recenter reads -- and an
+    # __init__-only attribute raises AttributeError there instead of defaulting. It is
+    # transient by design: a warning clock, not state, so it is not persisted and a
+    # restart legitimately starts it at zero.
+    _last_deform_warn_time = 0.0
+
     def __init__(
         self,
         exchange: Exchange,
@@ -2431,7 +2439,37 @@ class GridEngine:
         # seeds it from the exchange before the loop runs at all.
         flat = (self._net_long_qty <= 0 and self._net_short_qty <= 0
                 and abs(self._pos_qty) <= 1e-9)
-        deformed = self.ladder_defects(current_price) if flat else []
+        # Detect in every state; rebuild only when flat.
+        #
+        # This was `ladder_defects(current_price) if flat else []`, which made the check
+        # invisible for as long as any inventory was open -- and a grid holds inventory
+        # most of the time. On 2026-08-18 the ladder carried a 1.41% hole around the
+        # price from 17:57, when the 0.07027 sell filled and left SHORT 1778 open, until
+        # the 20:25 shutdown: 2h28m with no warning, no fills, and the nearest sell nine
+        # ticks above the high price reached.
+        #
+        # The stale grid_spacing hid it from the other direction too. ladder_defects
+        # flags a hole wider than 2x spacing; against the saved 0.00065864 that bar was
+        # 0.001317 and the 0.00099 hole cleared it, so the defect was invisible even on
+        # the flat path. Against the measured 0.00028286 the bar is 0.000566 and it
+        # registers.
+        #
+        # Rebuilding while holding stays forbidden. recenter pauses the grid, and with a
+        # position open the resting orders are its exits; cancelling them is what made
+        # this fire 89 times in one session and left a position unable to unwind. The
+        # non-destructive repair already runs every poll and is untouched by this. What
+        # was missing was any signal at all (AUDIT #116).
+        deformed = self.ladder_defects(current_price)
+        if deformed and not flat:
+            if (now - self._last_deform_warn_time) >= 300.0:
+                self._last_deform_warn_time = now
+                logger.warning(
+                    "DEFORMED LADDER (HOLDING) | {} — not rebuilding with {:g} open, "
+                    "since recentering would cancel the position's exit orders; the "
+                    "per-poll repair keeps working on it",
+                    "; ".join(deformed), self._pos_qty,
+                )
+            deformed = []
 
         if (in_margin_band and not stranded_above and not stranded_below
                 and not dead_inside and not deformed):
