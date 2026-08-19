@@ -38,6 +38,23 @@ def restore_exchange():
     switch_symbol.Exchange = real
 
 
+def other_symbol():
+    """A symbol that is definitely not the configured one.
+
+    main() short-circuits with "Already on that symbol" before it reaches the flat check,
+    so a hardcoded target quietly stops exercising the guard the moment .env moves to it.
+    That happened on 2026-08-19 when SYMBOL became ADAUSDT: these two tests went from
+    asserting rc == 2 to getting rc == 0, and the guard they exist to protect was no
+    longer covered by anything.
+    """
+    from config import settings
+
+    for candidate in ("ADAUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT"):
+        if candidate != settings.symbol:
+            return candidate
+    raise AssertionError("no distinct symbol available to switch to")
+
+
 # --- guard 1: never abandon a position --------------------------------------------------
 
 def test_an_open_position_blocks_the_switch(capsys):
@@ -45,7 +62,7 @@ def test_an_open_position_blocks_the_switch(capsys):
     ex = FakeExchange(positions=[{"contracts": 5350.0}])
     switch_symbol.Exchange = lambda *a, **k: ex
 
-    rc = switch_symbol.main(["ADAUSDT"])
+    rc = switch_symbol.main([other_symbol()])
 
     assert rc == 2
     out = capsys.readouterr().out
@@ -57,7 +74,7 @@ def test_resting_orders_block_it_too():
     ex = FakeExchange(orders=[{"id": "1"}])
     switch_symbol.Exchange = lambda *a, **k: ex
 
-    assert switch_symbol.main(["ADAUSDT"]) == 2
+    assert switch_symbol.main([other_symbol()]) == 2
 
 
 def test_a_short_counts_as_open():
