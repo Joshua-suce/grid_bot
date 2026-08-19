@@ -833,6 +833,66 @@ def ladder_cap_room(one_side_notional: float, cap: float, held_notional: float
     return one_side_notional <= room, room
 
 
+def seed_position_limit(exchange, grid, symbol: str, cfg) -> None:
+    """Teach the grid its position cap BEFORE it places anything. AUDIT #125.
+
+    set_position_limit is what computes _block_buys/_block_sells and the size taper, and
+    its first call lived inside the main loop -- roughly 730 lines after startup
+    placement. So every start laid a full ladder with the cap unknown: neither side
+    blocked, no taper, and whatever inventory was already open ignored entirely.
+
+    ADAUSDT 2026-08-19 10:01, restarting with SHORT 4284 already held:
+
+        10:01:12-23  six buy rungs and three sell rungs placed
+        10:01:24     LADDER FITS THE CAP | one side commits 750.00 of 982.39 (77%)
+        ...          sells keep filling, short walks 4284 -> 5597 -> 6307
+        14:56:27     POSITION LIMIT | short 6307.0 >= 5608.77 -- sell orders blocked
+
+    Real room at 10:01 was 982.39 minus ~749 held = 233 USDT, about 1.9 rungs. The bot
+    placed six, because nothing had told it otherwise yet. That is the shape of the whole
+    day: every session ended holding a position, every restart adopted it and stacked a
+    fresh full ladder on top, and the position ratcheted 0 -> 4284 -> 6307 without ever
+    being able to come back.
+
+    Seeded, that same restart taper the sell side to roughly half size and blocks it near
+    the cap instead of overshooting it, and AUDIT #122's stuck-ladder exit then has a
+    blocked side to react to -- together they let the position converge rather than
+    ratchet.
+
+    Costs one position read and one equity read, the same two the loop makes every
+    iteration. Non-fatal: if either fails the opening ladder is sized exactly as badly as
+    it was before, which is the status quo, not a new risk.
+    """
+    # Probe the book explicitly first. get_position_breakdown swallows a failed read
+    # and returns (0.0, 0.0), which is indistinguishable from genuinely flat -- and
+    # seeding 'flat' hands the ladder the entire cap, the exact assumption this
+    # function exists to remove. Refuse to guess instead.
+    try:
+        exchange.get_positions(symbol)
+    except Exception as e:
+        logger.warning(
+            "POSITION CAP NOT SEEDED | positions unreadable ({}) -- refusing to size "
+            "the opening ladder as if flat", e,
+        )
+        return
+    try:
+        long_pos, short_pos = get_position_breakdown(exchange, symbol)
+        price = exchange.get_price(symbol)
+        equity = exchange.get_total_equity()
+        max_pos_qty = equity * cfg.max_position_pct / price if price > 0 else 0.0
+        grid.set_position_limit(long_pos, short_pos, max_pos_qty)
+        if long_pos or short_pos:
+            logger.info(
+                "POSITION CAP SEEDED | long={:.0f} short={:.0f} against a cap of {:.0f} "
+                "-- the opening ladder is sized against what is already held",
+                long_pos, short_pos, max_pos_qty,
+            )
+    except Exception as e:
+        logger.warning(
+            "POSITION CAP NOT SEEDED | {} -- the opening ladder will be sized without it", e,
+        )
+
+
 def run_bot() -> None:
     setup_logging(settings.log_dir, "INFO")
     mode = "DEMO (testnet)" if settings.demo_mode else "LIVE"
@@ -1163,6 +1223,8 @@ def run_bot() -> None:
             for p in exchange.get_positions(settings.symbol)
         )
 
+        seed_position_limit(exchange, grid, settings.symbol, settings)
+
         if has_exchange_positions:
             grid.reconcile_state()
             grid.reconcile_positions()
@@ -1259,6 +1321,8 @@ def run_bot() -> None:
     # A warning, not an abort. The cap and the size taper keep this SAFE, only degraded,
     # and equity moves -- a restart after a drawdown should not refuse to start
     # (AUDIT #66).
+    seed_position_limit(exchange, grid, settings.symbol, settings)
+
     try:
         _one_side = grid.one_side_notional(balance)
         _cap = balance * settings.max_position_pct
