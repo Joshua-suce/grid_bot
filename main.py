@@ -805,6 +805,34 @@ def verify_account_config(exchange: Exchange, cfg, balance: float) -> list[str]:
     return problems
 
 
+def ladder_cap_room(one_side_notional: float, cap: float, held_notional: float
+                    ) -> tuple[bool, float]:
+    """Does one side of the ladder fit in the part of the cap that is still free?
+
+    A position already open eats the SAME cap the ladder is measured against, so the
+    ladder's real headroom is the cap MINUS what is already held. #66 compared the
+    ladder against the whole cap, which is right only from flat.
+
+    2026-08-19 10:01:24, restarting with SHORT 4284 ADA already open:
+
+        LADDER FITS THE CAP | one side commits 750.00 of 982.39 (77%), 1.9 rung(s) spare
+
+    The held short was ~749 USDT at 0.1749. 750 + 749 = 1499 against a 982 cap -- 53%
+    OVER before a single order was placed, reported as fitting with room to spare. The
+    sell side then filled its way to 6307 ADA, set_position_limit hard-blocked it, every
+    buy sat below break-even and was skipped, and the grid stood with an empty book for
+    three hours while price ran 3.6% away from it (AUDIT #120).
+
+    Returns (fits, room). A non-positive cap is not a verdict -- max_position_pct of 0
+    means unconfigured, not 'nothing fits' -- so it reports fitting and leaves the
+    decision to the cap enforcement itself.
+    """
+    room = cap - held_notional
+    if cap <= 0:
+        return True, room
+    return one_side_notional <= room, room
+
+
 def run_bot() -> None:
     setup_logging(settings.log_dir, "INFO")
     mode = "DEMO (testnet)" if settings.demo_mode else "LIVE"
@@ -1232,22 +1260,40 @@ def run_bot() -> None:
     try:
         _one_side = grid.one_side_notional(balance)
         _cap = balance * settings.max_position_pct
-        if _one_side > _cap > 0:
+        # A position already open eats the SAME cap the ladder is measured against, so
+        # the ladder's real headroom is the cap minus what is already held. Without that
+        # term this compares the ladder against the whole cap and passes a book that is
+        # already over it.
+        #
+        # 2026-08-19 10:01:24, restarting with SHORT 4284 ADA carried over:
+        #
+        #   LADDER FITS THE CAP | one side commits 750.00 of 982.39 (77%), 1.9 rung(s) spare
+        #
+        # The held short was ~749 USDT at 0.1749. 750 + 749 = 1499 against a 982 cap --
+        # 53% OVER before a single order was placed, reported as fitting with room to
+        # spare. The sell side then filled its way to 6307 ADA, set_position_limit hard-
+        # blocked it, every buy sat below break-even and was skipped, and the grid stood
+        # with an empty book for three hours while price ran 3.6% away (AUDIT #120).
+        _held = abs(getattr(grid, '_pos_qty', 0.0) or 0.0) * (current_price or 0.0)
+        _fits, _room = ladder_cap_room(_one_side, _cap, _held)
+        if not _fits:
             _per_order = _one_side / max(1, settings.grid_count / 2)
             logger.warning(
                 "LADDER OUTGROWS THE CAP | {:.0f} rungs a side at {:.2f} USDT commits "
-                "{:.2f}, over the {:.0%} position cap of {:.2f}. The outer {:.1f} rung(s) "
-                "can never fill and the book will go one-sided. Lower GRID_COUNT, lower "
-                "CAPITAL_PER_GRID_USDT or LEVERAGE, or raise MAX_POSITION_PCT",
-                settings.grid_count / 2, _per_order, _one_side,
-                settings.max_position_pct, _cap, (_one_side - _cap) / _per_order,
+                "{:.2f}, and {:.2f} is already held, against the {:.0%} position cap of "
+                "{:.2f} -- {:.2f} of room. The outer {:.1f} rung(s) can never fill and the "
+                "book will go one-sided. Lower GRID_COUNT, lower CAPITAL_PER_GRID_USDT or "
+                "LEVERAGE, or raise MAX_POSITION_PCT",
+                settings.grid_count / 2, _per_order, _one_side, _held,
+                settings.max_position_pct, _cap, _room,
+                (_one_side - _room) / _per_order,
             )
         else:
             logger.info(
-                "LADDER FITS THE CAP | one side commits {:.2f} of {:.2f} ({:.0%}), "
-                "{:.1f} rung(s) spare",
-                _one_side, _cap, _one_side / _cap if _cap else 0,
-                (_cap - _one_side) / max(1e-9, _one_side / max(1, settings.grid_count / 2)),
+                "LADDER FITS THE CAP | one side commits {:.2f} of {:.2f} room ({:.2f} cap "
+                "less {:.2f} held), {:.1f} rung(s) spare",
+                _one_side, _room, _cap, _held,
+                (_room - _one_side) / max(1e-9, _one_side / max(1, settings.grid_count / 2)),
             )
     except Exception as e:
         logger.debug("Ladder/cap coherence check skipped: {}", e)
