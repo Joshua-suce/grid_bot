@@ -1017,6 +1017,7 @@ def run_bot() -> None:
         confirmation_seconds=settings.trend_confirmation_seconds,
         flat_range_window=settings.flat_range_window,
         flat_range_pct=settings.flat_range_pct,
+        trend_min_votes=settings.regime_trend_min_votes,
     )
 
     # Deliberately given no exchange handle -- it reports on regime changes and cannot

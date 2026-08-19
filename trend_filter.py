@@ -80,6 +80,7 @@ class TrendFilter:
         confirmation_seconds: int = 600,
         flat_range_window: int = 6,
         flat_range_pct: float = 0.01,
+        trend_min_votes: int = 2,
     ):
         self.ema_fast = ema_fast
         self.ema_slow = ema_slow
@@ -90,6 +91,7 @@ class TrendFilter:
         self.confirmation_seconds = confirmation_seconds
         self.flat_range_window = flat_range_window
         self.flat_range_pct = flat_range_pct
+        self.trend_min_votes = max(1, int(trend_min_votes))
 
         self.regime = MarketRegime.UNCERTAIN
         self.last_check = 0.0
@@ -262,8 +264,17 @@ class TrendFilter:
         line = (
             f"{' '.join(parts)} | bands: range<={self.range_threshold:g} "
             f"trend>={self.trend_threshold:g} | {informative} of {len(self._timeframes)} "
-            f"timeframe(s) voting"
+            f"timeframe(s) voting, trend needs {self.trend_min_votes}"
         )
+        trending = sum(
+            1 for r in self._timeframes.values()
+            if r in (MarketRegime.UPTREND, MarketRegime.DOWNTREND)
+        )
+        if trending and trending < self.trend_min_votes:
+            line += (
+                f" — {trending} trending timeframe(s), {self.trend_min_votes} needed, so "
+                f"the follower stays ineligible"
+            )
         if not informative:
             line += " — ALL ABSTAINED (every ADX inside the dead band)"
         if self._flat_override_active:
@@ -300,10 +311,25 @@ class TrendFilter:
         trending = [r for r in informative if r in (MarketRegime.UPTREND, MarketRegime.DOWNTREND)]
         ranging_count = informative.count(MarketRegime.RANGING)
 
-        # TRENDING still needs two agreeing timeframes. That threshold is deliberate --
-        # a trend verdict PAUSES the grid, and one timeframe's opinion is not enough to
-        # stop trading on. Loosening it here would have silently reversed that choice.
-        if len(trending) >= 2:
+        # TRENDING needs `trend_min_votes` agreeing timeframes, default 2. That default
+        # is deliberate -- a trend verdict PAUSES the grid, and one timeframe's opinion
+        # is not much to stop trading on -- but it was a hardcoded 2, which made the
+        # trade-off invisible and unadjustable.
+        #
+        # On DOGEUSDT the 1h ADX sits in the dead band for hours at a time, so the only
+        # timeframe with an opinion is often a single one. Measured 2026-08-19 00:19-03:00:
+        # every REGIME line read `1h=ranging(17.x) 30m=downtrend(25-26) 1d=uncertain(20.3)`.
+        # 30m was trending and alone, len(trending) was 1, and the follower was never once
+        # eligible across 2h41m -- the AUDIT #33 "dormant bot" shape, reached by the vote
+        # rather than by the dead band.
+        #
+        # Setting this to 1 lets a lone trending timeframe hand over. That is a real
+        # trade-off, not a free win: it also pauses the grid on one timeframe's say-so,
+        # and the follower's measured edge over 70 trades was -0.14% per trade with a 95%
+        # interval of [-0.50%, +0.21%] -- consistent with zero. More trades at that
+        # expectancy is more churn, not more profit. Configurable so the choice is the
+        # operator's and is visible in the log, rather than buried here (AUDIT #117).
+        if len(trending) >= self.trend_min_votes:
             directions = set(trending)
             return directions.pop() if len(directions) == 1 else MarketRegime.UNCERTAIN
 

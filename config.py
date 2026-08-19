@@ -244,6 +244,18 @@ class Settings(BaseSettings):
     adx_period: int = Field(default=14, ge=5, le=50)
     adx_trend_threshold: float = Field(default=30.0, ge=15, le=40)
     adx_range_threshold: float = Field(default=20.0, ge=5, le=30)
+    regime_trend_min_votes: int = Field(
+        default=2, ge=1, le=3,
+        description=(
+            "How many timeframes must agree on a trend before the router hands the "
+            "symbol to the trend follower. 2 (default) is conservative: a trend verdict "
+            "PAUSES the grid, so one timeframe's opinion does not stop grid trading. "
+            "Set to 1 to let a single trending timeframe hand over -- on DOGEUSDT the 1h "
+            "ADX often sits in the dead band while the 30m trends alone, which leaves the "
+            "follower permanently ineligible. Raising frequency this way is a trade-off: "
+            "the follower's measured edge was -0.14%/trade over 70 trades."
+        ),
+    )
     trend_check_interval: int = Field(
         default=300, ge=60, le=3600,
         description="Seconds between trend filter checks",
