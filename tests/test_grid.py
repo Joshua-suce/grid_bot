@@ -223,7 +223,7 @@ def test_handle_fill_fills_buy_level_replaces_at_next_sell_level():
             def price_to_precision(symbol, price):
                 return f"{price:.2f}"
 
-        def place_limit_order(self, symbol, side, price, amount, params=None):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
 
     exchange = FakeExchange()
@@ -656,7 +656,7 @@ def test_place_order_skips_sell_when_short_blocked():
         def can_place_order(self, symbol):
             return True
 
-        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
 
     ex = FakeExchange()
@@ -697,7 +697,7 @@ def test_place_order_scales_sell_quantity_by_sell_scale():
         def can_place_order(self, symbol):
             return True
 
-        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             self.placed.append((side, price, amount))
             return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
 
@@ -747,7 +747,7 @@ def test_place_order_skips_when_scaled_below_min_notional():
         def can_place_order(self, symbol):
             return True
 
-        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             self.placed.append((side, price, amount))
             return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
 
@@ -813,7 +813,7 @@ def test_handle_fill_occupied_replacement_keeps_levels_and_order_ids():
             def price_to_precision(symbol, price):
                 return f"{price:.6f}"
 
-        def place_limit_order(self, symbol, side, price, amount, params=None):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             return {"id": f"ORDER-{side.upper()}-{price:.6f}"}
 
     ex = FakeExchange()
@@ -891,7 +891,7 @@ def test_handle_fill_short_cycle_counts_pnl():
             def price_to_precision(symbol, price):
                 return f"{price:.2f}"
 
-        def place_limit_order(self, symbol, side, price, amount, params=None):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
 
     grid = GridEngine(
@@ -937,7 +937,7 @@ def test_handle_fill_long_cycle_still_counts_pnl():
             def price_to_precision(symbol, price):
                 return f"{price:.2f}"
 
-        def place_limit_order(self, symbol, side, price, amount, params=None):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
 
     grid = GridEngine(
@@ -993,7 +993,7 @@ def test_check_fills_processes_vanished_sell_as_fill_with_short_position():
         def can_place_order(self, symbol):
             return True
 
-        def place_limit_order(self, symbol, side, price, amount, params=None):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
 
     grid = GridEngine(
@@ -1043,7 +1043,7 @@ def test_check_fills_vanished_sell_with_negative_contract_short():
         def can_place_order(self, symbol):
             return True
 
-        def place_limit_order(self, symbol, side, price, amount, params=None):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
 
     grid = GridEngine(
@@ -1092,7 +1092,7 @@ def test_check_fills_marks_vanished_sell_dead_when_only_long_position():
         def can_place_order(self, symbol):
             return True
 
-        def place_limit_order(self, symbol, side, price, amount, params=None):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
 
     grid = GridEngine(
@@ -1111,7 +1111,13 @@ def test_check_fills_marks_vanished_sell_dead_when_only_long_position():
 
     fills = grid.check_fills(balance=1000.0)
     assert fills == []
-    assert grid.levels[0].order_id is None
+    # NOT `order_id is None`. The level IS marked dead -- and the ladder then
+    # replaces it, which is correct. That replacement used to raise TypeError,
+    # because this fake's place_limit_order was narrower than the real one, so
+    # order_id stayed None and the assertion passed for a reason it never named.
+    # The claim in the docstring is that the vanished order is not retained and
+    # not counted as a fill; that is what is asserted now (AUDIT #124).
+    assert grid.levels[0].order_id != "SELL-105"
     assert grid.levels[0].status == "pending"
 
 
@@ -1137,7 +1143,7 @@ def test_check_fills_retries_unfilled_levels():
         def can_place_order(self, symbol):
             return True
 
-        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             self.placed.append((side, price, amount))
             return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
 
@@ -1186,7 +1192,7 @@ def test_place_order_adopts_existing_open_order_instead_of_duplicating():
         def can_place_order(self, symbol):
             return True
 
-        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             self.placed.append((side, price, amount))
             return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
 
@@ -1232,7 +1238,7 @@ def test_place_order_skips_adoption_when_order_already_tracked():
         def can_place_order(self, symbol):
             return True
 
-        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             self.placed.append((side, price, amount))
             return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
 
@@ -1272,7 +1278,7 @@ def test_recenter_aborts_on_dirty_book():
                     return f"{price:.2f}"
             self.exchange = _ex()
 
-        def cancel_everything(self, symbol, timeout_seconds=300.0):
+        def cancel_everything(self, symbol, timeout_seconds=300.0, keep_stops=False):
             return 1
 
         def get_open_order_ids(self, symbol):
@@ -1321,7 +1327,7 @@ def test_recenter_unwinds_position_through_reduceonly_sells():
             self.closed = None
             self._order_id = 0
 
-        def cancel_everything(self, symbol, timeout_seconds=300.0):
+        def cancel_everything(self, symbol, timeout_seconds=300.0, keep_stops=False):
             return 0
 
         def get_open_order_ids(self, symbol):
@@ -1336,7 +1342,7 @@ def test_recenter_unwinds_position_through_reduceonly_sells():
         def can_place_order(self, symbol):
             return True
 
-        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             self._order_id += 1
             if params and params.get("reduceOnly"):
                 self.sell_params.append({"side": side, "price": price, "amount": amount, "params": params})
@@ -1394,7 +1400,7 @@ def test_recenter_forced_when_grid_goes_one_sided_above():
         def __init__(self):
             self._order_id = 0
 
-        def cancel_everything(self, symbol, timeout_seconds=300.0):
+        def cancel_everything(self, symbol, timeout_seconds=300.0, keep_stops=False):
             return 0
 
         def get_open_order_ids(self, symbol):
@@ -1409,7 +1415,7 @@ def test_recenter_forced_when_grid_goes_one_sided_above():
         def can_place_order(self, symbol):
             return True
 
-        def place_limit_order(self, symbol, side, price, amount, params=None):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             self._order_id += 1
             return {"id": f"ORDER-{self._order_id}"}
 
@@ -1456,7 +1462,7 @@ def test_recenter_forced_when_grid_goes_one_sided_below():
         def __init__(self):
             self._order_id = 0
 
-        def cancel_everything(self, symbol, timeout_seconds=300.0):
+        def cancel_everything(self, symbol, timeout_seconds=300.0, keep_stops=False):
             return 0
 
         def get_open_order_ids(self, symbol):
@@ -1471,7 +1477,7 @@ def test_recenter_forced_when_grid_goes_one_sided_below():
         def can_place_order(self, symbol):
             return True
 
-        def place_limit_order(self, symbol, side, price, amount, params=None):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             self._order_id += 1
             return {"id": f"ORDER-{self._order_id}"}
 
@@ -1513,7 +1519,7 @@ def test_recenter_still_waits_for_margin_when_grid_has_both_sides():
             def price_to_precision(symbol, price):
                 return f"{price:.6f}"
 
-        def cancel_everything(self, symbol, timeout_seconds=300.0):
+        def cancel_everything(self, symbol, timeout_seconds=300.0, keep_stops=False):
             return 0
 
         def get_open_order_ids(self, symbol):
@@ -1528,7 +1534,7 @@ def test_recenter_still_waits_for_margin_when_grid_has_both_sides():
         def can_place_order(self, symbol):
             return True
 
-        def place_limit_order(self, symbol, side, price, amount, params=None):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             return {"id": "ORDER-1"}
 
     ex = FakeExchange()
@@ -1569,7 +1575,7 @@ def test_recenter_forced_when_grid_dead_inside_band_below_sells():
         def __init__(self):
             self._order_id = 0
 
-        def cancel_everything(self, symbol, timeout_seconds=300.0):
+        def cancel_everything(self, symbol, timeout_seconds=300.0, keep_stops=False):
             return 0
 
         def get_open_order_ids(self, symbol):
@@ -1584,7 +1590,7 @@ def test_recenter_forced_when_grid_dead_inside_band_below_sells():
         def can_place_order(self, symbol):
             return True
 
-        def place_limit_order(self, symbol, side, price, amount, params=None):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             self._order_id += 1
             return {"id": f"ORDER-{self._order_id}"}
 
@@ -1631,7 +1637,7 @@ def test_recenter_forced_when_grid_dead_inside_band_above_buys():
         def __init__(self):
             self._order_id = 0
 
-        def cancel_everything(self, symbol, timeout_seconds=300.0):
+        def cancel_everything(self, symbol, timeout_seconds=300.0, keep_stops=False):
             return 0
 
         def get_open_order_ids(self, symbol):
@@ -1646,7 +1652,7 @@ def test_recenter_forced_when_grid_dead_inside_band_above_buys():
         def can_place_order(self, symbol):
             return True
 
-        def place_limit_order(self, symbol, side, price, amount, params=None):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             self._order_id += 1
             return {"id": f"ORDER-{self._order_id}"}
 
@@ -1691,7 +1697,7 @@ def test_recenter_does_not_fire_when_sells_are_below_price_inside_band():
             def price_to_precision(symbol, price):
                 return f"{price:.6f}"
 
-        def cancel_everything(self, symbol, timeout_seconds=300.0):
+        def cancel_everything(self, symbol, timeout_seconds=300.0, keep_stops=False):
             return 0
 
         def get_open_order_ids(self, symbol):
@@ -1706,7 +1712,7 @@ def test_recenter_does_not_fire_when_sells_are_below_price_inside_band():
         def can_place_order(self, symbol):
             return True
 
-        def place_limit_order(self, symbol, side, price, amount, params=None):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             return {"id": "ORDER-1"}
 
     ex = FakeExchange()
@@ -1751,7 +1757,7 @@ def test_reduceonly_sell_params_and_market_close():
                     return f"{price:.2f}"
             self.exchange = _ex()
 
-        def place_limit_order(self, symbol, side, price, amount, params=None):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             self.last_place_params = params
             return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
 
@@ -1819,7 +1825,7 @@ def test_burst_of_fills_distributes_replacements_across_slots():
             def price_to_precision(symbol, price):
                 return f"{price:.6f}"
 
-        def place_limit_order(self, symbol, side, price, amount, params=None):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             return {"id": f"ORDER-{side.upper()}-{price:.6f}"}
 
     ex = FakeExchange()
@@ -2021,7 +2027,7 @@ def test_replacement_cooldown_is_per_level_not_global():
         def can_place_order(self, symbol):
             return True
 
-        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             self.placed.append((side, price, amount))
             return {"id": "REPL-A"}
 
@@ -2075,7 +2081,7 @@ def test_replacement_cooldown_still_blocks_the_same_level():
         def can_place_order(self, symbol):
             return True
 
-        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1):
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
             self.placed.append((side, price, amount))
             return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
 

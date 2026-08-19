@@ -38,7 +38,7 @@ class _Ex:
     def get_open_order_ids(self, s): return {"A", "B"}
     def can_place_order(self, s): return True
     def place_limit_order(self, *a, **k): return {"id": "x"}
-    def cancel_everything(self, s, timeout_seconds=30): return 0
+    def cancel_everything(self, s, timeout_seconds=30, keep_stops=False): return 0
     def cancel_order(self, oid, symbol):
         self.cancel_calls.append(oid)
         return self.cancel_result

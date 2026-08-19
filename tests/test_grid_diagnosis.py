@@ -55,13 +55,13 @@ class FakeExchange:
         self.cancelled.append(order_id)
         return True
 
-    def cancel_everything(self, symbol, timeout_seconds=300.0):
+    def cancel_everything(self, symbol, timeout_seconds=300.0, keep_stops=False):
         return 0
 
     def get_orderbook_depth(self, symbol, limit=10):
         return {"bid_vol": 0, "ask_vol": 0, "imbalance": 0, "spread_pct": 0}
 
-    def place_limit_order(self, symbol, side, price, amount, max_attempts=3, params=None, post_only=True):
+    def place_limit_order(self, symbol, side, price, amount, max_attempts=3, params=None, post_only=True, allow_taker_fallback=False):
         params = params or {}
         if params.get("reduceOnly") and self._reject_over is not None:
             if self._reduce_only_total + amount > self._reject_over + 1e-9:

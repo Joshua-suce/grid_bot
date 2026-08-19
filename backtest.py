@@ -250,7 +250,10 @@ class SimulatedExchange:
             o.status = "canceled"
         return True
 
-    def cancel_everything(self, symbol: str, timeout_seconds: float = 300.0) -> int:
+    def cancel_everything(self, symbol: str, timeout_seconds: float = 300.0,
+                          keep_stops: bool = False) -> int:
+        # Accepted to match Exchange, ignored deliberately: SimOrder models limit orders
+        # with reduceOnly and has no stop/conditional book, so there is nothing to keep.
         n = 0
         for o in self._orders.values():
             if o.status == "open":

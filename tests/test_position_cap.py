@@ -41,7 +41,7 @@ class _Ex:
     def get_open_order_ids(self, s): return set()
     def fetch_order(self, i, s): return None
     def cancel_order(self, i, s): return True
-    def cancel_everything(self, s, timeout_seconds=300.0): return 0
+    def cancel_everything(self, s, timeout_seconds=300.0, keep_stops=False): return 0
     def can_place_order(self, s): return True
     def close_position(self, symbol, side, amount, max_attempts=None): return {"id": "c"}
     def place_limit_order(self, symbol, side, price, amount, max_attempts=3, params=None,

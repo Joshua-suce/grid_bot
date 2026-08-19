@@ -57,7 +57,7 @@ class FakeExchange:
     def get_price(self, symbol):
         return 0.07020
 
-    def place_limit_order(self, symbol, side, price, qty, params=None):
+    def place_limit_order(self, symbol, side, price, qty, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
         self.placed.append({"side": side, "price": price, "qty": qty,
                             "params": dict(params or {})})
         return {"id": f"o{len(self.placed)}"}

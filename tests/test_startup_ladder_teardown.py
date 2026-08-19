@@ -54,7 +54,7 @@ class FakeExchange:
         self.cancelled.append(order_id)
         return True
 
-    def place_limit_order(self, symbol, side, price, qty, params=None):
+    def place_limit_order(self, symbol, side, price, qty, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
         self.placed.append({"side": side, "price": price, "qty": qty})
         return {"id": f"o{len(self.placed)}"}
 

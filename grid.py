@@ -2457,7 +2457,34 @@ class GridEngine:
     def pause(self) -> None:
         if not self.active:
             return
-        cancelled = self.exchange.cancel_everything(self.symbol, timeout_seconds=30)
+        # Pausing does NOT flatten -- see Strategy.pause -- so any position survives it.
+        # Cancelling the stop book here leaves that position naked for as long as it takes
+        # _refresh_sl_stops to notice, and that runs on a 120s verification timer.
+        #
+        # ADAUSDT 2026-08-19, holding SHORT 6307:
+        #
+        #   14:56:28  STOP-MARKET PLACED | BUY 6307.0 ADAUSDT @ stop=0.17753
+        #   15:05:39  ONE-SIDED GRID | ... forcing recenter inside margin band
+        #   15:05:42  CANCEL EVERYTHING | 8 total orders confirmed cancelled
+        #   15:06:28  KILL SWITCH: price 0.1776 above stop loss 0.1775302773632203
+        #
+        # recenter() calls pause(). Seven limit orders were open; the eighth was the
+        # stop. It was gone 46 seconds before price crossed it, and the short rode from
+        # 0.1767 to 0.1806 with nothing on the exchange to close it.
+        #
+        # emergency_stop has guarded exactly this since the shutdown fix. pause never
+        # did. The gap was raised earlier the same day and dismissed on the grounds that
+        # _refresh_sl_stops rebuilds the stops -- true, and not within 46 seconds
+        # (AUDIT #123).
+        holding = self._has_open_position()
+        cancelled = self.exchange.cancel_everything(
+            self.symbol, timeout_seconds=30, keep_stops=holding,
+        )
+        if holding:
+            logger.warning(
+                "STOPS LEFT ARMED | pausing with a position open, so its stop-loss legs "
+                "stay on the exchange rather than going down with the ladder",
+            )
         still_open = self.exchange.get_open_order_ids(self.symbol)
         for level in self.levels:
             if level.order_id is not None:

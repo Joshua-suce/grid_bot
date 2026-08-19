@@ -55,7 +55,7 @@ class RecordingExchange:
     def get_orderbook_depth(self, symbol, limit=10):
         return {"bid_vol": 0, "ask_vol": 0, "imbalance": 0, "spread_pct": 0}
 
-    def place_limit_order(self, symbol, side, price, amount, max_attempts=3, params=None, post_only=True):
+    def place_limit_order(self, symbol, side, price, amount, max_attempts=3, params=None, post_only=True, allow_taker_fallback=False):
         if self._cross_side is not None and side == self._cross_side:
             raise PostOnlyWouldCross(f"{side} @ {price} would cross the spread")
         self._next_id += 1

@@ -51,7 +51,7 @@ class FakeExchange:
             self._orders[order_id]["status"] = "canceled"
         return True
 
-    def cancel_everything(self, symbol, timeout_seconds=300.0):
+    def cancel_everything(self, symbol, timeout_seconds=300.0, keep_stops=False):
         return 0
 
     def close_position(self, symbol, side, amount, max_attempts=None):

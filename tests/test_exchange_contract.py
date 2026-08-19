@@ -108,6 +108,87 @@ def test_fake_close_position_accepts_the_real_call(case):
     )
 
 
+def _fake_surface_methods():
+    """Every (file, class, method) in tests/ and backtest.py implementing SHARED_SURFACE.
+
+    The scan above anchors on close_position and only ever signature-checked THAT method,
+    so drift in any other method of the surface was invisible.
+    """
+    found = []
+    paths = sorted(REPO.glob("tests/*.py")) + [REPO / "backtest.py"]
+    for path in paths:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name in SHARED_SURFACE:
+                    found.append((path.name, node.name, item.name, item))
+    return found
+
+
+SURFACE_FAKES = _fake_surface_methods()
+PRODUCTION = ["grid.py", "main.py", "trend_follower.py", "router.py"]
+
+
+def _keywords_production_passes():
+    """method -> set of keyword names production actually uses on the exchange wrapper.
+
+    This, not the real signature, is the contract a stand-in has to meet. Comparing
+    against every parameter Exchange declares flags harmless positional-name differences
+    -- `def cancel_everything(self, s, ...)` binds `cancel_everything(symbol, ...)` fine
+    -- and 94 of those drown the real ones.
+
+    What genuinely breaks a fake is a keyword it does not declare.
+
+    Exchange.cancel_everything grew `keep_stops` when the shutdown fix landed. Fourteen
+    stand-ins never grew it. It stayed hidden until production passed the argument on a
+    SECOND code path -- GridEngine.pause, 2026-08-19 -- and then surfaced as nine
+    TypeErrors in unrelated recenter and backtest tests rather than as a contract
+    failure. Two fakes had already been updated by then, which is the tell: the interface
+    moved and the doubles were repaired one at a time, wherever something broke first
+    (AUDIT #124).
+    """
+    wanted = {}
+    for name in PRODUCTION:
+        for method, _n_pos, kwargs, _line in _calls_on_exchange_attr(REPO / name):
+            if method in SHARED_SURFACE:
+                wanted.setdefault(method, set()).update(kwargs)
+    return wanted
+
+
+def test_the_surface_scan_reaches_past_close_position():
+    """A guard on the guard. If this only ever finds close_position then the test below
+    is the old one wearing a new name."""
+    methods = {m for _, _, m, _ in SURFACE_FAKES}
+    assert len(methods) >= 4, f"scan found only {methods}"
+    assert "cancel_everything" in methods, "the method that actually drifted is not covered"
+
+
+def test_production_really_does_pass_keep_stops():
+    """Guards the premise. If pause and emergency_stop stop passing it, the case below
+    passes vacuously and the next drift goes unnoticed again."""
+    assert "keep_stops" in _keywords_production_passes().get("cancel_everything", set())
+
+
+@pytest.mark.parametrize(
+    "case", SURFACE_FAKES, ids=[f"{f}::{c}.{m}" for f, c, m, _ in SURFACE_FAKES]
+)
+def test_every_fake_accepts_the_keywords_production_passes(case):
+    filename, classname, method, node = case
+    names, has_varargs, has_kwargs = _params(node)
+    if has_kwargs:
+        return
+    needed = _keywords_production_passes().get(method, set())
+    missing = sorted(k for k in needed if k not in names)
+    assert missing == [], (
+        f"{filename}::{classname}.{method}{tuple(names)} cannot accept {missing}, which "
+        f"production passes by keyword. A stand-in that omits a keyword raises TypeError "
+        f"the moment a new code path uses it, and this test is the only place that "
+        f"catches it first (AUDIT #124)."
+    )
+
+
 def _calls_on_exchange_attr(path: pathlib.Path):
     """Every call on the Exchange wrapper in a module, with its arity.
 
