@@ -240,14 +240,29 @@ class StrategyRouter:
         when the position is confirmed flat, so there is never a moment with two
         writers on one net position.
         """
+        if self._handoff_target == target:
+            # Already waiting for this one. Restarting the clock here would push the
+            # deadline out every iteration and the grace period would never expire.
+            #
+            # The 'starting' line used to sit ABOVE this guard, so it printed on every
+            # call. ADAUSDT 2026-08-19 16:51-19:40: 41 identical 'handoff starting'
+            # lines in under three hours. That reads as a handoff restarting or failing
+            # over and over; it was ONE handoff, waiting, exactly as designed. The
+            # question a reader actually has -- is this progressing, and when does it
+            # give up -- was answerable from the code and from nothing in the log
+            # (AUDIT #121).
+            waited = time.time() - self._handoff_started
+            logger.info(
+                "ROUTER | handoff {} -> {} still waiting for flat | {:.0f}s elapsed, "
+                "{:.0f}s until the position is force-closed",
+                self.active_name, target, waited,
+                max(0.0, self.handoff_grace_seconds - waited),
+            )
+            return
         logger.info(
             "ROUTER | handoff {} -> {} starting (waiting for flat, grace {}s)",
             self.active_name, target, self.handoff_grace_seconds,
         )
-        if self._handoff_target == target:
-            # Already waiting for this one. Restarting the clock here would push the
-            # deadline out every iteration and the grace period would never expire.
-            return
         self._handoff_target = target
         self._handoff_started = time.time()
 
