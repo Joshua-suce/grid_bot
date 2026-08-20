@@ -119,6 +119,25 @@ class Settings(BaseSettings):
         ),
     )
 
+    empty_book_alert_seconds: float = Field(
+        default=900.0, ge=0.0,
+        description=(
+            "Alert after this long holding a position with no working ladder orders. "
+            "The 2026-08-19 deadlock ran 3h13m with an open 6,307 ADA short and an "
+            "empty book while the loop polled 4,770 times without raising once. "
+            "0 disables the alert."
+        ),
+    )
+    empty_book_restart_seconds: float = Field(
+        default=2700.0, ge=0.0,
+        description=(
+            "Exit non-zero after this long dormant, so supervise.py restarts the bot. "
+            "A restart re-lays the ladder with the position cap seeded, which is what "
+            "actually broke the deadlock on 2026-08-19 at 16:29:58. Must exceed "
+            "EMPTY_BOOK_ALERT_SECONDS so the alert always lands first. 0 disables the "
+            "restart and leaves detection alerting only."
+        ),
+    )
     rung_loss_cap_pct: float = Field(
         default=0.01, ge=0.0, le=0.10,
         description=(

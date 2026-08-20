@@ -841,6 +841,42 @@ def abort_startup(transient: bool) -> NoReturn:
     got it (AUDIT #126).
     """
     raise SystemExit(1 if transient else 0)
+def dormancy_clock(has_position: bool, working_orders: int, strategy_active: bool,
+                   dormant_since: float | None, now: float) -> tuple[float | None, float]:
+    """How long has the bot held exposure with nothing working to resolve it?
+
+    2026-08-19, 16:31:42 -> 19:44:58: a 6,307 ADA short, an empty order book, and a
+    loop that polled 4,770 times without raising once. Every recovery path in this
+    program hangs off an exception, and a bot calmly doing nothing throws none. The
+    only liveness test that existed -- supervise.log_is_stale -- watches log mtime,
+    and the deadlock wrote a PRICE= line every ten seconds, so it stayed satisfied
+    the whole time. Unrealised went -7.36 -> -36 across those three hours.
+
+    A deliberately paused strategy (recovery cooldown, post-kill-switch) is NOT
+    dormant: having no orders is the entire point. Hence strategy_active.
+
+    Returns (dormant_since, seconds_dormant); (None, 0.0) whenever healthy.
+    (AUDIT #127)
+    """
+    if not (has_position and strategy_active) or working_orders > 0:
+        return None, 0.0
+    started = now if dormant_since is None else dormant_since
+    return started, max(0.0, now - started)
+
+
+def dormancy_action(seconds_dormant: float, seconds_since_alert: float,
+                    alert_after: float, restart_after: float) -> str:
+    """"none" | "alert" | "restart". Either threshold at 0 disables that rung.
+
+    Re-alerts on the same interval rather than once. POSITION UNDER-PROTECTED fired
+    exactly once on 2026-08-19 (16:30:26) and never again, which is how a correct
+    detection still went unheard for three hours.
+    """
+    if restart_after > 0 and seconds_dormant >= restart_after:
+        return "restart"
+    if alert_after > 0 and seconds_dormant >= alert_after and seconds_since_alert >= alert_after:
+        return "alert"
+    return "none"
 def ladder_cap_room(one_side_notional: float, cap: float, held_notional: float
                     ) -> tuple[bool, float]:
     """Does one side of the ladder fit in the part of the cap that is still free?
@@ -1658,6 +1694,8 @@ def run_bot() -> None:
 
     loop_count = 0
     consecutive_errors = 0
+    dormant_since: float | None = None
+    dormant_alerted_at = 0.0
     seen_bug_errors: set[str] = set()
     last_analytics_fill_count = 0
     try:
@@ -1913,6 +1951,55 @@ def run_bot() -> None:
                         # It cancelled something, so that snapshot is now a lie about the
                         # book -- and check_fills infers fills from ABSENCE from this list.
                         open_orders = exchange.get_open_orders(settings.symbol)
+                    # Count only orders the ladder is actually working. fetch_open_orders
+                    # returns the conditional book too, so a lone stop-loss leg would read as a
+                    # healthy book and mask the exact condition this watches for.
+                    _tracked = grid.get_tracked_order_ids()
+                    _working = sum(1 for o in open_orders if str(o.get("id")) in _tracked)
+                    dormant_since, _dormant_for = dormancy_clock(
+                        has_position=abs(sum(
+                            float(p.get("qty") or 0.0) for p in pos_details)) > 0,
+                        working_orders=_working,
+                        strategy_active=bool(getattr(grid, "active", True)),
+                        dormant_since=dormant_since, now=time.time(),
+                    )
+                    if dormant_since is None:
+                        dormant_alerted_at = 0.0
+                    else:
+                        _act = dormancy_action(
+                            _dormant_for,
+                            time.time() - dormant_alerted_at if dormant_alerted_at else 1e9,
+                            settings.empty_book_alert_seconds,
+                            settings.empty_book_restart_seconds,
+                        )
+                        if _act in ("alert", "restart"):
+                            dormant_alerted_at = time.time()
+                            logger.error(
+                                "DORMANT WITH EXPOSURE | {:.0f}s holding a position with no working "
+                                "ladder orders. Nothing is raising, so nothing else will notice "
+                                "(AUDIT #127)", _dormant_for,
+                            )
+                            events.risk_check("empty_book", _dormant_for,
+                                              settings.empty_book_alert_seconds, _act.upper())
+                            try:
+                                notifier.send(
+                                    "&#x26a0; <b>DORMANT WITH EXPOSURE</b>\n"
+                                    f"{_dormant_for/60:.0f} min holding a position with an empty "
+                                    "ladder."
+                                    + ("\nRestarting so the ladder is re-laid."
+                                       if _act == "restart" else "")
+                                )
+                            except Exception:
+                                pass
+                        if _act == "restart":
+                            # Exit non-zero so supervise.py restarts us (abort_startup's contract,
+                            # AUDIT #126). A restart re-lays the ladder with the cap seeded -- the
+                            # thing that actually broke this deadlock on 2026-08-19 at 16:29:58.
+                            # SystemExit is a BaseException, so the loop's `except Exception`
+                            # cannot swallow it, and the outer finally still runs emergency_stop,
+                            # which keeps the stop legs armed while a position is open.
+                            logger.error("DORMANT WITH EXPOSURE | restarting to re-lay the ladder")
+                            raise SystemExit(1)
                     fills = grid.check_fills(balance, open_orders=open_orders)
                     if fills:
                         # Pull Binance's actual income ledger once per batch of fills so the
