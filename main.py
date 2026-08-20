@@ -5,6 +5,8 @@ import sys
 import time
 from datetime import datetime, timezone
 
+from typing import NoReturn
+import ccxt
 import numpy as np
 from loguru import logger
 
@@ -805,6 +807,40 @@ def verify_account_config(exchange: Exchange, cfg, balance: float) -> list[str]:
     return problems
 
 
+def _is_auth_failure(exc: BaseException) -> bool:
+    """Bad credentials, as opposed to a venue we simply cannot reach right now.
+
+    The distinction decides whether the supervisor should try again: rotated or
+    wrong-mode keys will fail identically forever, an unreachable endpoint will not.
+    """
+    if isinstance(exc, ccxt.AuthenticationError):
+        return True
+    text = str(exc).lower()
+    # -2014 API-key format invalid, -2015 invalid key / IP / permissions.
+    return any(s in text for s in
+               ("api-key", "apikey", "signature", "unauthorized", "-2014", "-2015"))
+
+
+def abort_startup(transient: bool) -> NoReturn:
+    """End startup, telling supervise.py whether it should try again.
+
+    RestartPolicy.should_restart treats a clean exit as a deliberate stop and stays
+    down (supervise.py:63-70). The process exit code is therefore the ONLY channel
+    this function has for saying "retry me" versus "a human must fix this first".
+
+    Every startup guard used to end in a bare `return` -- which falls out of run_bot,
+    ends __main__, and exits 0. For a misconfiguration that is correct: restarting
+    into the same bad config forever helps nobody. For an unreachable endpoint it is
+    backwards, and it is the reason a network outage turns into an indefinite outage:
+    the bot stops, the supervisor honours the stop, and the position sits on the
+    exchange with only its stop-loss until a human notices. The log lines at those
+    sites even said "Restart the bot once the exchange recovers" -- addressed to a
+    person, because nothing else was listening.
+
+    AUDIT #104 drew this line at the account probe. These are the sites that never
+    got it (AUDIT #126).
+    """
+    raise SystemExit(1 if transient else 0)
 def ladder_cap_room(one_side_notional: float, cap: float, held_notional: float
                     ) -> tuple[bool, float]:
     """Does one side of the ladder fit in the part of the cap that is still free?
@@ -904,7 +940,7 @@ def run_bot() -> None:
         settings.validate()
     except ValueError as e:
         logger.error("Invalid configuration: {}", e)
-        return
+        abort_startup(transient=False)
 
     notifier = TelegramNotifier(
         settings.telegram_bot_token,
@@ -928,7 +964,7 @@ def run_bot() -> None:
             "A live key also needs Futures trading enabled and this IP whitelisted",
             mode, "DEMO" if settings.demo_mode else "LIVE",
         )
-        return
+        abort_startup(transient=not _is_auth_failure(e))
 
     # Every money figure the bot computes is config x exchange-reality. Confirm they
     # agree before any of it is spent (AUDIT #69).
@@ -975,8 +1011,8 @@ def run_bot() -> None:
         # way to question. 2026-08-18 02:04, with every signed Binance endpoint answering
         # HTTP 408, that is precisely what happened (AUDIT #104).
         if ACCOUNT_UNREADABLE in account_problems:
-            raise SystemExit(1)
-        return
+            abort_startup(transient=True)
+        abort_startup(transient=False)
 
     # Read the state file BEFORE deciding what to do with any open position.
     #
@@ -1047,7 +1083,7 @@ def run_bot() -> None:
             ]
         except Exception as e:
             logger.error("Could not check for pre-existing positions ({}) — not starting", e)
-            return
+            abort_startup(transient=True)
         if pre_existing:
             logger.error("=" * 50)
             logger.error(
@@ -1068,7 +1104,7 @@ def run_bot() -> None:
                 f"{state_mgr.mode.upper()} run for {settings.symbol}. The bot did not open "
                 "it and will not close it."
             )
-            return
+            abort_startup(transient=False)
         logger.info(
             "STARTUP | first {} run for {} — no prior state, book is clean",
             state_mgr.mode, settings.symbol,
@@ -1085,7 +1121,7 @@ def run_bot() -> None:
         leftover = exchange.get_open_orders(settings.symbol)
     except Exception as e:
         logger.error("Cleanup verification failed ({}): cannot start on an uncertain book. Restart once the exchange write path recovers.", e)
-        return
+        abort_startup(transient=True)
     if leftover:
         logger.error(
             "{} orders are still open after cleanup — the exchange write path is unreachable. "
@@ -1093,7 +1129,7 @@ def run_bot() -> None:
             len(leftover),
         )
         notifier.send(f"&#x1f6a8; <b>STARTUP ABORTED</b>\n{len(leftover)} stale orders could not be cancelled (exchange write path down). Book was left untouched.")
-        return
+        abort_startup(transient=True)
 
     trend = TrendFilter(
         ema_fast=settings.ema_fast,
@@ -1276,7 +1312,7 @@ def run_bot() -> None:
 
         if not validate_grid_spacing(grid_lower, grid_upper, dynamic_count, settings.range_min_spacing_pct, current_price):
             logger.error("Grid spacing validation failed. Adjust grid_count or range parameters.")
-            return
+            abort_startup(transient=False)
 
         balance = exchange.get_balance()
         risk.initialize(balance)
@@ -2249,7 +2285,7 @@ def run_bot() -> None:
                             state_mgr.save(state_data)
                         except Exception:
                             pass
-                        return
+                        abort_startup(transient=True)
                 else:
                     time.sleep(10)
 

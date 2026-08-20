@@ -273,11 +273,18 @@ def _run_and_capture(monkeypatch, exchange_cls, state_dir):
 
     sink = []
     handle = logger.add(lambda m: sink.append(str(m)), level="INFO")
+    # Startup guards end in abort_startup, which RAISES SystemExit -- the exit code is
+    # the contract with supervise.py, so the code is part of what these tests assert
+    # (AUDIT #126). A guard that merely returned would exit 0 by accident rather than
+    # by decision, which is the bug.
+    code = 0
     try:
         main_module.run_bot()
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else 1
     finally:
         logger.remove(handle)
-    return "".join(sink)
+    return "".join(sink), code
 
 
 class WrongLeverageExchange(DirtyBookExchange):
@@ -293,11 +300,13 @@ def test_run_bot_refuses_to_trade_a_misconfigured_account(monkeypatch, tmp_path)
 
     Nothing covered the WIRING: the gate could be commented out and every account-config
     test still passed, because they all call the function directly (AUDIT #69)."""
-    logs = _run_and_capture(monkeypatch, WrongLeverageExchange, tmp_path)
+    logs, code = _run_and_capture(monkeypatch, WrongLeverageExchange, tmp_path)
 
     assert "ACCOUNT NOT SAFE TO TRADE" in logs
     assert "leverage mismatch" in logs
     assert "still open after cleanup" not in logs, "startup continued past the gate"
+    assert code == 0, ("a leverage mismatch is a real misconfiguration -- restarting into "
+                       "it forever helps nobody, so exit 0 and stay down (AUDIT #126)")
 
 
 class PreExistingPositionExchange(DirtyBookExchange):
@@ -311,10 +320,12 @@ class PreExistingPositionExchange(DirtyBookExchange):
 def test_run_bot_will_not_close_a_position_it_did_not_open(monkeypatch, tmp_path):
     """First run against an account, so any position belongs to whoever opened it --
     most likely the human, right after flipping DEMO_MODE (AUDIT #72)."""
-    logs = _run_and_capture(monkeypatch, PreExistingPositionExchange, tmp_path)
+    logs, code = _run_and_capture(monkeypatch, PreExistingPositionExchange, tmp_path)
 
     assert "PRE-EXISTING POSITION" in logs
     assert "still open after cleanup" not in logs, "startup continued past the guard"
+    assert code == 0, ("a position the bot did not open needs a human, not a retry loop "
+                       "(AUDIT #126)")
 
 
 def test_an_orphan_from_a_previous_session_is_still_closed(monkeypatch, tmp_path):
@@ -322,10 +333,12 @@ def test_an_orphan_from_a_previous_session_is_still_closed(monkeypatch, tmp_path
     before, an open position IS an orphan and closing it is the documented behaviour."""
     (tmp_path / f"grid_{main_module.settings.symbol.lower()}_demo.bak.1786498297").write_text("{}")
 
-    logs = _run_and_capture(monkeypatch, PreExistingPositionExchange, tmp_path)
+    logs, code = _run_and_capture(monkeypatch, PreExistingPositionExchange, tmp_path)
 
     assert "PRE-EXISTING POSITION" not in logs
     assert "still open after cleanup" in logs, "it did not reach the normal cleanup path"
+    assert code == 1, ("this run reaches the dirty-book abort, which is transient and "
+                       "must ask the supervisor to try again (AUDIT #126)")
 
 
 def test_run_bot_aborts_on_dirty_book(monkeypatch, caplog):
@@ -339,11 +352,19 @@ def test_run_bot_aborts_on_dirty_book(monkeypatch, caplog):
 
     sink = []
     handle = logger.add(lambda m: sink.append(str(m)), level="INFO")
+    code = 0
     try:
         main_module.run_bot()
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else 1
     finally:
         logger.remove(handle)
 
+    assert code == 1, (
+        "a dirty book means the exchange write path is down -- a temporary condition. "
+        "Exiting 0 tells supervise.py someone chose to stop and it stays down "
+        "(AUDIT #126)"
+    )
     logs = "".join(sink)
     assert "still open after cleanup" in logs, (
         "startup aborted somewhere else — this test no longer covers the dirty book"
