@@ -848,6 +848,22 @@ def abort_startup(transient: bool) -> NoReturn:
     got it (AUDIT #126).
     """
     raise SystemExit(1 if transient else 0)
+def account_recheck_due(last_checked: float, now: float, interval: float) -> bool:
+    """Is another account-config check owed? interval <= 0 disables it entirely.
+
+    verify_account_config runs once, at startup, and its own docstring says every
+    money figure the bot computes depends on what it checks. Account settings can
+    move under a running bot -- someone changes leverage in the Binance UI, or
+    another process on the same account does -- and from that moment every notional,
+    margin and stop figure is wrong with nothing saying so. This account went 25x ->
+    5x between sessions on 2026-08-19/20; mid-session that would have been silent
+    until a restart (AUDIT #137).
+    """
+    if interval <= 0:
+        return False
+    return (now - last_checked) >= interval
+
+
 def dormancy_clock(has_position: bool, working_orders: int, strategy_active: bool,
                    dormant_since: float | None, now: float,
                    position_known: bool = True) -> tuple[float | None, float]:
@@ -1723,6 +1739,7 @@ def run_bot() -> None:
     loop_count = 0
     consecutive_errors = 0
     dormant_since: float | None = None
+    account_checked_at = time.time()   # verify_account_config ran during startup
     dormant_alerted_at = 0.0
     # Bound before the loop: the unrealised figure is now only recomputed when the
     # account was actually readable, so a failed first poll would leave it unset.
@@ -1962,6 +1979,44 @@ def run_bot() -> None:
                             events.grid_exit(settings.symbol, "price_above_grid_no_position", price, total_pos)
 
                     balance = exchange.get_balance_cached()
+
+                    # Alert, do NOT abort. Startup refuses to trade on a mismatched
+                    # account because nothing is open yet; killing a running bot that
+                    # holds a position is a bigger risk than the mis-sizing it would
+                    # avoid. So this is the loudest thing short of acting (AUDIT #137).
+                    if account_recheck_due(account_checked_at, time.time(),
+                                           settings.account_recheck_seconds):
+                        account_checked_at = time.time()
+                        try:
+                            _drift = verify_account_config(exchange, settings, balance)
+                        except Exception as _e:
+                            logger.warning("ACCOUNT RECHECK FAILED | {}", _e)
+                            _drift = []
+                        if ACCOUNT_UNREADABLE in _drift:
+                            # An outage is not drift, and the loop has its own
+                            # machinery for outages. Say so quietly and wait.
+                            logger.warning(
+                                "ACCOUNT RECHECK | account unreadable -- no verdict on "
+                                "whether settings still match",
+                            )
+                            _drift = []
+                        if _drift:
+                            logger.error(
+                                "ACCOUNT DRIFTED | {} problem(s) appeared since startup "
+                                "-- every notional and margin figure computed from here "
+                                "is suspect (AUDIT #137)", len(_drift),
+                            )
+                            for _problem in _drift:
+                                logger.error("  - {}", _problem)
+                            events.risk_check("account_config", len(_drift), 0.0, "DRIFT")
+                            try:
+                                notifier.send(
+                                    "&#x26a0; <b>ACCOUNT DRIFTED</b>\n"
+                                    "Settings changed under the running bot:\n"
+                                    + "\n".join(f"* {_p}" for _p in _drift)
+                                )
+                            except Exception:
+                                pass
                     equity = exchange.get_total_equity_cached()
                     exposure = grid.get_exposure_pct(equity)
                     # `exposure` stays this symbol's own figure -- that is what the event

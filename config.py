@@ -119,6 +119,17 @@ class Settings(BaseSettings):
         ),
     )
 
+    account_recheck_seconds: float = Field(
+        default=900.0, ge=0.0,
+        description=(
+            "How often to re-verify that the exchange account still matches the "
+            "bot's sizing assumptions. verify_account_config ran once at startup "
+            "and never again, so leverage, margin mode, position mode or fee rates "
+            "changed under a running bot went unnoticed until a restart -- and every "
+            "notional and margin figure computed after that point was wrong. "
+            "0 disables the recheck."
+        ),
+    )
     empty_book_alert_seconds: float = Field(
         default=900.0, ge=0.0,
         description=(
