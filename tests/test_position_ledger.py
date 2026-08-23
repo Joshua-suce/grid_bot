@@ -178,18 +178,28 @@ def test_the_old_books_undercharged_this_run_by_half():
 class _Positions:
     """Minimal stand-in for the exchange wrapper's get_positions."""
 
-    def __init__(self, rows):
-        self.rows = rows
+    def __init__(self, rows, *later):
+        # `later` lets a test answer differently on the second read, which is the only
+        # way to exercise corroboration: a transient bad reply followed by the truth
+        # (AUDIT #134).
+        self.replies = [rows, *later]
+        self.calls = 0
+
+    @property
+    def rows(self):
+        return self.replies[min(self.calls, len(self.replies) - 1)]
 
     def get_positions(self, symbol):
-        if isinstance(self.rows, Exception):
-            raise self.rows
-        return self.rows
+        reply = self.rows
+        self.calls += 1
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
 
 
-def seeded(rows, start_qty=0.0, start_entry=0.0):
+def seeded(rows, start_qty=0.0, start_entry=0.0, *later):
     g = ledger(start_qty, start_entry)
-    g.exchange = _Positions(rows)
+    g.exchange = _Positions(rows, *later)
     g.symbol = "DOGEUSDT"
     g._seed_position_from_exchange()
     return g
@@ -207,18 +217,73 @@ def test_an_inherited_long_is_adopted():
     assert g._pos_qty == 1793
 
 
-def test_a_flat_account_leaves_the_saved_ledger_alone():
+def test_a_corroborated_flat_account_clears_the_saved_ledger():
+    """Reversed deliberately. This used to assert the ledger survived a flat reply,
+    on the grounds that one bad response must not wipe a real position's cost basis.
+    That reasoning is still right, and is now served by requiring a SECOND read to
+    agree rather than by ignoring flatness altogether.
+
+    Ignoring it cost money on 2026-08-20 06:02:31: ledger short 531 @ 0.1919 against
+    a genuinely flat account, and a BUY 116 @ 0.2148 priced against the phantom for
+    (0.1919 - 0.2148) * 116 = -2.6564, journalled as a real cycle (AUDIT #134)."""
     g = seeded([], start_qty=100, start_entry=0.07)
-    assert g._pos_qty == 100, "a flat exchange reply wiped restored state"
+    assert g._pos_qty == 0.0
+    assert g._pos_entry == 0.0
 
 
-def test_a_zero_size_row_is_not_adopted():
+def test_a_zero_size_row_is_a_flat_account():
+    """Binance returns zero-size rows for symbols you hold nothing in. Treating those
+    as ambiguous would make a genuinely flat account permanently unclearable."""
     g = seeded([{"contracts": 0, "side": "long", "entryPrice": 0.07}], start_qty=50, start_entry=0.07)
+    assert g._pos_qty == 0.0
+
+
+def test_one_transient_flat_reply_does_not_wipe_the_ledger():
+    """The safeguard the reversal above had to preserve: a single bad response is not
+    enough. First read flat, second read holds -> keep the saved ledger."""
+    g = seeded([], 50, 0.07,
+               [{"contracts": 50, "side": "long", "entryPrice": 0.07}])
+    assert g._pos_qty == 50, "one flat reply discarded a position the next read saw"
+
+
+def test_a_flat_reply_followed_by_an_unreadable_one_keeps_the_ledger():
+    """UNKNOWN does not corroborate. Only flat corroborates flat."""
+    g = seeded([], 50, 0.07, RuntimeError("connection reset"))
     assert g._pos_qty == 50
+
+
+def test_clearing_costs_exactly_one_extra_read():
+    """Corroboration is worth one API call and must not become a poll."""
+    g = seeded([], start_qty=100, start_entry=0.07)
+    assert g.exchange.calls == 2
+
+
+def test_an_already_flat_ledger_does_not_pay_for_corroboration():
+    """Nothing to protect, so do not spend the second call."""
+    g = seeded([], start_qty=0.0)
+    assert g.exchange.calls == 1
+
+
+def test_a_held_position_with_no_entry_price_still_keeps_the_ledger():
+    """Holds size but unpriceable. Adopting a size with no cost basis books its close
+    as pure profit; clearing denies a position that exists. Neither -- keep the saved
+    ledger. This is the case that made the first attempt at this fix wrong: it wiped
+    a ledger while 900 units were open."""
+    g = seeded([{"contracts": 900, "side": "long", "entryPrice": 0}], start_qty=50, start_entry=0.07)
+    assert g._pos_qty == 50
+    assert g.exchange.calls == 1, "corroborated a reply that was never flat"
 
 
 def test_a_row_without_an_entry_price_is_not_adopted():
     g = seeded([{"contracts": 900, "side": "long", "entryPrice": 0}], start_qty=50, start_entry=0.07)
+    assert g._pos_qty == 50
+
+
+def test_an_unparseable_size_is_not_read_as_flat():
+    """A reply we cannot understand is UNKNOWN, not empty. Parsing failure must never
+    become evidence that the account holds nothing (AUDIT #134)."""
+    g = seeded([{"contracts": "n/a", "side": "long", "entryPrice": 0.07}],
+               start_qty=50, start_entry=0.07)
     assert g._pos_qty == 50
 
 

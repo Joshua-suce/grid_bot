@@ -708,6 +708,45 @@ class GridEngine:
             self._pos_entry = price
         return realized
 
+    # A positions reply is one of three things, and conflating any two of them has
+    # cost this bot money in both directions. AUDIT #134.
+    POSITIONS_FLAT = "flat"
+    POSITIONS_HOLDS = "holds"
+    POSITIONS_UNREADABLE = "unreadable"
+
+    def _read_positions(self) -> "tuple[str, list]":
+        """Classify what the account says: flat, holding, or unreadable.
+
+        `[]` and a zero-size row both mean "this account holds nothing" -- Binance
+        returns zero-size rows for symbols you are not in, so treating those as
+        ambiguous would make a genuinely flat account permanently unreadable.
+
+        A raise, or a size that will not parse, is NOT evidence of flatness. Acting on
+        a reply we could not understand is how a live position's cost basis gets
+        thrown away and its eventual close booked as pure profit (AUDIT #80).
+
+        Note this classifies SIZE only. A row that holds size but carries no usable
+        entry price is still HOLDS -- the account is not flat just because we cannot
+        price what it holds.
+        """
+        try:
+            positions = self.exchange.get_positions(self.symbol) or []
+        except Exception as exc:
+            logger.warning("POSITIONS UNREADABLE | {}", exc)
+            return self.POSITIONS_UNREADABLE, []
+        for pos in positions:
+            raw = pos.get("contracts")
+            if raw in (None, ""):
+                raw = (pos.get("info") or {}).get("positionAmt")
+            try:
+                qty = float(raw or 0)
+            except (TypeError, ValueError):
+                logger.warning("POSITIONS UNREADABLE | unparseable size {!r}", raw)
+                return self.POSITIONS_UNREADABLE, positions
+            if abs(qty) > 0:
+                return self.POSITIONS_HOLDS, positions
+        return self.POSITIONS_FLAT, positions
+
     def _seed_position_from_exchange(self) -> None:
         """Adopt whatever the account already holds before trading starts.
 
@@ -715,28 +754,75 @@ class GridEngine:
         Starting a session believing we are flat when 5348 DOGE of short is open --
         exactly the state this bot woke up in on 2026-08-15 -- books the eventual
         close of that inheritance as profit the session never made (AUDIT #80).
+
+        The mirror image of that cost money too. 2026-08-20 06:02:31: the restored
+        ledger said short 531 @ 0.1919 (an old session, a price level 12% away) while
+        the account was genuinely flat, because this function only ever adopted the
+        exchange from INSIDE its loop over open positions. A BUY 116 @ 0.2148 was then
+        priced against that phantom short for (0.1919 - 0.2148) * 116 = -2.6564, and
+        that number went into trades_demo.csv as a realised cycle that never happened.
+
+        So a flat account is authority too -- but only once CORROBORATED by a second,
+        independent read. One bad HTTP reply must not be enough to discard a real
+        position's cost basis, which is the failure the AUDIT #80 tests above guard
+        (AUDIT #134).
         """
-        try:
-            positions = self.exchange.get_positions(self.symbol) or []
-        except Exception as exc:                              # network, auth, anything
-            logger.warning("POSITION SEED SKIPPED | {} — ledger starts from saved state", exc)
+        state, positions = self._read_positions()
+
+        if state == self.POSITIONS_UNREADABLE:
+            logger.warning(
+                "POSITION SEED SKIPPED | positions unreadable -- ledger starts from "
+                "saved state",
+            )
             return
-        for pos in positions:
-            qty = float(pos.get("contracts") or 0)
-            if qty <= 0:
-                continue
-            signed = -qty if str(pos.get("side", "")).lower() == "short" else qty
-            entry = float(pos.get("entryPrice") or 0)
-            if entry <= 0:
-                continue
-            if abs(signed - self._pos_qty) > 1e-9:
-                logger.info(
-                    "POSITION SEEDED | ledger had {}, exchange holds {} @ {} — "
-                    "adopting the exchange's",
-                    round(self._pos_qty, 4), round(signed, 4), entry,
-                )
-            self.seed_position(signed, entry)
+
+        if state == self.POSITIONS_HOLDS:
+            for pos in positions:
+                qty = float(pos.get("contracts") or 0)
+                if qty <= 0:
+                    continue
+                signed = -qty if str(pos.get("side", "")).lower() == "short" else qty
+                entry = float(pos.get("entryPrice") or 0)
+                if entry <= 0:
+                    continue
+                if abs(signed - self._pos_qty) > 1e-9:
+                    logger.info(
+                        "POSITION SEEDED | ledger had {}, exchange holds {} @ {} -- "
+                        "adopting the exchange's",
+                        round(self._pos_qty, 4), round(signed, 4), entry,
+                    )
+                self.seed_position(signed, entry)
+                return
+            # Holds size, but nothing we can price. Adopting a size with no cost basis
+            # books its close as pure profit; clearing denies a position that exists.
+            # Leave the saved ledger alone and say so.
+            logger.warning(
+                "POSITION SEED INCOMPLETE | the account holds a position with no "
+                "usable entry price -- keeping the saved ledger rather than guessing",
+            )
             return
+
+        # Flat. If the ledger already agrees there is nothing to corroborate and no
+        # reason to spend a second API call.
+        if abs(self._pos_qty) <= 1e-9:
+            return
+
+        second, _ = self._read_positions()
+        if second != self.POSITIONS_FLAT:
+            logger.warning(
+                "POSITION SEED FLAT UNCONFIRMED | first read said flat, second said "
+                "{} -- keeping the saved ledger of {} (AUDIT #134)",
+                second, round(self._pos_qty, 4),
+            )
+            return
+
+        logger.warning(
+            "POSITION SEEDED FLAT | ledger had {} but two independent reads agree the "
+            "account holds nothing -- clearing it. A fill priced against a phantom "
+            "position reports profit the session never made (AUDIT #134)",
+            round(self._pos_qty, 4),
+        )
+        self.seed_position(0.0, 0.0)
 
     # Polls of ledger-vs-exchange size disagreement tolerated before the mirror is
     # rebuilt outright. check_fills attributes a fill on the very next poll, so
