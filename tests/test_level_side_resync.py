@@ -176,18 +176,25 @@ def test_a_zero_price_is_not_treated_as_a_market():
 
 def test_the_reset_is_gated_on_a_flat_account():
     """Re-siding is only safe with no position open: with inventory, flipping a level
-    turns a reduce-only exit into an order that ADDS exposure. main.py must keep calling
-    this in the no-position branch, never beside reconcile_positions."""
+    turns a reduce-only exit into an order that ADDS exposure. main.py must call this
+    only under `if not has_exchange_positions:` -- with reconcile_positions run
+    unconditionally BEFORE that gate, so a state file still claiming a position the
+    exchange has already closed is cleared against the exchange's truth first."""
     from pathlib import Path
 
     import main
 
     src = Path(main.__file__).read_text(encoding="utf-8")
-    at = src.index("if has_exchange_positions:")
+    reconciled = src.index("grid.reconcile_positions()")
+    at = src.index("if not has_exchange_positions:")
     block = src[at:at + 900]
-    held, flat = block.split("else:", 1)
 
-    assert "reset_levels_to_pending" not in held, (
-        "reset_levels_to_pending moved into the branch where a position IS open — "
-        "re-siding there can convert an exit into an entry")
-    assert "reset_levels_to_pending" in flat
+    assert reconciled < at, (
+        "reconcile_positions was gated behind the positions check again — a stale "
+        "state-file position then blocks place_initial_orders forever")
+    assert "reset_levels_to_pending" in block, (
+        "reset_levels_to_pending left the flat branch — re-siding beside held "
+        "inventory can convert an exit into an entry")
+    assert src.count("reset_levels_to_pending") == 1, (
+        "a second call site appeared; each one must be checked for which side of "
+        "the flat-account gate it sits on")

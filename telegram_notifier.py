@@ -347,6 +347,30 @@ class TelegramNotifier:
             f"Unrealized: {unrealized_pnl:.4f} USDT"
         )
 
+    def on_position_closed(self, symbol: str, side: str, qty: float,
+                           exit_price: float, profit: float) -> None:
+        """A position the bot opened has been closed, with the realised result.
+
+        This did not exist. trend_follower._close_position called it anyway, so every
+        trend exit raised AttributeError -- 2026-08-20 04:49:19, and again at 05:35:33
+        during startup where no handler catches it, killing the process twice before
+        supervise got a clean start.
+
+        The raise landed BETWEEN the market close and the bookkeeping, so the exit
+        only half-happened: _disarm_take_profit never ran, _side was never cleared, and
+        the follower stayed wedged holding a position it had already sold -- the exact
+        state the AUDIT #38 comment in _close_position warns about, reached by a
+        different route (AUDIT #131).
+        """
+        emoji = "&#x1f7e2;" if profit >= 0 else "&#x1f534;"
+        exit_str = f"{exit_price:.8f}".rstrip("0").rstrip(".")
+        self.send(
+            f"{emoji} <b>POSITION CLOSED</b>\n"
+            f"{side.upper()} {qty:.1f} {symbol}\n"
+            f"Exit: {exit_str}\n"
+            f"Realised: {profit:.4f} USDT"
+        )
+
     def on_balance_update(
         self, free: float, used: float, total_equity: float, exposure_pct: float,
         total_pnl_verified: float | None = None,

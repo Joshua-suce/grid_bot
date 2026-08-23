@@ -506,7 +506,7 @@ def get_net_position(exchange: Exchange, symbol: str) -> tuple[str, float]:
     return "", 0.0
 
 
-def get_position_details(exchange: Exchange, symbol: str) -> list[dict]:
+def get_position_details(exchange: Exchange, symbol: str) -> list[dict] | None:
     """Return list of position dicts with entry_price, qty, side, unrealized_pnl.
 
     Normalizes both standard one-way short encoding (side='short', qty>0) and
@@ -546,8 +546,15 @@ def get_position_details(exchange: Exchange, symbol: str) -> list[dict]:
                 "unrealized_pnl": upnl,
             })
         return result
-    except Exception:
-        return []
+    except Exception as e:
+        # [] means FLAT. An unreadable account must not borrow that meaning: the
+        # loop's flat branch sweeps stops, unblocks the position cap and zeroes the
+        # unrealised figure, and the dormancy clock RESETS -- so one failed poll
+        # during a network blip erased however long the book had been empty, and a
+        # flaky venue would stop the watchdog ever accumulating. Exactly when the
+        # exchange is unreliable is when that detector matters most (AUDIT #128).
+        logger.warning("POSITIONS UNREADABLE | {} -- treating the position as UNKNOWN", e)
+        return None
 
 
 def _position_unrealized_pnl(pos: dict, current_price: float) -> float:
@@ -572,7 +579,7 @@ def _notify_status(
     pnl_reconciler: PnLReconciler | None = None,
 ) -> None:
     """Send position + balance to Telegram. Call only on significant events."""
-    pos_details = get_position_details(exchange, symbol)
+    pos_details = get_position_details(exchange, symbol) or []
     for pos in pos_details:
         unrealized = _position_unrealized_pnl(pos, price)
         notifier.on_position_update(symbol, pos["side"], pos["entry_price"], pos["qty"], price, unrealized)
@@ -842,7 +849,8 @@ def abort_startup(transient: bool) -> NoReturn:
     """
     raise SystemExit(1 if transient else 0)
 def dormancy_clock(has_position: bool, working_orders: int, strategy_active: bool,
-                   dormant_since: float | None, now: float) -> tuple[float | None, float]:
+                   dormant_since: float | None, now: float,
+                   position_known: bool = True) -> tuple[float | None, float]:
     """How long has the bot held exposure with nothing working to resolve it?
 
     2026-08-19, 16:31:42 -> 19:44:58: a 6,307 ADA short, an empty order book, and a
@@ -858,6 +866,14 @@ def dormancy_clock(has_position: bool, working_orders: int, strategy_active: boo
     Returns (dormant_since, seconds_dormant); (None, 0.0) whenever healthy.
     (AUDIT #127)
     """
+    if not position_known:
+        # Freeze, never reset. An unreadable account is not evidence of health, and
+        # resetting here would let intermittent read failures hold the clock at zero
+        # forever. It cannot START the clock either -- that would be guessing at
+        # exposure we cannot see (AUDIT #128).
+        if dormant_since is None:
+            return None, 0.0
+        return dormant_since, max(0.0, now - dormant_since)
     if not (has_position and strategy_active) or working_orders > 0:
         return None, 0.0
     started = now if dormant_since is None else dormant_since
@@ -953,6 +969,7 @@ def seed_position_limit(exchange, grid, symbol: str, cfg) -> None:
         equity = exchange.get_total_equity()
         max_pos_qty = equity * cfg.max_position_pct / price if price > 0 else 0.0
         grid.set_position_limit(long_pos, short_pos, max_pos_qty)
+        grid.apply_open_loss_guard(price)
         if long_pos or short_pos:
             logger.info(
                 "POSITION CAP SEEDED | long={:.0f} short={:.0f} against a cap of {:.0f} "
@@ -1280,6 +1297,7 @@ def run_bot() -> None:
             max_exposure_pct=settings.max_exposure_pct,
             min_profit_multiplier=settings.min_profit_multiplier,
             rung_loss_cap_pct=settings.rung_loss_cap_pct,
+            max_open_loss_usdt=settings.max_open_loss_usdt,
             event_journal=events,
             notifier=notifier,
         )
@@ -1297,10 +1315,19 @@ def run_bot() -> None:
 
         seed_position_limit(exchange, grid, settings.symbol, settings)
 
-        if has_exchange_positions:
-            grid.reconcile_state()
-            grid.reconcile_positions()
-        else:
+        # Reconcile BEFORE deciding what to place, and whether the exchange holds a
+        # position or not. Gating this on has_exchange_positions left one wedge: a
+        # state file that still claimed a position while the exchange was flat. The
+        # strategy's place_initial_orders no-ops while it believes it holds anything,
+        # so nothing was ever placed again -- 2026-08-20 19:34 -> 21:31, the trend
+        # follower sat "long" 647 ADA that an exchange-side stop had already closed,
+        # polling in silence for two hours. The flat path of reconcile_positions is
+        # exactly what clears that ghost; the holding path adopts real inventory as
+        # before.
+        grid.reconcile_state()
+        grid.reconcile_positions()
+
+        if not has_exchange_positions:
             logger.info("No exchange positions — resetting stale grid levels to pending")
             grid.reset_levels_to_pending(exchange.get_price(settings.symbol))
             logger.info("Placing fresh grid orders after cleanup")
@@ -1372,6 +1399,7 @@ def run_bot() -> None:
             max_exposure_pct=settings.max_exposure_pct,
             min_profit_multiplier=settings.min_profit_multiplier,
             rung_loss_cap_pct=settings.rung_loss_cap_pct,
+            max_open_loss_usdt=settings.max_open_loss_usdt,
             event_journal=events,
             notifier=notifier,
         )
@@ -1696,6 +1724,9 @@ def run_bot() -> None:
     consecutive_errors = 0
     dormant_since: float | None = None
     dormant_alerted_at = 0.0
+    # Bound before the loop: the unrealised figure is now only recomputed when the
+    # account was actually readable, so a failed first poll would leave it unset.
+    unrealized = 0.0
     seen_bug_errors: set[str] = set()
     last_analytics_fill_count = 0
     try:
@@ -1791,10 +1822,20 @@ def run_bot() -> None:
                                 max_exposure_pct=settings.max_exposure_pct,
                                 min_profit_multiplier=settings.min_profit_multiplier,
                                 rung_loss_cap_pct=settings.rung_loss_cap_pct,
+                                max_open_loss_usdt=settings.max_open_loss_usdt,
                                 event_journal=events,
                                 notifier=notifier,
                             )
                             grid = _install_strategy(grid, exchange, events, notifier)
+                            # The third placement site, and the one AUDIT #125 missed.
+                            # The cooldown ends with whatever position triggered the
+                            # kill switch still open, so rebuilding here without the
+                            # cap hands a full-size ladder the entire budget on top of
+                            # inherited inventory -- the exact arithmetic that ran the
+                            # short to 6,307 on 2026-08-19. The ordering test asserted
+                            # ">= 2 call sites" and passed while this one had none
+                            # (AUDIT #130).
+                            seed_position_limit(exchange, grid, settings.symbol, settings)
                             grid.initialize(price, exchange.get_balance())
                             grid.total_fills = old_fills
                             grid.total_pnl = old_pnl
@@ -1940,7 +1981,13 @@ def run_bot() -> None:
                     # grid's internal per-level guess, which can drift the same way
                     # the realized-PnL bookkeeping did (AUDIT.md issues #7/#8).
                     pos_details = get_position_details(exchange, settings.symbol)
-                    unrealized = sum(_position_unrealized_pnl(p, price) for p in pos_details)
+                    _pos_known = pos_details is not None
+                    if not _pos_known:
+                        # Keep the previous unrealised figure rather than reporting a
+                        # loss that vanished because a read failed.
+                        pos_details = []
+                    else:
+                        unrealized = sum(_position_unrealized_pnl(p, price) for p in pos_details)
                     # One open-order read per iteration, shared by the limit check and the
                     # fill sweep. They ran back to back against the same book and each
                     # paid its own ~400ms round trip.
@@ -1956,12 +2003,23 @@ def run_bot() -> None:
                     # healthy book and mask the exact condition this watches for.
                     _tracked = grid.get_tracked_order_ids()
                     _working = sum(1 for o in open_orders if str(o.get("id")) in _tracked)
+                    # Dust does not arm the clock. Below MIN_NOTIONAL_USDT the exchange
+                    # refuses every order this program could place for the position, so
+                    # no restart can ever re-lay anything for it -- and on 2026-08-20
+                    # that futility ran as a restart every 45 minutes while the real
+                    # defect (a strategy holding zero tracked orders) sat upstream. The
+                    # stop legs still cover what is held, or STOP-LOSS UNPROTECTABLE
+                    # has already said loudly why they cannot.
+                    _pos_notional = sum(
+                        abs(float(p.get("qty") or 0.0)) * float(p.get("entry_price") or 0.0)
+                        for p in pos_details
+                    )
                     dormant_since, _dormant_for = dormancy_clock(
-                        has_position=abs(sum(
-                            float(p.get("qty") or 0.0) for p in pos_details)) > 0,
+                        has_position=_pos_notional >= MIN_NOTIONAL_USDT,
                         working_orders=_working,
                         strategy_active=bool(getattr(grid, "active", True)),
                         dormant_since=dormant_since, now=time.time(),
+                        position_known=_pos_known,
                     )
                     if dormant_since is None:
                         dormant_alerted_at = 0.0
@@ -2091,8 +2149,46 @@ def run_bot() -> None:
                         position_side, position_qty = "", 0.0
                     max_pos_qty = equity * settings.max_position_pct / price if price > 0 else 0
                     grid.set_position_limit(long_pos, short_pos, max_pos_qty)
+                    # The loss budget rides the same per-tick position refresh as the
+                    # cap: both are recomputed from live data, neither is persisted.
+                    grid.apply_open_loss_guard(price)
 
                     if position_side != _last_side:
+                        if position_side == "" and _last_side in ("long", "short"):
+                            # The exchange just went flat under us -- a stop leg fired,
+                            # a manual close, an ADL. Tell the live strategy BEFORE
+                            # reset_trailing() wipes the ratchet it would have used to
+                            # notice: on 2026-08-20 19:34 the trend follower's stop
+                            # anchor was erased one tick before its software check
+                            # could see the breach, and it then sat two hours believing
+                            # it held 647 ADA that no longer existed, placing nothing.
+                            # reconcile_positions is "the exchange is the truth" made
+                            # callable; for a flat grid it is a harmless no-op.
+                            #
+                            # The fresh read guards against a transient positions
+                            # failure: get_position_breakdown returns (0, 0) when the
+                            # API hiccups, and clearing strategy state on that would
+                            # orphan a position that is very much still there. If this
+                            # read fails too, assume the position remains.
+                            try:
+                                still_held = any(
+                                    abs(float(p.get("contracts", 0) or 0)) > 0
+                                    for p in exchange.get_positions(settings.symbol)
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "SIDE FLIP | could not re-verify flat ({}) — "
+                                    "leaving strategy state alone this tick", e,
+                                )
+                                still_held = True
+                            if not still_held:
+                                try:
+                                    grid.reconcile_positions()
+                                except Exception as e:
+                                    logger.warning(
+                                        "SIDE FLIP | reconcile after external close "
+                                        "failed: {}", e,
+                                    )
                         _last_side = position_side
                         grid.reset_trailing()
                         if _scale_out_done:
@@ -2242,7 +2338,7 @@ def run_bot() -> None:
 
                         risk.update_unrealized(sum(
                             _position_unrealized_pnl(p, price)
-                            for p in get_position_details(exchange, settings.symbol)
+                            for p in (get_position_details(exchange, settings.symbol) or [])
                         ))
 
                         held_sl = (grid.get_short_stop_loss_price() if held_side == "short"

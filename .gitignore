@@ -11,6 +11,7 @@ __pycache__/
 # State (contains order IDs and session data)
 state/*.json
 state/*.json.old
+state/*.json.*
 state/*.corrupt*
 state/*.bak.*
 state/*.empty
@@ -35,6 +36,7 @@ logs/*.log.*
 # IDE / OS
 .vscode/
 .idea/
+.claude/
 *.swp
 .DS_Store
 Thumbs.db

@@ -65,6 +65,7 @@ PURPOSE_TAGS = {
     "reconcile": "rc",      # reconcile_positions hedging or closing a drifted position
     "stop_trail": "st",     # trailing scale-out leg
     "stop_hard": "sh",      # static hard stop
+    "trend_tp": "tp",       # trend follower's resting take-profit limit
     "emergency": "em",      # kill switch / shutdown close
     "other": "gg",
 }
@@ -903,9 +904,16 @@ class Exchange:
         bot loses its money -- 30 days of ledger put maker at +98.74 and taker at
         -132.04 -- so the order is tagged with why it happened (AUDIT #56)."""
         close_side = "sell" if side == "long" else "buy"
+        # reduceOnly is what makes this a CLOSE. Without it, a close racing a position
+        # that an exchange-side stop just took (the stop leg lives on the book
+        # independently of this process) would market-SELL into a flat account and OPEN
+        # a full-size opposite position. With it, the exchange rejects the stale close
+        # with -2022 instead, the caller's except handles it, and reconciliation clears
+        # the ghost on the next pass.
         order = self._retry(
             self.exchange.create_market_order, symbol, close_side, amount,
-            {"newClientOrderId": f"{_purpose_tag(purpose)}{uuid.uuid4().hex[:29]}"},
+            {"newClientOrderId": f"{_purpose_tag(purpose)}{uuid.uuid4().hex[:29]}",
+             "reduceOnly": True},
             label="close_position", max_attempts=max_attempts,
         )
         logger.info("POSITION CLOSED | {} {} {} ({})", close_side.upper(), amount, symbol, purpose)

@@ -288,11 +288,16 @@ def _run_and_capture(monkeypatch, exchange_cls, state_dir):
 
 
 class WrongLeverageExchange(DirtyBookExchange):
-    """The measured case: .env says 25x, the exchange is on 5x."""
+    """The measured case: .env says one thing, the exchange is set to another.
+
+    Read live so the test stays correct whichever leverage .env carries: whatever
+    settings wants, this account is one tick off, which is the whole defect."""
 
     def get_account_config(self, symbol):
-        return {"leverage": 5, "margin_mode": "cross", "isolated": False,
-                "dual_side": False, "max_notional": 4800000.0}
+        from config import settings
+
+        return {"leverage": settings.leverage + 1, "margin_mode": "cross",
+                "isolated": False, "dual_side": False, "max_notional": 4800000.0}
 
 
 def test_run_bot_refuses_to_trade_a_misconfigured_account(monkeypatch, tmp_path):

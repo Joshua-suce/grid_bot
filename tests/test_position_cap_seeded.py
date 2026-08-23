@@ -182,21 +182,49 @@ def test_the_call_site_scan_excludes_the_definition():
 
 def test_seeding_happens_before_every_placement_path():
     """A seed that runs after the ladder is on the book is worth nothing. This is the
-    assertion that actually prevents the recurrence."""
-    src = Path(main.__file__).read_text(encoding="utf-8")
+    assertion that actually prevents the recurrence.
 
-    first_seed = _seed_call_sites(src)[0]
+    Checks EVERY occurrence of each placement call, not just the first. The original
+    compared src.index(call) -- the first occurrence -- against the first seed, so it
+    could only ever inspect one placement site. The post-cooldown rebuild had no seed
+    at all and this test passed anyway (AUDIT #130).
+    """
+    src = Path(main.__file__).read_text(encoding="utf-8")
+    seeds = _seed_call_sites(src)
 
     for call in ("grid.reconcile_state()", "grid.place_initial_orders(", "grid.activate("):
-        assert src.index(call) > first_seed, (
-            f"{call} runs before the position cap is seeded -- the ladder is sized "
-            f"against a cap it does not know yet (AUDIT #125)"
-        )
+        starts = [m.start() for m in re.finditer(re.escape(call), src)]
+        assert starts, f"{call} no longer appears in main.py -- this test is stale"
+        for at in starts:
+            assert any(s < at for s in seeds), (
+                f"the {call} at offset {at} runs with no seed before it -- that ladder "
+                f"is sized against a cap it does not know yet (AUDIT #125/#130)"
+            )
 
 
-def test_both_startup_routes_are_covered():
-    """Restored-state and fresh-start reach placement by different paths; one seed on
-    only one of them leaves the other exactly as it was."""
+def test_every_ladder_construction_route_is_seeded():
+    """Restored-state, fresh-start and the post-cooldown rebuild each reach placement
+    by a different path. A seed on some of them leaves the others exactly as they were.
+
+    Three routes, so three seeds. The old assertion was `>= 2`, which is precisely the
+    number that let the third route ship unseeded.
+    """
     src = Path(main.__file__).read_text(encoding="utf-8")
 
-    assert len(_seed_call_sites(src)) >= 2, "only one startup route is seeded"
+    assert len(_seed_call_sites(src)) >= 3, (
+        f"only {len(_seed_call_sites(src))} seed call site(s); the startup restore, "
+        f"the fresh start and the recovery rebuild each need one"
+    )
+
+
+def test_the_recovery_rebuild_specifically_is_seeded():
+    """Named on its own because it is the one that was missing, and because a count
+    assertion cannot say WHICH route lost its seed."""
+    src = Path(main.__file__).read_text(encoding="utf-8")
+
+    rebuild = src.index("grid.initialize(price, exchange.get_balance())")
+    window = src[max(0, rebuild - 1200):rebuild]
+    assert "seed_position_limit(" in window, (
+        "the post-cooldown rebuild lays a fresh ladder while the position that "
+        "tripped the kill switch is still open, and does not seed the cap first"
+    )

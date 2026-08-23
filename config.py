@@ -240,6 +240,24 @@ class Settings(BaseSettings):
         default=0.12, gt=0, le=2.0,
         description="Max position size as fraction of equity (stops unlimited accumulation)",
     )
+    max_open_loss_usdt: float = Field(
+        default=0.0, ge=0,
+        description=(
+            "Loss budget for the OPEN position, in USDT. Once its unrealised loss "
+            "reaches this, the side that would ADD to the position is blocked (exits "
+            "stay legal) until the loss recedes or the position closes.\n"
+            "\n"
+            "The cap bounds how big a position can get; nothing bounded how much "
+            "adverse room it was handed, so a trend running through the ladder could "
+            "hand a capped position to the hard stop as one taker print worth hundreds "
+            "of grid cycles (the -74.39 vs +2.61 asymmetry of 2026-07-22..08-20). This "
+            "bounds the averaging instead: the grid stops digging at the budget.\n"
+            "\n"
+            "0 disables the guard. Size it against cycle economics: with 25 USDT rungs "
+            "earning ~0.03 per cycle, even 10 USDT is generous -- it is roughly one "
+            "worst-case stop-out of a MAX_POSITION_PCT=0.05 cap."
+        ),
+    )
     sl_scale_out_pct: float = Field(
         default=0.50, ge=0, le=0.95,
         description=(

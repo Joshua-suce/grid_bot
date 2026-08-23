@@ -38,6 +38,7 @@ SWEEPABLE = {
     "adx_range_threshold": float,
     "maker_fee": float,
     "recenter_margin_pct": float,
+    "max_open_loss_usdt": float,
 }
 
 
@@ -62,6 +63,7 @@ def _defaults_from_env() -> dict:
         "recenter_cooldown": settings.recenter_cooldown,
         "replacement_cooldown": settings.replacement_cooldown,
         "recenter_margin_pct": settings.recenter_margin_pct,
+        "max_open_loss_usdt": settings.max_open_loss_usdt,
         "adx_trend_threshold": settings.adx_trend_threshold,
         "adx_range_threshold": settings.adx_range_threshold,
         "ema_fast": settings.ema_fast,

@@ -176,3 +176,52 @@ def test_the_restart_cannot_be_swallowed_by_the_loops_error_handler():
     loop = _loop_source()
     idx = loop.index("SystemExit(1)")
     assert "raise" in loop[max(0, idx - 40):idx]
+
+# ------------------------------------------- an unreadable account is not "flat"
+def test_an_unreadable_account_never_resets_a_running_clock():
+    """get_position_details returned [] for BOTH 'flat' and 'the read failed', so one
+    failed poll during a network blip erased however long the book had been empty.
+    A flaky venue would stop the clock ever accumulating -- and a flaky venue is
+    exactly when this detector matters most (AUDIT #128)."""
+    since, secs = dormancy_clock(has_position=False, working_orders=0,
+                                 strategy_active=True, dormant_since=1000.0,
+                                 now=3000.0, position_known=False)
+    assert since == 1000.0, "an unreadable read reset the clock"
+    assert secs == 2000.0, "the clock stopped accruing while the account was unreadable"
+
+
+def test_an_unreadable_account_does_not_start_the_clock():
+    """Freezing is not the same as guessing. With no clock running we have no
+    evidence of exposure, so starting one would be inventing a position."""
+    since, secs = dormancy_clock(False, 0, True, dormant_since=None, now=3000.0,
+                                 position_known=False)
+    assert (since, secs) == (None, 0.0)
+
+
+def test_a_genuinely_flat_account_still_resets_the_clock():
+    """The fix must not turn every flat poll into a frozen one."""
+    since, secs = dormancy_clock(False, 0, True, dormant_since=1000.0, now=3000.0,
+                                 position_known=True)
+    assert (since, secs) == (None, 0.0)
+
+
+def test_position_known_defaults_to_true():
+    """Every existing caller and test predates the parameter."""
+    assert dormancy_clock(True, 0, True, None, 500.0) == (500.0, 0.0)
+
+
+def test_get_position_details_tells_flat_apart_from_unreadable():
+    class Flat:
+        def get_positions(self, s): return []
+    class Broken:
+        def get_positions(self, s): raise ConnectionError("HTTP 408")
+
+    assert main_module.get_position_details(Flat(), "ADAUSDT") == []
+    assert main_module.get_position_details(Broken(), "ADAUSDT") is None
+
+
+def test_the_loop_forwards_readability_to_the_clock():
+    """A distinction the loop does not pass on is a distinction that does not exist."""
+    loop = _loop_source()
+    assert "position_known=" in loop, "the loop never tells the clock what it knows"
+    assert re.search(r"_pos_known\s*=\s*pos_details is not None", loop)

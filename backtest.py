@@ -521,6 +521,7 @@ def run_backtest(
     ema_fast: int = 20,
     ema_slow: int = 50,
     adx_period: int = 14,
+    max_open_loss_usdt: float = 0.0,
     quiet: bool = True,
 ) -> BacktestResult:
     """Replay `ohlcv` through a real GridEngine and report what it would have done.
@@ -551,6 +552,7 @@ def run_backtest(
             adx_trend_threshold=adx_trend_threshold,
             adx_range_threshold=adx_range_threshold, ema_fast=ema_fast, ema_slow=ema_slow,
             adx_period=adx_period,
+            max_open_loss_usdt=max_open_loss_usdt,
         )
     finally:
         if quiet:
@@ -598,7 +600,8 @@ def _run(ohlcv, *, symbol, starting_balance, grid_count, capital_per_grid_pct,
          price_decimals, amount_decimals, use_trend_filter, use_router,
          trend_capital_pct, trend_atr_stop_multiplier, trend_min_hold_seconds,
          router_min_regime_seconds, router_handoff_grace_seconds, adx_trend_threshold,
-         adx_range_threshold, ema_fast, ema_slow, adx_period) -> BacktestResult:
+         adx_range_threshold, ema_fast, ema_slow, adx_period,
+         max_open_loss_usdt) -> BacktestResult:
     from trend_filter import atr as calc_atr
 
     if len(ohlcv) <= warmup + 10:
@@ -652,6 +655,7 @@ def _run(ohlcv, *, symbol, starting_balance, grid_count, capital_per_grid_pct,
             trailing_sl_trigger_pct=trailing_sl_trigger_pct,
             max_exposure_pct=max_exposure_pct,
             min_profit_multiplier=min_profit_multiplier,
+            max_open_loss_usdt=max_open_loss_usdt,
         )
         # In router mode the engine is wrapped alongside a trend follower, exactly as
         # main.py's _install_strategy does it. `strategy` is what the loop drives; the
@@ -707,6 +711,7 @@ def _run(ohlcv, *, symbol, starting_balance, grid_count, capital_per_grid_pct,
             strategy.set_position_limit(
                 long_position=long_qty, short_position=short_qty, max_position_qty=max_qty,
             )
+            strategy.apply_open_loss_guard(c)
 
             fills = strategy.check_fills(balance)
             for f in fills:

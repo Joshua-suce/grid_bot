@@ -221,6 +221,7 @@ class GridEngine:
         use_market_close_on_replace: bool = False,
         min_profit_multiplier: float = 3.0,
         rung_loss_cap_pct: float = 0.01,
+        max_open_loss_usdt: float = 0.0,
         event_journal: object | None = None,
         notifier: object | None = None,
     ):
@@ -274,6 +275,12 @@ class GridEngine:
         self._notifier = notifier
         self._block_buys = False
         self._block_sells = False
+        # Loss budget: once the OPEN position's unrealised loss reaches
+        # max_open_loss_usdt, the side that would ADD to it is blocked (0 disables).
+        # See apply_open_loss_guard.
+        self.max_open_loss_usdt = max_open_loss_usdt
+        self._loss_block_buys = False
+        self._loss_block_sells = False
         # Last net position seen by set_position_limit(), used to decide whether an
         # order actually *reduces* a position (reduceOnly is only legal then -- see
         # _reduce_only_qty). Refreshed from the exchange every main-loop iteration.
@@ -406,6 +413,63 @@ class GridEngine:
         if ratio < 0.5:
             return False, 1.0
         return False, 1.0 - (ratio - 0.5) / 0.5
+
+    def apply_open_loss_guard(self, price: float) -> None:
+        """Refuse to ADD to a position whose open loss has eaten the loss budget.
+
+        The cap bounds how BIG a position can get; nothing bounded how much adverse
+        room it was handed. A trend that runs one way through the ladder fills every
+        rung on one side -- each an intentional average -- and then hands the whole
+        capped position to the hard stop as a single taker print: -74.39 of the
+        account's -68.37 net over 2026-07-22..08-20, against +2.61 earned by 178
+        maker cycles. The wins are structurally small (one spacing); this makes the
+        losses structurally small too: once the open loss reaches the budget, the
+        adverse side stops digging. Reducing stays legal -- exits are how the
+        position resolves, and blocking them would weld the loss in place.
+
+        Stateless by design: recomputed from (pos, entry, price) every call, so it
+        needs no persistence and self-clears when price recovers or the position
+        closes.
+        """
+        if self.max_open_loss_usdt <= 0:
+            self._loss_block_buys = False
+            self._loss_block_sells = False
+            return
+
+        if self._pos_qty > 0:
+            loss = (self._pos_entry - price) * self._pos_qty
+            adverse = "buy"
+        elif self._pos_qty < 0:
+            loss = (price - self._pos_entry) * -self._pos_qty
+            adverse = "sell"
+        else:
+            self._loss_block_buys = False
+            self._loss_block_sells = False
+            return
+
+        trip = loss >= self.max_open_loss_usdt
+        if adverse == "buy":
+            blocked, was = trip, self._loss_block_buys
+            self._loss_block_buys = trip
+        else:
+            blocked, was = trip, self._loss_block_sells
+            self._loss_block_sells = trip
+
+        if blocked and not was:
+            logger.warning(
+                "OPEN LOSS BUDGET | {} position down {:.2f} USDT >= {:.2f} budget — "
+                "{} orders blocked (no longer averaging into the move); exits stay "
+                "open",
+                "long" if adverse == "buy" else "short", loss,
+                self.max_open_loss_usdt, adverse.upper(),
+            )
+            self._cancel_resting_orders(adverse, "open_loss_budget")
+        elif not blocked and was:
+            logger.info(
+                "OPEN LOSS BUDGET | {} back inside budget ({:.2f} USDT) — {} orders "
+                "unblocked",
+                "long" if adverse == "buy" else "short", loss, adverse.upper(),
+            )
 
     def _reduce_only_qty(self, side: str) -> float:
         """Return how much quantity an order on `side` could legally close right now.
@@ -1473,6 +1537,12 @@ class GridEngine:
             return False
         if level.side == "sell" and self._block_sells:
             logger.debug("SKIP SELL ORDER | short position limit reached")
+            return False
+        if level.side == "buy" and self._loss_block_buys:
+            logger.debug("SKIP BUY ORDER | open loss budget exhausted")
+            return False
+        if level.side == "sell" and self._loss_block_sells:
+            logger.debug("SKIP SELL ORDER | open loss budget exhausted")
             return False
         if self._would_realise_a_loss(level.side, level.price):
             be = self._position_break_even()

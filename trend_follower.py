@@ -115,6 +115,17 @@ class TrendFollower:
         # and shrink the reward it was set to guarantee.
         self._initial_risk = 0.0
         self._take_profit_price: float | None = None
+        # The target as a RESTING reduce-only limit on the exchange, not just a number
+        # this process compares against from memory (AUDIT #130). While the target lived
+        # only in software, a position held by this strategy worked zero tracked orders:
+        # main.py's dormancy watchdog read that empty book every 15 minutes, concluded
+        # nothing would ever resolve the exposure, and restarted the bot -- which
+        # restored the identical state and changed nothing, forever. A resting target is
+        # also simply safer: it executes even if this process dies.
+        self._tp_order_id: str | None = None
+        # Backoff after a failed placement so a persistently rejected target (dust qty,
+        # insufficient margin) retries at a civilized rate instead of once per poll.
+        self._tp_retry_after = 0.0
 
         # --- stops (ratcheted, see update_trailing_sl) ---
         self._peak_price = 0.0
@@ -234,6 +245,10 @@ class TrendFollower:
         try:
             self.exchange.cancel_everything(
                 self.symbol, timeout_seconds=30, keep_stops=holding)
+            # cancel_everything clears every regular limit order -- the resting target
+            # among them. Drop the claim so a restart does not resurrect a stale id;
+            # reconcile_positions re-arms a fresh target if a position survives.
+            self._tp_order_id = None
             if holding:
                 logger.warning(
                     "STOPS LEFT ARMED | a position is still open on {}, so its "
@@ -288,6 +303,76 @@ class TrendFollower:
                 self.symbol, self._side or "", self._entry_price, self._order_id, reason,
             )
         self._order_id = None
+        return True
+
+    def _arm_take_profit(self, qty: float) -> None:
+        """Rest the target on the exchange as a reduce-only limit (AUDIT #130).
+
+        Post-only: the target sits beyond price by construction, so it always rests --
+        and a post-only rejection would mean price is already at/through the target,
+        where the software check below should take over instead of crossing as taker.
+        Failure is not fatal: `_take_profit_price` stays set and check_fills keeps its
+        software comparison as the fallback, but the placement failure backs off rather
+        than retrying into the book every poll.
+        """
+        if self._tp_order_id is not None or self._take_profit_price is None:
+            return
+        if time.time() < self._tp_retry_after:
+            return
+        if qty <= 0 or qty * self._take_profit_price < MIN_NOTIONAL_USDT:
+            # The exchange would refuse it; nothing placeable exists at this size.
+            self._tp_retry_after = time.time() + 300.0
+            return
+        side = "sell" if self._side == "long" else "buy"
+        try:
+            order = self.exchange.place_limit_order(
+                self.symbol, side, self._take_profit_price, qty,
+                max_attempts=1, post_only=True,
+                params={"reduceOnly": True, "purpose": "trend_tp"},
+            )
+        except Exception as e:
+            logger.error(
+                "TREND TP PLACE FAILED | {} {} @ {} — target stays software-side "
+                "as fallback: {}", side, qty, self._take_profit_price, e,
+            )
+            self._tp_retry_after = time.time() + 60.0
+            return
+        self._tp_order_id = order.get("id")
+        logger.info(
+            "TREND TP PLACED | {} {} {} @ {} (id={})",
+            side.upper(), qty, self.symbol, self._take_profit_price, self._tp_order_id,
+        )
+        if self._event_journal:
+            self._event_journal.order_placed(
+                self.symbol, side, self._take_profit_price, qty, self._tp_order_id)
+
+    def _disarm_take_profit(self, reason: str) -> bool:
+        """Cancel the resting target. True only when confirmed gone.
+
+        Same contract as _cancel_entry: an UNCONFIRMED cancel keeps the claim, because
+        clearing it here would let the next trade arm a second target while this one
+        might still be live. A claimed-but-gone order resolves itself in check_fills,
+        which notices the id missing from the open book and clears the claim.
+        """
+        if self._tp_order_id is None:
+            return True
+        try:
+            confirmed = self.exchange.cancel_order(self._tp_order_id, self.symbol)
+        except Exception as e:
+            logger.warning("TREND FOLLOWER | cancel tp {} failed: {}", self._tp_order_id, e)
+            confirmed = False
+        if not confirmed:
+            logger.error(
+                "TREND FOLLOWER | take-profit {} could NOT be confirmed cancelled — "
+                "keeping it claimed", self._tp_order_id,
+            )
+            return False
+        if self._event_journal:
+            self._event_journal.order_cancelled(
+                self.symbol, self._side or "", self._take_profit_price or 0.0,
+                self._tp_order_id, reason,
+            )
+        self._tp_order_id = None
         return True
 
     # --- trading -----------------------------------------------------------
@@ -367,7 +452,7 @@ class TrendFollower:
         return qty
 
     def check_fills(self, balance: float, open_orders: list[dict] | None = None) -> list[dict]:
-        """Detect the entry filling, and enforce the trailing stop."""
+        """Detect the entry or take-profit filling, and enforce the trailing stop."""
         fills: list[dict] = []
         if self._order_id is not None:
             open_ids = ({o["id"] for o in open_orders} if open_orders is not None
@@ -379,14 +464,36 @@ class TrendFollower:
                 elif order is None or order.get("status") == "canceled":
                     self._order_id = None
 
+        # The resting target can fill without this process doing anything -- that is
+        # most of why it rests there at all (AUDIT #130). Same absence-from-the-book
+        # inference the entry detection above uses.
+        if self._tp_order_id is not None:
+            open_ids = ({o["id"] for o in open_orders} if open_orders is not None
+                        else self.exchange.get_open_order_ids(self.symbol))
+            if self._tp_order_id not in open_ids:
+                order = self.exchange.fetch_order(self._tp_order_id, self.symbol)
+                if order and order.get("status") == "closed":
+                    fills.append(self._record_tp_exit(order))
+                elif order is None or order.get("status") == "canceled":
+                    # Gone without filling (cancelled externally, or an unconfirmed
+                    # cancel from a close that raced us). Drop the claim so a later
+                    # trade can arm its own; if still holding, reconcile_positions
+                    # re-arms a replacement.
+                    self._tp_order_id = None
+
         if self._side is not None:
             price = self.exchange.get_price(self.symbol)
-            # The target is checked FIRST, and deliberately. Stop and target sit on
-            # opposite sides of entry so they cannot both be live on one tick -- except
-            # on a gap, where price has jumped clean past one of them. Taking the target
-            # there would book a win the market never offered; testing the stop's side
-            # of the move first keeps the pessimistic reading.
-            tp = self._take_profit_price
+            # The software target comparison is now the FALLBACK path only: it runs
+            # when no resting target exists on the book (placement failed, or its
+            # cancel never confirmed). When the resting one exists it is authoritative
+            # -- running both would race a market close against the very limit order
+            # the book is holding for this exit.
+            #
+            # The pessimistic gap rule survives unchanged where it matters: stop and
+            # target sit on opposite sides of entry, so only a gap puts price past
+            # both, and a DOWN gap through a long's resting sell cannot fill it -- the
+            # stop wins on the book exactly as it did here.
+            tp = None if self._tp_order_id is not None else self._take_profit_price
             hit_target = tp is not None and (
                 price >= tp if self._side == "long" else price <= tp)
 
@@ -412,8 +519,12 @@ class TrendFollower:
         # is called every iteration whenever a strategy is live, so the entry is armed
         # from here too. Both paths are idempotent: place_initial_orders no-ops while a
         # position or a resting entry order exists, so being driven twice in one
-        # iteration (as the backtester does) still opens only one position.
-        if self.active and self._side is None and self._order_id is None:
+        # iteration (as the backtester does) still opens only one position. The target
+        # claim gates it as well: an unconfirmed TP cancel keeps the claim until the
+        # book proves the order gone, and a new trade must not arm a second target
+        # underneath it.
+        if (self.active and self._side is None and self._order_id is None
+                and self._tp_order_id is None):
             self.place_initial_orders(balance)
 
         return fills
@@ -459,6 +570,10 @@ class TrendFollower:
             offset = self._initial_risk * self.take_profit_r
             self._take_profit_price = self._round_price(
                 price + offset if self._side == "long" else price - offset)
+        # A fresh trade gets a fresh chance at a resting target, whatever backoff a
+        # previous trade's placement failures earned.
+        self._tp_retry_after = 0.0
+        self._arm_take_profit(qty)
 
         logger.info(
             "TREND ENTRY FILLED | {} {} @ {} | stop={} | target={} ({}R)",
@@ -471,10 +586,111 @@ class TrendFollower:
             "profit": 0.0, "fee": 0.0, "completed_cycle": False,
         }
 
+    def _record_tp_exit(self, order: dict) -> dict:
+        """The resting target filled on the exchange. Book the win it just delivered.
+
+        The position is already closed -- the reduce-only limit did it, at the target
+        price or better. All this does is bring the internal ledger in line with the
+        exchange and free the strategy to trade again.
+        """
+        side = self._side
+        entry, qty = self._entry_price, self._qty
+        exit_price = float(order.get("average") or order.get("price") or 0.0)
+        direction = 1.0 if side == "long" else -1.0
+        profit = (exit_price - entry) * qty * direction
+
+        self.total_fills += 1
+        self.total_completed_cycles += 1
+        self.total_pnl += profit
+        logger.info(
+            "TREND EXIT | {} {} @ {} (entry {}) | reason=take_profit (resting target "
+            "filled) | pnl={:.6f}",
+            side.upper(), qty, exit_price, entry, profit,
+        )
+        if self._notifier:
+            self._notifier.on_position_closed(self.symbol, side, qty, exit_price, profit)
+
+        # The stop legs main.py placed for this position are now orphaned on the book;
+        # its flat sweep (cancel_all_stop_orders once the net position reads empty)
+        # owns them, exactly as for any other externally-closed position.
+        self._side = None
+        self._entry_price = 0.0
+        self._qty = 0.0
+        self._entry_time = 0.0
+        self._initial_risk = 0.0
+        self._take_profit_price = None
+        self._tp_order_id = None
+        self.reset_trailing()
+        return {
+            "price": exit_price, "side": "sell" if side == "long" else "buy",
+            "quantity": qty, "profit": profit, "fee": 0.0, "completed_cycle": True,
+            "reason": "take_profit",
+        }
+
+    def _live_position_qty(self) -> float | None:
+        """Absolute size of this symbol's net position, or None if unreadable.
+
+        None means UNKNOWN and must never be read as flat -- an unreadable account is
+        not evidence of anything, and treating it as flat here would skip a close that
+        genuinely needs to happen (AUDIT #132).
+        """
+        try:
+            positions = self.exchange.get_positions(self.symbol)
+        except Exception as e:
+            logger.warning("TREND | position read failed ({}) -- treating as UNKNOWN", e)
+            return None
+        if positions is None:
+            return None
+        total = 0.0
+        for pos in positions:
+            try:
+                amt = float(pos.get("contracts")
+                            or pos.get("info", {}).get("positionAmt") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            total += abs(amt)
+        return total
+
     def _close_position(self, reason: str) -> dict | None:
         if self._side is None:
             return None
         entry, qty, side = self._entry_price, self._qty, self._side
+
+        # Is the position still there? This mirror is NOT authority: main.py arms a
+        # hard stop-market leg for every trend position, and that leg can fire on the
+        # exchange between two polls. Closing from the mirror alone then sells a
+        # position that is already flat, and on a one-way account a second sell does
+        # not close harder -- it opens the other way.
+        #
+        # 2026-08-20 04:49. Long 111 ADA @ 0.2237 with a hard stop at 0.21678. Price
+        # fell through it, the stop sold 111, and one poll later the trailing-stop exit
+        # market-sold another 111 against a mirror that still said long. The account
+        # ended SHORT 111 nobody asked for, closed at 05:35 for a further -0.16
+        # (AUDIT #132).
+        live = self._live_position_qty()
+        if live is not None and live <= 0.0:
+            logger.warning(
+                "TREND CLOSE SKIPPED | mirror says {} {} but the exchange is flat -- "
+                "its stop leg already closed this. Clearing state instead of selling "
+                "again, which would open the opposite side (AUDIT #132)",
+                side, qty,
+            )
+            self._disarm_take_profit(reason)
+            self._side = None
+            self._entry_price = 0.0
+            self._qty = 0.0
+            self._entry_time = 0.0
+            self._initial_risk = 0.0
+            self._take_profit_price = None
+            self.reset_trailing()
+            return None
+        if live is not None and live < abs(qty):
+            logger.warning(
+                "TREND CLOSE RESIZED | mirror says {:.8g} but the exchange holds "
+                "{:.8g} -- closing the live amount (AUDIT #132)", abs(qty), live,
+            )
+            qty = live
+
         try:
             # Exchange.close_position(symbol, side, amount) -- `side` is the POSITION
             # side ("long"/"short"), which it converts to the closing order side.
@@ -510,12 +726,21 @@ class TrendFollower:
         if self._notifier:
             self._notifier.on_position_closed(self.symbol, side, qty, exit_price, profit)
 
+        # The position is gone; its resting target must go too, or it lingers on the
+        # book as a reduce-only order that can never fill and that the next trade's
+        # target would duplicate. An unconfirmed cancel keeps the claim (see
+        # _disarm_take_profit): check_fills clears it once the book proves the order
+        # gone, and until then the re-arm gate holds new entries off.
+        self._disarm_take_profit(reason)
+
         self._side = None
         self._entry_price = 0.0
         self._qty = 0.0
         self._entry_time = 0.0
         self._initial_risk = 0.0
         self._take_profit_price = None
+        # _tp_order_id is left exactly as _disarm_take_profit left it: None on a
+        # confirmed cancel, claimed on an unconfirmed one until the book resolves it.
         self.reset_trailing()
         return {
             "price": exit_price, "side": "sell" if side == "long" else "buy",
@@ -651,6 +876,12 @@ class TrendFollower:
                 self._qty = 0.0
                 self._entry_price = 0.0
                 self.reset_trailing()
+            # A stray resting target must not outlive its position. Reduce-only means
+            # it can never fill now, but it still sits on the book -- where main.py's
+            # dormancy watchdog counts it as a working order that will never resolve,
+            # and where the next trade's target would duplicate it.
+            self._take_profit_price = None
+            self._disarm_take_profit("position_closed")
             return
 
         side, qty, entry = live
@@ -667,8 +898,45 @@ class TrendFollower:
             self._peak_price = self._peak_price or self._entry_price
             self._trough_price = self._trough_price or self._entry_price
 
+        # Holding: make sure a resting target actually exists for this position. This
+        # covers restarts into an inherited position (state kept the price, the order
+        # id did not survive), state files written before targets rested on the book at
+        # all, and claims dropped by check_fills' vanished-order branch. Without it, a
+        # held position works zero tracked orders and the dormancy watchdog restarts
+        # the bot every 45 minutes trying to fix a book nothing ever re-lays (the
+        # 2026-08-20 loop).
+        if self._tp_order_id is None and self._take_profit_price is not None:
+            self._arm_take_profit(self._qty)
+        elif (self._tp_order_id is None and self._take_profit_price is None
+                and self.take_profit_r > 0 and self._entry_price > 0):
+            # No target anywhere -- including nothing to restore from state. Reconstruct
+            # one from what IS known: the distance to the live trail stands in for the
+            # opening stop this position no longer has a record of. Not the R the trade
+            # was opened with, but far better than a naked book the watchdog rightly
+            # screams about.
+            stop = (self.get_stop_loss_price() if self._side == "long"
+                    else self.get_short_stop_loss_price())
+            risk = abs(self._entry_price - stop) if stop else 0.0
+            if risk > 0:
+                offset = risk * self.take_profit_r
+                self._initial_risk = risk
+                self._take_profit_price = self._round_price(
+                    self._entry_price + offset if self._side == "long"
+                    else self._entry_price - offset)
+                logger.warning(
+                    "TREND TP RECONSTRUCTED | position had no target on record -- "
+                    "derived {} from the live trail distance ({}R of {:.6g})",
+                    self._take_profit_price, self.take_profit_r, risk,
+                )
+                self._arm_take_profit(self._qty)
+
     def get_tracked_order_ids(self) -> set:
-        return {self._order_id} if self._order_id else set()
+        # Both legs this strategy owns: the entry it is waiting on, and the resting
+        # take-profit protecting the position it holds. main.py's dormancy watchdog
+        # counts open orders against exactly this set -- an empty set while holding a
+        # position is what read as "dormant" every 15 minutes (AUDIT #130).
+        ids = {oid for oid in (self._order_id, self._tp_order_id) if oid}
+        return ids
 
     # --- persistence -------------------------------------------------------
 
@@ -678,6 +946,8 @@ class TrendFollower:
             "entry_price": self._entry_price,
             "qty": self._qty,
             "order_id": self._order_id,
+            "tp_order_id": self._tp_order_id,
+            "take_profit_price": self._take_profit_price,
             "entry_time": self._entry_time,
             "regime": self._regime,
             "peak_price": self._peak_price,
@@ -698,6 +968,10 @@ class TrendFollower:
             self._entry_price = float(data.get("entry_price", 0.0))
             self._qty = float(data.get("qty", 0.0))
             self._order_id = data.get("order_id")
+            tp_id = data.get("tp_order_id")
+            self._tp_order_id = str(tp_id) if tp_id else None
+            tpp = data.get("take_profit_price")
+            self._take_profit_price = None if tpp is None else float(tpp)
             self._entry_time = float(data.get("entry_time", 0.0))
             self._regime = str(data.get("regime", "uncertain"))
             self._peak_price = float(data.get("peak_price", 0.0))
@@ -720,6 +994,12 @@ class TrendFollower:
         if self._side is not None and self._qty <= 0:
             logger.warning("TREND FOLLOWER | state claims a {} with no quantity -- clearing", self._side)
             self._side = None
+
+        if self._side is None:
+            # A flat strategy owns no target. Stale tp fields on a flat restore would
+            # have reconcile_positions arming an order with no position behind it.
+            self._tp_order_id = None
+            self._take_profit_price = None
 
     # --- grid-specific surface main.py still calls -------------------------
     # Implemented as harmless equivalents so the router can delegate blindly and
@@ -760,6 +1040,14 @@ class TrendFollower:
     def reset_levels_to_pending(self, *args, **kwargs) -> int:
         """No ladder to reset -- the position, if any, is real and stays."""
         return 0
+
+    def apply_open_loss_guard(self, *args, **kwargs) -> None:
+        """Nothing to gate: a trend follower never averages into a move.
+
+        The guard exists to stop a LADDER from adding rung after rung while its open
+        loss grows. This strategy's position is bounded by construction -- one entry,
+        a stop, and a target -- so the budget has no adverse side to block."""
+        return None
 
     def get_scale_out_trail_price(self, *args, **kwargs) -> float | None:
         """No scale-out: the position exits in one piece at the trailing stop."""

@@ -355,6 +355,18 @@ class StrategyRouter:
                 logger.warning("ROUTER | still not flat after close -- retrying next tick")
                 return
 
+            # The close just happened behind the outgoing strategy's back: it still
+            # believes it holds the position, and anything it rested against that
+            # position (a take-profit, say) is still on the book. Telling it now is
+            # what stops the ghost riding along: a strategy reactivated while it
+            # "holds" phantom inventory no-ops place_initial_orders forever, which is
+            # the silent-flat failure of 2026-08-20 one router hop removed. For a
+            # naturally-flat outgoing strategy this is a cheap no-op.
+            try:
+                self.strategy.reconcile_positions()
+            except Exception as e:
+                logger.warning("ROUTER | post-flatten reconcile failed ({})", e)
+
         # Flat (naturally or forced): stand the outgoing strategy down and switch.
         self.strategy.pause()
         previous = self.active_name
@@ -542,6 +554,7 @@ class StrategyRouter:
             "active_name": self.active_name,
             "regime": self._regime,
             "handoff_target": self._handoff_target,
+            "handoff_started": self._handoff_started,
             "switches": self.switches,
             "failed_handoffs": self.failed_handoffs,
             "forced_flattens": self.forced_flattens,
@@ -561,7 +574,27 @@ class StrategyRouter:
         self.failed_handoffs = int(router_state.get("failed_handoffs", 0))
         self.forced_flattens = int(router_state.get("forced_flattens", 0))
         if self._handoff_target is not None:
-            self._handoff_started = time.time()
+            # The grace deadline is wall-clock absolute, so it has to survive a
+            # restart. Stamping time.time() here restarted the countdown instead,
+            # which meant the force-close could be pushed out indefinitely by
+            # something that merely restarts the bot -- and since AUDIT #127 the bot
+            # now restarts ITSELF after 45 dormant minutes, so a handoff waiting on a
+            # position that cannot reach flat would have had its deadline reset by
+            # the very mechanism meant to break the deadlock (AUDIT #129).
+            saved = router_state.get("handoff_started")
+            try:
+                saved = float(saved) if saved is not None else 0.0
+            except (TypeError, ValueError):
+                saved = 0.0
+            now = time.time()
+            # Reject only ABSURD stamps -- a time in the future, or one so old it
+            # cannot be this session (a truncated or hand-edited file reading 0.0
+            # would otherwise say "expired by 56 years" and market-close on the first
+            # tick). An ordinary expired deadline is NOT absurd: a handoff that has
+            # outlived its grace must force-close, which is the whole point of the
+            # deadline, so it has to be allowed through here.
+            plausible = 0.0 < saved <= now + 1.0 and (now - saved) < 30 * 86400
+            self._handoff_started = saved if plausible else now
 
         sub_states = (data or {}).get("strategies") or {}
         if sub_states:

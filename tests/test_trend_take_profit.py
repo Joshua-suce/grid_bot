@@ -43,19 +43,28 @@ class FakeExchange:
         self.exchange = FakeInner()
         self.price = price
         self.closed = []
+        # What the ACCOUNT holds. This used to be absent and get_positions returned []
+        # unconditionally -- the fake reported flat while the test had just driven a
+        # real entry through _record_entry. A close-guard that verifies the position
+        # against the exchange then passes against a lie (AUDIT #132).
+        self.position_qty = 0.0
 
     def get_price(self, symbol):
         return self.price
 
     def close_position(self, symbol, side, amount):
         self.closed.append((side, amount))
+        self.position_qty = max(0.0, self.position_qty - abs(amount))
         return {"id": "c1"}
 
     def get_open_order_ids(self, symbol):
         return set()
 
     def get_positions(self, symbol):
-        return []
+        if self.position_qty <= 0:
+            return []
+        return [{"contracts": self.position_qty,
+                 "info": {"positionAmt": str(self.position_qty)}}]
 
 
 def follower(take_profit_r=0.0, atr_pct=0.01, price=0.0700):
@@ -72,6 +81,7 @@ def enter(t, side="buy", price=0.0700, qty=1000.0):
     """Drive a filled entry through the real _record_entry."""
     t._record_entry({"side": side, "average": price, "filled": qty, "status": "closed"})
     t._entry_time = 0.0                      # min_hold satisfied
+    t.exchange.position_qty = qty            # the account really holds it now
     return t
 
 

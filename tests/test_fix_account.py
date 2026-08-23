@@ -96,7 +96,9 @@ def test_the_real_reset_is_detected():
 
 def test_hedge_mode_is_treated_as_wrong():
     """The bot sends no positionSide, which hedge mode rejects outright (-4061)."""
-    todo = plan(cfg(dual=True))
+    from config import settings
+
+    todo = plan(cfg(leverage=settings.leverage, dual=True))
 
     assert [row[0] for row in todo] == ["position mode"]
 

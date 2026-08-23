@@ -239,4 +239,9 @@ GRID_SPECIFIC_MEMBERS = (
     # startup coherence check that uses it is wrapped in try/except precisely so router
     # mode degrades to skipping the check rather than raising (AUDIT #66).
     "one_side_notional",
+    # The loss budget gates ADDING to a ladder's averaging. A trend follower never
+    # averages -- its stop and target bound the position by construction -- so there is
+    # nothing for the guard to gate; main.py calls it unconditionally, so the protocol
+    # needs to know it is deliberately grid-only.
+    "apply_open_loss_guard",
 )

@@ -9,6 +9,72 @@ tests; the full suite (86 tests across `test_grid.py`, `test_risk.py`,
 `test_telegram_notifier.py` need `pydantic`/`httpx`, which weren't available in
 this sandbox -- run `pytest` yourself once before going live to cover those too.
 
+## Where the money actually went (2026-08-21)
+
+`attribute_pnl.py 30` over the demo account, 2026-07-22 -> 08-20: **net -68.37 USDT**.
+The grid's 178 maker executions earned +2.08 net; two `stop_hard` taker prints lost
+-74.39; forced taker exits were 2.7% of executions but 38.1% of notional. The account
+reconciler agrees: -69.98 realized since the 2026-08-14 epoch. One capped position
+stopped out cost more than a hundred grid cycles earn -- the tail IS the PnL.
+
+Backtest over ADAUSDT 1h x180d (drift -21.9%), current .env config as baseline:
+
+| config | net | maxDD |
+|---|---|---|
+| baseline (cap=0.20, stop=0.5%, gc=8) | -192.99 | 3.9% |
+| cap=0.10 | -89.67 | 2.6% |
+| **cap=0.05, stop=2%, gc=6** | **-23.11** | **1.5%** |
+
+Net improves MONOTONICALLY as the cap shrinks, on every metric including drawdown:
+the cap is what bounds the stopped-out tail, and per-cycle profit does not depend
+on it. Wider stop (2%) beats 0.5%/1%/3% at small cap; fewer rungs beat more (fees).
+
+Honest caveat, same as the router section below: mean/stdev across start offsets is
+-0.96 for the best combo. NOTHING tested clears the noise floor on this symbol and
+period -- these changes are measured harm reduction (an 8x smaller loss and half the
+drawdown through a -22% market), not evidence of an edge. The .env now carries them:
+LEVERAGE 25->5 (the comment said "optimized for 5x" while the value was 25, making
+every rung $125 and pinning filled ladders against the cap), MAX_POSITION_PCT
+0.20->0.05, STOP_LOSS_PCT 0.005->0.02, GRID_COUNT 8->6.
+
+## The wins were structurally small and the losses structurally large (#131)
+
+`attribute_pnl.py` made the asymmetry explicit: 178 maker cycles earned +2.61 net
+while forced taker exits lost -70.97 -- one capped position handed to its hard stop
+outweighed everything the grid's design wins. The reason is structural, not bad luck:
+
+- a grid WIN is bounded by construction at one spacing (~0.66% of one rung);
+- a grid LOSS was bounded only by `cap x trend distance`, because nothing in the
+  add-to-position path ever looked at the open PnL. `_block_buys/_block_sells`
+  counted QUANTITY (the cap), never LOSS.
+
+**Fix: an explicit loss budget** (`MAX_OPEN_LOSS_USDT`, `apply_open_loss_guard` in
+grid.py). Once the open position's unrealised loss reaches the budget, the side that
+would ADD to it is blocked and its resting orders are cancelled -- the same contract
+the cap uses. Exits stay legal; blocking those would weld the loss in place (#42).
+Stateless by construction: recomputed from (pos, entry, price) each tick, so it needs
+no persistence and self-clears on recovery. Wired wherever the cap is wired (startup
+seed + every main-loop position refresh + all three GridEngine constructions), and
+sweepable from the backtest harness (`--set max_open_loss_usdt=N`). Default 0 (off)
+in code; .env turns it on at 10 USDT -- with 25 USDT rungs that is roughly one
+worst-case stop-out of the 0.05 cap, and ~300 generous cycles of rope.
+
+Tests: `tests/test_open_loss_guard.py` (blocks adverse side for long AND short,
+never blocks exits, clears on recovery, cancels resting adverse orders on trip,
+holds the placement choke point, disabled at 0).
+
+**Measured verdict: OFF.** The mechanism works; the economics do not, at this sizing.
+On ADAUSDT 1h x180d with the new cap=0.05 config, every budget tried netted WORSE
+than disabled -- off -17.61, vs -84 (10), -62 (5), -48 (15/20), -42 (30). The reason
+inverts the original asymmetry: once the CAP bounds the position at ~$250, a stopped
+out tail costs roughly one rung-stack (~$12), while the grid's averaging through
+ordinary oscillation is where its entire gross comes from (+0.79 gross off; blocking
+adds forfeits the bounce that completes those cycles). The guard was built for a
+world of $125 rungs and a $1,000 cap; the cap fix already shrank that world. It
+stays wired, tested, sweepable (`--set max_open_loss_usdt=N`), default 0, and .env
+carries 0 with this measurement attached -- same treatment as the router before it:
+built and tested, enabled only when evidence supports it.
+
 ## Fixed
 
 ### 1. Unhandled failure in the post-only order fallback (exchange.py) -- HIGH
