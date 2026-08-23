@@ -38,11 +38,37 @@ from loguru import logger
 # so a symbol change had two places to remember and no way to notice missing one.
 from grid import MIN_NOTIONAL_USDT  # noqa: E402  (AUDIT #107)
 
+# How long to wait before re-offering a target the venue refused on its price band.
+# Long, because only price moving toward the target makes it placeable -- a shorter
+# timer just re-runs the rejection (AUDIT #135).
+TP_BAND_RETRY_SECONDS = 600.0
+
+# Binance refuses a limit price outside its PERCENT_PRICE band relative to mark price.
+# -4016/-4015 are the band codes; -1013 is the generic filter failure older responses
+# use for the same condition.
+_PRICE_BAND_MARKERS = ("-4016", "-4015", "-1013",
+                       "price can't be higher", "price can't be lower",
+                       "percent_price")
+
+
+def is_price_band_rejection(exc: BaseException) -> bool:
+    """Did the venue refuse this price for being too far from the mark?
+
+    Distinguished from an ordinary placement failure because the two want opposite
+    responses: a transient failure should be retried soon, a band rejection should not
+    be retried at all until price has moved (AUDIT #135).
+    """
+    text = str(exc).lower()
+    return any(m in text for m in _PRICE_BAND_MARKERS)
+
+
 LONG_REGIMES = {"uptrend"}
 SHORT_REGIMES = {"downtrend"}
 
 
 class TrendFollower:
+
+    _tp_band_deferred = False
     """Holds at most one position, in the direction of the prevailing regime.
 
     Implements the `Strategy` protocol, plus no-op equivalents of the grid-specific
@@ -126,6 +152,7 @@ class TrendFollower:
         # Backoff after a failed placement so a persistently rejected target (dust qty,
         # insufficient margin) retries at a civilized rate instead of once per poll.
         self._tp_retry_after = 0.0
+        self._tp_band_deferred = False
 
         # --- stops (ratcheted, see update_trailing_sl) ---
         self._peak_price = 0.0
@@ -331,12 +358,32 @@ class TrendFollower:
                 params={"reduceOnly": True, "purpose": "trend_tp"},
             )
         except Exception as e:
+            if is_price_band_rejection(e):
+                # The venue caps a limit price relative to mark price. A 3R target on
+                # a wide ATR stop can sit outside that cap: 2026-08-20 05:35:28, the
+                # target was 0.2445 against a ceiling of 0.22887 with spot at 0.2180.
+                #
+                # Retrying does not fix it -- only price moving toward the target
+                # does. And nothing is lost by waiting: check_fills' software
+                # comparison is what actually closes the position, so the resting
+                # order is an optimisation, not the mechanism. Defer quietly instead
+                # of writing an ERROR into the log every minute forever (AUDIT #135).
+                if not self._tp_band_deferred:
+                    logger.info(
+                        "TREND TP DEFERRED | target {} is outside the venue's price "
+                        "band for now; the software target still closes the position "
+                        "(AUDIT #135)", self._take_profit_price,
+                    )
+                    self._tp_band_deferred = True
+                self._tp_retry_after = time.time() + TP_BAND_RETRY_SECONDS
+                return
             logger.error(
                 "TREND TP PLACE FAILED | {} {} @ {} — target stays software-side "
                 "as fallback: {}", side, qty, self._take_profit_price, e,
             )
             self._tp_retry_after = time.time() + 60.0
             return
+        self._tp_band_deferred = False
         self._tp_order_id = order.get("id")
         logger.info(
             "TREND TP PLACED | {} {} {} @ {} (id={})",
@@ -573,6 +620,7 @@ class TrendFollower:
         # A fresh trade gets a fresh chance at a resting target, whatever backoff a
         # previous trade's placement failures earned.
         self._tp_retry_after = 0.0
+        self._tp_band_deferred = False
         self._arm_take_profit(qty)
 
         logger.info(

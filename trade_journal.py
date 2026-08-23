@@ -99,7 +99,7 @@ class TradeJournal:
                     f"{unrealized_pnl:.6f}",
                 ])
             logger.info(
-                "TRADE JOURNAL | {} {} @ {} | fill#{} | cycle_pnl={:.6f} | cum_pnl={:.6f}",
+                "TRADE JOURNAL | {} {} @ {} | account fill#{} | cycle_pnl={:.6f} | cum_pnl={:.6f}",
                 side.upper(), symbol, price, fill_number, cycle_pnl, cumulative_pnl,
             )
         except Exception as e:

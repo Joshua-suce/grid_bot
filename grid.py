@@ -2422,7 +2422,12 @@ class GridEngine:
             self.total_completed_cycles += 1
 
         logger.info(
-            "FILL #{} | {} @ {} | qty={} profit={:.6f} fees={:.6f} net={:.6f} | cycle={}",
+            # This ladder's own count, NOT the account's. main.py journals
+            # router.total_fills, which sums every strategy, so the two differ by
+            # whatever the trend follower has done -- 31 here against fill#37 in
+            # the journal on 2026-08-20 06:02:31. Both were right and both were
+            # called "fill" (AUDIT #136).
+            "GRID FILL #{} | {} @ {} | qty={} profit={:.6f} fees={:.6f} net={:.6f} | cycle={}",
             self.total_fills, level.side.upper(), level.price,
             level.quantity, profit, fee, profit - fee, "complete" if completed_cycle else "open",
         )
