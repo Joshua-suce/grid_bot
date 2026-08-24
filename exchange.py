@@ -181,6 +181,12 @@ class Exchange:
                 self.exchange.enable_demo_trading(True)
             self.exchange.load_markets()
             self._sync_time()
+            # The client is new; the cached balance is not. It carries a 5s TTL and
+            # survives the reconnect, so the first read after an outage could serve a
+            # figure from BEFORE it -- during which the position may have been stopped
+            # out and the balance changed. _invalidate_balance_cache existed for
+            # exactly this and was called from nowhere (AUDIT #142).
+            self._invalidate_balance_cache()
             self._circuit_breaker.record_success()
             logger.info("RECONNECTED | exchange connection restored")
             return True

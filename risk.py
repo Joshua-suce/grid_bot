@@ -68,7 +68,7 @@ class RiskManager:
         the account's real daily P&L instead of the grid's per-level estimate, which
         can drift from Binance's blended-average accounting (see AUDIT.md). Leaves
         `state.daily_realized_pnl` itself untouched -- it still drives
-        `consecutive_losses` via `record_trade()`.
+        `consecutive_losses` via `record_cycles()`.
         """
         self.state.peak_balance = max(self.state.peak_balance, current_balance)
         if not self._check_cooldown():
@@ -210,11 +210,6 @@ class RiskManager:
         remaining = int(effective_cooldown - elapsed)
         return max(0, remaining)
 
-    def can_recover(self) -> bool:
-        if not self.state.in_recovery:
-            return False
-        return self.recovery_cooldown_remaining() == 0
-
     def exit_recovery(self) -> None:
         logger.info(
             "RECOVERY COMPLETE | exiting recovery mode | consec_losses={}",
@@ -252,18 +247,6 @@ class RiskManager:
         if not self.state.in_recovery:
             self.state.consecutive_losses = 0
         self.state.last_reset_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    def record_trade(self, pnl: float) -> None:
-        self.state.daily_realized_pnl += pnl
-        self.state.trades_today += 1
-        if pnl >= 0:
-            self.state.consecutive_losses = 0
-        else:
-            self.state.consecutive_losses += 1
-        logger.info(
-            "TRADE RECORDED | pnl={:.2f} | daily_total={:.2f} | trades_today={} | consec_losses={}",
-            pnl, self.state.daily_realized_pnl, self.state.trades_today, self.state.consecutive_losses,
-        )
 
     def record_cycles(
         self, completed: int, verified_pnl: float | None, estimated_pnl: float,

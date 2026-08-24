@@ -119,10 +119,16 @@ def test_cooldown():
     assert is_fatal is True
 
 
-def test_record_trade():
+# test_record_trade is gone with the method it tested. record_trade was superseded by
+# record_cycles in AUDIT #43 -- it was fed the grid engine's per-level cycle profit,
+# which is ~20x the account's realised change and can differ in SIGN -- and had no
+# production caller left. The two tests below used it only to put P&L on the books,
+# and now use the method that actually runs (AUDIT #142).
+
+def test_record_cycles_books_a_trade():
     rm = RiskManager()
     rm.initialize(1000)
-    rm.record_trade(5.0)
+    rm.record_cycles(1, 5.0, 5.0)
     assert rm.state.daily_realized_pnl == 5.0
     assert rm.state.trades_today == 1
 
@@ -130,8 +136,8 @@ def test_record_trade():
 def test_reset_daily():
     rm = RiskManager()
     rm.initialize(1000)
-    rm.record_trade(-10.0)
-    rm.record_trade(5.0)
+    rm.record_cycles(1, -10.0, -10.0)
+    rm.record_cycles(1, 5.0, 5.0)
     rm.reset_daily()
     assert rm.state.daily_realized_pnl == 0.0
     assert rm.state.trades_today == 0
@@ -140,7 +146,7 @@ def test_reset_daily():
 def test_to_dict_and_load():
     rm = RiskManager()
     rm.initialize(1000)
-    rm.record_trade(10.0)
+    rm.record_cycles(1, 10.0, 10.0)
     d = rm.to_dict()
     rm2 = RiskManager()
     rm2.load_from_dict(d)

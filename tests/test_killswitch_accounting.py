@@ -125,6 +125,16 @@ def test_main_feeds_the_verified_delta_not_the_grid_sum():
     assert "pnl_reconciler.net_realized_pnl - verified_before" in text, (
         "main.py is not passing the exchange-verified delta to the risk manager"
     )
+    # Stronger than the original. That checked production did not CALL
+    # record_trade(profit); with the method deleted (AUDIT #142) such a check passes
+    # vacuously forever. Asserting the method does not exist makes the AUDIT #43
+    # mistake impossible to reintroduce rather than merely absent today.
+    from risk import RiskManager
+    assert not hasattr(RiskManager, "record_trade"), (
+        "record_trade is back. It credits the grid engine's per-level cycle profit, "
+        "which is ~20x the account's realised change and can differ in SIGN -- use "
+        "record_cycles (AUDIT #43)"
+    )
     assert "risk.record_trade(profit)" not in text, (
         "main.py still feeds the grid's per-level estimate to the risk manager (#43)"
     )
