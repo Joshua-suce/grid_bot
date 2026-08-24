@@ -325,6 +325,7 @@ class StrategyRouter:
                 # strategy keep working it down through its own exits. Dumping here is
                 # what cost -46.16 across 18 handoffs (AUDIT #29).
                 self.deferred_ticks += 1
+                self._accelerate_outgoing_exit()
                 return
 
             logger.warning(
@@ -391,6 +392,25 @@ class StrategyRouter:
                 )
             except Exception:
                 pass
+
+    def _accelerate_outgoing_exit(self) -> None:
+        """Give the outgoing strategy a chance to close through its own book instead of
+        just idling until the grace clock forces a market close.
+
+        This reaches for the method with getattr rather than adding it to the Strategy
+        protocol: it moves a resting ladder rung, and strategy.py deliberately keeps
+        ladder-shaped members (`recenter`, `levels`, ...) out of the protocol because
+        they mean nothing to a strategy that is not a grid. A strategy without one has
+        nothing here to accelerate, and that is fine (AUDIT #145).
+        """
+        accelerate = getattr(self.strategy, "accelerate_handoff_exit", None)
+        if accelerate is None or self.exchange is None:
+            return
+        try:
+            price = self.exchange.get_price(self.symbol)
+            accelerate(price, self._current_balance())
+        except Exception as e:
+            logger.debug("ROUTER | handoff acceleration skipped ({})", e)
 
     @property
     def handoff_in_progress(self) -> bool:

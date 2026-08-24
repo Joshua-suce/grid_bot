@@ -199,6 +199,11 @@ class GridEngine:
     _break_even_cache: "tuple[str, float] | None" = None
     _break_even_time = 0.0
 
+    # Same reason: accelerate_handoff_exit is reached from router tests that build the
+    # engine with __new__ too (AUDIT #145).
+    _last_handoff_accel_time = 0.0
+    HANDOFF_ACCEL_COOLDOWN_SECONDS = 60.0
+
     def __init__(
         self,
         exchange: Exchange,
@@ -256,6 +261,7 @@ class GridEngine:
         self.total_fills = 0
         self.total_completed_cycles = 0
         self._last_recenter_time = 0.0
+        self._last_handoff_accel_time = 0.0
         self._volatility_mult = 1.0
         self._trailing_sl_price: float | None = None
         self._trailing_sl_trigger: float = trailing_sl_trigger_pct
@@ -1484,6 +1490,83 @@ class GridEngine:
             if abs(other.price - target) < floor:
                 return None                     # would deform the ladder (#34)
         return target
+
+    def accelerate_handoff_exit(self, current_price: float, balance: float) -> bool:
+        """During a router handoff, bring the nearest exit-side rung to a price it can
+        actually trade at instead of leaving it wherever ordinary grid spacing put it.
+
+        router._continue_handoff lets the outgoing strategy keep unwinding through its
+        own levels for up to handoff_grace_seconds before forcing a market close --
+        AUDIT #29 measured that force-close at -46.16 across 18 handoffs, so waiting is
+        the right default. But nothing ever repriced the level it is waiting on: on
+        2026-08-24 a long's nearest exit sat at 0.2195 while price held 0.2181-0.2183
+        for the whole 620s of the run, 0.6% away and going nowhere, with the grace
+        clock racing toward the same forced dump this design exists to avoid.
+
+        Only the EXIT side is ever touched here -- the side that reduces the position
+        -- and _nearest_legal_exit never returns worse than the position's own
+        break-even, so this can only bring a still-profitable exit closer to market,
+        never manufacture the loss the force-close would take anyway. The actual
+        placement goes through _place_order_for_level, so every existing guard
+        (crossing checks, the fee floor, the loss guard) still applies exactly as it
+        does to any other level (AUDIT #145).
+        """
+        if abs(self._pos_qty) <= 1e-9:
+            return False                          # already flat -- the handoff completes on its own
+        now = time.time()
+        if (now - self._last_handoff_accel_time) < self.HANDOFF_ACCEL_COOLDOWN_SECONDS:
+            return False
+        exit_side = "sell" if self._pos_qty > 0 else "buy"
+        resting = [l for l in self.levels if l.side == exit_side and l.order_id is not None]
+        if not resting:
+            return False
+        nearest = min(resting, key=lambda l: abs(l.price - current_price))
+        target = self._nearest_legal_exit(nearest)
+        if target is None:
+            return False
+        # A real improvement, not just "legal" -- _nearest_legal_exit also fires when
+        # the level is already fine and simply far away, which is exactly this case.
+        improves = ((exit_side == "sell" and target < nearest.price)
+                    or (exit_side == "buy" and target > nearest.price))
+        if not improves:
+            return False
+
+        # Claim the cooldown before any I/O: a failed cancel below must not retry
+        # every single poll (the same discipline _cancel_resting_orders follows).
+        self._last_handoff_accel_time = now
+        try:
+            still_open = self.exchange.get_open_order_ids(self.symbol)
+        except Exception as e:
+            logger.error("HANDOFF ACCEL | could not fetch open orders: {}", e)
+            return False
+        if nearest.order_id in still_open:
+            try:
+                confirmed = self.exchange.cancel_order(nearest.order_id, self.symbol)
+            except Exception as e:
+                logger.error(
+                    "HANDOFF ACCEL | failed to cancel {} @ {}: {}",
+                    nearest.side, nearest.price, e,
+                )
+                return False
+            if not confirmed:
+                return False                      # order_id kept; retried after the cooldown
+
+        old_price, old_id = nearest.price, nearest.order_id
+        if self._event_journal:
+            self._event_journal.order_cancelled(self.symbol, exit_side, old_price, old_id, "handoff_accel")
+        if self._notifier:
+            self._notifier.on_order_cancelled(self.symbol, exit_side, old_price, old_id, "handoff_accel")
+        nearest.order_id = None
+        nearest.status = "pending"
+        nearest.price = target
+        logger.warning(
+            "HANDOFF EXIT ACCELERATED | {} {} -> {} | {:.2f}% from market and idle -- "
+            "repricing toward break-even so the handoff can close through it instead "
+            "of waiting on the grace deadline (AUDIT #145)",
+            exit_side.upper(), old_price, target,
+            abs(old_price - current_price) / current_price * 100,
+        )
+        return self._place_order_for_level(nearest, balance)
 
     def _existing_open_order(self, price: float, side: str) -> dict | None:
         """Return an open exchange order already resting at the same price+side, if any.

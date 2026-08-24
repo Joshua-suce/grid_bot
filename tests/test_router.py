@@ -503,3 +503,68 @@ def test_update_regime_handoff_survives_an_unreadable_balance():
 
     assert r.active_name == "trend"
     assert trend.active
+
+
+# --- handoff acceleration (AUDIT #145) --------------------------------------
+
+class BalancedExchange(FakeExchange):
+    def get_balance(self):
+        return 4866.53
+
+
+class TrackingStrategy(FakeStrategy):
+    """A strategy with a ladder to accelerate, unlike the plain FakeStrategy above."""
+    def __init__(self, name):
+        super().__init__(name)
+        self.accel_calls = []
+
+    def accelerate_handoff_exit(self, price, balance):
+        self.accel_calls.append((price, balance))
+
+
+def test_the_outgoing_strategy_is_offered_a_chance_to_accelerate():
+    """Every deferred tick during a handoff must give the outgoing ladder a chance to
+    reprice toward the market, not just wait silently on the grace clock."""
+    ex = BalancedExchange(position=5000.0)
+    grid, trend = TrackingStrategy("grid"), FakeStrategy("trend")
+    r = StrategyRouter(
+        strategies={"grid": grid, "trend": trend},
+        min_regime_seconds=0, handoff_grace_seconds=3600, exchange=ex, symbol="DOGEUSDT",
+    )
+    grid.activate(5000)
+
+    r.update_regime("uptrend")
+
+    assert grid.accel_calls == [(0.072, 4866.53)], (
+        "the outgoing strategy was never asked to accelerate its exit"
+    )
+
+
+def test_a_strategy_without_a_ladder_is_left_alone():
+    """FakeStrategy has no accelerate_handoff_exit -- getattr must no-op, not raise.
+    This is the trend follower's real shape: it has no rungs to reprice."""
+    r, grid, trend, ex = make(position=5000.0, handoff_grace_seconds=3600)
+
+    r.update_regime("uptrend")   # must not raise AttributeError
+
+    assert r.handoff_in_progress
+
+
+def test_acceleration_is_not_offered_once_the_handoff_completes():
+    """Once flat, the switch happens and there is nothing left to accelerate."""
+    ex = BalancedExchange(position=5000.0)
+    grid, trend = TrackingStrategy("grid"), FakeStrategy("trend")
+    r = StrategyRouter(
+        strategies={"grid": grid, "trend": trend},
+        min_regime_seconds=0, handoff_grace_seconds=3600, exchange=ex, symbol="DOGEUSDT",
+    )
+    grid.activate(5000)
+    r.update_regime("uptrend")
+    assert grid.accel_calls, "sanity: it was offered a chance while still holding"
+
+    ex.position = 0.0
+    calls_before = len(grid.accel_calls)
+    r.update_regime("uptrend")
+
+    assert r.active_name == "trend"
+    assert len(grid.accel_calls) == calls_before, "accelerated an exit after going flat"
