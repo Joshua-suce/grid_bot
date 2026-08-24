@@ -633,7 +633,13 @@ def test_set_position_limit_does_not_cancel_orders_below_cap():
 
     grid.set_position_limit(long_position=1.0, short_position=0.0, max_position_qty=10.0)
 
-    assert grid._block_buys is False
+    # Blocking flipped deliberately (AUDIT #138). Filled long is 1 of a cap of 10, but
+    # the resting buy is 10 -- if it fills the position is 11, over the cap. The gate
+    # now bounds COMMITTED exposure, so placing MORE buys is refused. What this test
+    # exists to protect is unchanged and still asserted below: the resting order it
+    # already has is kept, not cancelled. Cancelling it would remove the very
+    # commitment that caused the block, and the side would oscillate.
+    assert grid._block_buys is True
     assert ex.cancelled == []
     assert grid.levels[0].order_id == "B1"
 

@@ -372,21 +372,38 @@ class GridEngine:
         self._net_long_qty = max(0.0, long_position)
         self._net_short_qty = max(0.0, short_position)
 
-        self._block_buys, self._buy_scale = self._position_limit_state(long_position, max_position_qty)
-        self._block_sells, self._sell_scale = self._position_limit_state(short_position, max_position_qty)
+        # Gate on what the ladder has COMMITTED, not just what has filled (AUDIT #138).
+        committed_long, committed_short = self._committed_exposure(
+            long_position, short_position)
+        self._block_buys, self._buy_scale = self._position_limit_state(
+            committed_long, max_position_qty)
+        self._block_sells, self._sell_scale = self._position_limit_state(
+            committed_short, max_position_qty)
 
-        # The cap is enforced on new placements only; resting orders placed before the
-        # cap was hit keep filling and overshoot it. Once a side is blocked, cancel the
-        # resting orders on that side so the position cannot keep growing past the cap.
-        if self._block_buys:
+        # Cancel on the FILLED position, NOT the committed one.
+        #
+        # These are two different jobs and merging them oscillates. The block above is
+        # a placement gate: it stops NEW orders that would breach the cap. Cancelling
+        # because of a commitment would remove the very orders that created it -- next
+        # poll the commitment is gone, the side unblocks, the ladder re-places, and it
+        # blocks again. A loop that burns API calls and never converges.
+        #
+        # So the cancel keeps its original, blunter trigger: the position that has
+        # ALREADY filled is at or past the cap, so pull the pending adds behind it
+        # (AUDIT #138).
+        filled_long_over, _ = self._position_limit_state(long_position, max_position_qty)
+        filled_short_over, _ = self._position_limit_state(short_position, max_position_qty)
+        if filled_long_over:
             self._cancel_resting_orders("buy", "position_limit")
-        if self._block_sells:
+        if filled_short_over:
             self._cancel_resting_orders("sell", "position_limit")
 
         if self._block_buys and not old_block_buys:
             logger.warning(
-                "POSITION LIMIT | long {} >= {} — buy orders blocked",
-                round(long_position, 2), round(max_position_qty, 2),
+                "POSITION LIMIT | long {} (committed {} incl. resting buys) >= {} "
+                "— buy orders blocked",
+                round(long_position, 2), round(committed_long, 2),
+                round(max_position_qty, 2),
             )
         # Rounded to the precision the message itself prints. The cap moves with equity
         # every iteration, so an exact comparison logged BUY SCALE on every single loop
@@ -396,11 +413,44 @@ class GridEngine:
 
         if self._block_sells and not old_block_sells:
             logger.warning(
-                "POSITION LIMIT | short {} >= {} — sell orders blocked",
-                round(short_position, 2), round(max_position_qty, 2),
+                "POSITION LIMIT | short {} (committed {} incl. resting sells) >= {} "
+                "— sell orders blocked",
+                round(short_position, 2), round(committed_short, 2),
+                round(max_position_qty, 2),
             )
         elif round(self._sell_scale, 2) != round(old_sell_scale, 2) and self._sell_scale < 1.0:
             logger.info("SELL SCALE | short={:.1f}/{:.1f} | scale={:.2f}", short_position, max_position_qty, self._sell_scale)
+
+    def _resting_qty(self, side: str) -> float:
+        """Quantity of orders this ladder currently has live on one side."""
+        return sum(l.quantity for l in self.levels
+                   if l.side == side and l.order_id is not None and l.quantity > 0)
+
+    def _committed_exposure(self, long_position: float, short_position: float
+                            ) -> tuple[float, float]:
+        """What each side would hold if every resting order on it filled.
+
+        The cap was enforced against the FILLED position only, so resting orders were
+        invisible to it: six sell rungs of ~125 USDT could sit under a 243 USDT cap
+        and the gate reported "not blocked" until the moment they all filled. On
+        2026-08-20 the ADA short book reached ~1,103 USDT against that 243 cap -- 4.5x
+        over -- and the hard stop closed it for -74.84, which is 105% of the account's
+        entire -71.17 loss for the period. 179 maker grid cycles earned +2.08 in the
+        same window; one uncapped position gave back thirty years of that.
+
+        Cancelling the resting side once blocked (below) is a backstop, not a bound:
+        the overshoot happens BETWEEN the cap being reached and the next poll, and a
+        run through six rungs takes less than one 10s interval.
+
+        One-way netting matters here. A resting sell against an open long REDUCES the
+        position; only the part beyond the long can create short. Counting it as new
+        short would block the exits and weld the position in place, which is the
+        failure the AUDIT #32 break-even rule already produces on its own.
+        """
+        net = long_position - short_position          # signed, + is long
+        committed_long = max(0.0, net + self._resting_qty("buy"))
+        committed_short = max(0.0, self._resting_qty("sell") - net)
+        return committed_long, committed_short
 
     @staticmethod
     def _position_limit_state(current_position: float, max_position_qty: float) -> tuple[bool, float]:
