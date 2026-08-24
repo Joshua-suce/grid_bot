@@ -69,7 +69,41 @@ def _defaults_from_env() -> dict:
         "ema_fast": settings.ema_fast,
         "ema_slow": settings.ema_slow,
         "adx_period": settings.adx_period,
+        # The strategy actually deployed. run_backtest.py never passed this and
+        # backtest.run_backtest defaults use_router to False, so EVERY figure this
+        # tool has ever printed measured the grid ALONE -- not the router the bot
+        # runs. Across four non-overlapping 45-day windows of ADA: grid-only +16.11,
+        # router -96.21. The tool was reporting the wrong strategy by 112 USDT, and
+        # every tuning decision taken from it was taken on the wrong system
+        # (AUDIT #140).
+        "use_router": settings.strategy_mode == "router",
+        "trend_capital_pct": settings.trend_capital_pct,
+        "trend_atr_stop_multiplier": settings.trend_atr_stop_multiplier,
+        "trend_min_hold_seconds": settings.trend_min_hold_seconds,
+        "router_min_regime_seconds": settings.router_min_regime_seconds,
+        "router_handoff_grace_seconds": settings.router_handoff_grace_seconds,
     }
+
+
+def sizing_mismatch(cfg: dict, balance: float) -> tuple:
+    """(backtest notional per order, live notional per order, ratio).
+
+    The harness sizes only by percent of balance. The bot, when CAPITAL_PER_GRID_USDT
+    is set, sizes by a fixed stake times leverage -- and there is no parameter to tell
+    the harness that, so it silently trades a different size than the account does.
+
+    Live that is 0.018 x 4,866 = 87.6 per order against 5.00 x 5 = 25.0, ~3.5x
+    oversized. It does not flip the sign of a result, but it inflates every absolute
+    USDT figure and every fee total -- which is how a 45% "fee share" was read off a
+    run whose fee bill at live sizing is a few USDT. Say so rather than letting the
+    reader assume the numbers are to scale (AUDIT #140).
+    """
+    from config import settings
+    bt = cfg.get("capital_per_grid_pct", 0.018) * balance
+    live = getattr(settings, "capital_per_grid_usdt", 0.0) * getattr(settings, "leverage", 1)
+    if live <= 0:
+        return bt, 0.0, 1.0
+    return bt, live, bt / live
 
 
 # Price/quantity precision, from Binance USDM market metadata. `backtest.py` defaults
@@ -144,6 +178,10 @@ def main() -> None:
     p.add_argument("--csv", default=None, help="Use a local OHLCV csv instead of fetching.")
     p.add_argument("--balance", type=float, default=5000.0)
     p.add_argument("--trend-filter", action="store_true", help="Pause the grid in a confirmed trend.")
+    p.add_argument("--router", dest="router", action="store_true", default=None,
+                   help="Force the grid<->trend router on (default: follow STRATEGY_MODE).")
+    p.add_argument("--no-router", dest="router", action="store_false",
+                   help="Force the router off, measuring the grid alone.")
     p.add_argument("--sweep", default=None, metavar="KEY=v1,v2",
                    help=f"Compare values of one parameter. Sweepable: {', '.join(sorted(SWEEPABLE))}")
     p.add_argument("--robustness", action="store_true",
@@ -163,6 +201,8 @@ def main() -> None:
     symbol = args.symbol or cfg.get("symbol", "DOGEUSDT")
     cfg["symbol"] = symbol
     cfg["use_trend_filter"] = args.trend_filter
+    if args.router is not None:
+        cfg["use_router"] = args.router
     cfg["price_decimals"], cfg["amount_decimals"] = _resolve_precision(symbol, args)
 
     for override in args.set:
@@ -172,7 +212,16 @@ def main() -> None:
     df = load_ohlcv(args.csv) if args.csv else fetch_ohlcv(symbol, args.timeframe, args.days)
     drift = (df["close"].iloc[-1] / df["close"].iloc[0] - 1) * 100
     print(f"\n{symbol} {args.timeframe} | {len(df)} candles | net drift {drift:+.1f}%")
-    print(f"trend filter: {'on' if args.trend_filter else 'off'} | starting balance {args.balance:,.0f}\n")
+    _bt_size, _live_size, _ratio = sizing_mismatch(cfg, args.balance)
+    print(f"strategy: {'ROUTER (grid+trend)' if cfg.get('use_router') else 'grid only'}"
+          f" | trend filter: {'on' if args.trend_filter else 'off'}"
+          f" | starting balance {args.balance:,.0f}")
+    if _live_size > 0 and (_ratio > 1.2 or _ratio < 0.83):
+        print(f"  !! SIZING NOT TO SCALE: this run trades {_bt_size:,.1f} USDT/order, "
+              f"the bot trades {_live_size:,.1f} ({_ratio:.1f}x). Absolute USDT and fee "
+              f"figures are inflated by about that factor; the sign and the win/loss "
+              f"structure are not.")
+    print()
 
     if args.robustness:
         offsets = [50 + i * 6 for i in range(args.offsets)]
