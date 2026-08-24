@@ -848,6 +848,30 @@ def abort_startup(transient: bool) -> NoReturn:
     got it (AUDIT #126).
     """
     raise SystemExit(1 if transient else 0)
+def pnl_divergence(engine_delta: float, account_delta: float,
+                   tolerance: float) -> float:
+    """Gap between what the engine thinks it earned and what the account actually
+    earned, over the SAME interval. Returns 0.0 while within tolerance.
+
+    Deltas, not totals, on purpose. The engine's total_pnl is restored from saved
+    state and spans every session the ladder has run; the reconciler's session figure
+    resets on restart. Comparing totals would report a divergence that is only a
+    difference of window. Comparing what each ACCRUED between two checks is
+    window-independent, and is the thing that can actually be wrong.
+
+    It is wrong, structurally. Forced closes -- the hard stop-market leg, reconcile
+    closes, emergency_stop -- go through exchange.close_position() and never reach
+    _handle_fill, so the engine ledger never books them. 2026-08-20: the -74.84 stop
+    produced no journal row at all, cycle_pnl showed 47 wins and 1 loss for +10.96,
+    and the account was down ~71. Both numbers were already printed in every status
+    line, ten seconds apart, for days, and nothing compared them (AUDIT #139).
+    """
+    if tolerance <= 0:
+        return 0.0
+    gap = engine_delta - account_delta
+    return 0.0 if abs(gap) <= tolerance else gap
+
+
 def account_recheck_due(last_checked: float, now: float, interval: float) -> bool:
     """Is another account-config check owed? interval <= 0 disables it entirely.
 
@@ -1740,6 +1764,7 @@ def run_bot() -> None:
     consecutive_errors = 0
     dormant_since: float | None = None
     account_checked_at = time.time()   # verify_account_config ran during startup
+    pnl_marks: tuple[float, float] | None = None   # (engine_net, account_session)
     dormant_alerted_at = 0.0
     # Bound before the loop: the unrealised figure is now only recomputed when the
     # account was actually readable, so a failed first poll would leave it unset.
@@ -1984,8 +2009,42 @@ def run_bot() -> None:
                     # account because nothing is open yet; killing a running bot that
                     # holds a position is a bigger risk than the mis-sizing it would
                     # avoid. So this is the loudest thing short of acting (AUDIT #137).
-                    if account_recheck_due(account_checked_at, time.time(),
-                                           settings.account_recheck_seconds):
+                    # Does the engine's story match the account's? (AUDIT #139)
+                    _engine_net = grid.total_pnl - grid.total_fees
+                    _account_net = pnl_reconciler.session_pnl
+                    _due = account_recheck_due(account_checked_at, time.time(),
+                                               settings.account_recheck_seconds)
+                    if pnl_marks is None:
+                        pnl_marks = (_engine_net, _account_net)
+                    elif _due:
+                        _engine_moved = _engine_net - pnl_marks[0]
+                        _account_moved = _account_net - pnl_marks[1]
+                        pnl_marks = (_engine_net, _account_net)
+                        _gap = pnl_divergence(_engine_moved, _account_moved,
+                                              settings.pnl_divergence_alert_usdt)
+                        if _gap:
+                            logger.error(
+                                "PNL DIVERGED | since the last check the engine says "
+                                "it earned {:+.2f} and the account says {:+.2f} -- a "
+                                "{:+.2f} gap. Forced closes never reach the engine "
+                                "ledger, so trust account=, not net= (AUDIT #139)",
+                                _engine_moved, _account_moved, _gap,
+                            )
+                            events.risk_check("pnl_divergence", abs(_gap),
+                                              settings.pnl_divergence_alert_usdt,
+                                              "DIVERGED")
+                            try:
+                                notifier.send(
+                                    "&#x26a0; <b>PNL DIVERGED</b>\n"
+                                    f"engine {_engine_moved:+.2f} vs account "
+                                    f"{_account_moved:+.2f} ({_gap:+.2f} gap)\n"
+                                    "The engine does not book forced closes. "
+                                    "Trust the account figure."
+                                )
+                            except Exception:
+                                pass
+
+                    if _due:
                         account_checked_at = time.time()
                         try:
                             _drift = verify_account_config(exchange, settings, balance)

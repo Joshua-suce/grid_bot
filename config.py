@@ -119,6 +119,18 @@ class Settings(BaseSettings):
         ),
     )
 
+    pnl_divergence_alert_usdt: float = Field(
+        default=2.0, ge=0.0,
+        description=(
+            "Alert when the engine's own P&L and the account's reconciled P&L "
+            "disagree by more than this over the same interval. The two numbers "
+            "already sit side by side in every status line -- net= from the engine, "
+            "account= from Binance income -- and nothing compared them: on "
+            "2026-08-20 they read net=2.11 and account=-71.43 for days. Forced "
+            "closes (hard stop, reconcile, emergency) never reach the engine ledger, "
+            "so it reports profit while the account bleeds. 0 disables."
+        ),
+    )
     account_recheck_seconds: float = Field(
         default=900.0, ge=0.0,
         description=(

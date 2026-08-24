@@ -77,12 +77,26 @@ def _recheck_guard() -> "ast.If | None":
     execute.
     """
     tree = ast.parse(textwrap.dedent(inspect.getsource(main_module.run_bot)))
+
+    # A guard may hold its verdict in a variable -- `_due = account_recheck_due(...)`
+    # then `if _due:` -- which is perfectly legitimate. Resolve those, or this test
+    # fails on a refactor while still passing on a genuinely disabled guard.
+    from_call = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "account_recheck_due"):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    from_call.add(t.id)
+
     for node in ast.walk(tree):
         if not isinstance(node, ast.If):
             continue
         called = {c.func.id for c in ast.walk(node.test)
                   if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
-        if "account_recheck_due" in called:
+        names = {n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)}
+        if "account_recheck_due" in called or (names & from_call):
             return node
     return None
 
@@ -100,11 +114,13 @@ def test_the_guard_is_the_call_itself_not_a_disabled_expression():
     not something that merely mentions it."""
     node = _recheck_guard()
     assert node is not None, "no `if` statement guards on account_recheck_due"
-    assert isinstance(node.test, ast.Call), (
-        "the guard condition is not a bare account_recheck_due(...) call -- something "
-        "wraps it, and a wrapper is how a permanently-false guard hides"
+    assert isinstance(node.test, (ast.Call, ast.Name)), (
+        "the guard condition is neither a bare account_recheck_due(...) call nor a "
+        "variable holding one -- something wraps it, and a wrapper is how a "
+        "permanently-false guard hides"
     )
-    assert node.test.func.id == "account_recheck_due"
+    if isinstance(node.test, ast.Call):
+        assert node.test.func.id == "account_recheck_due"
 
 
 def test_the_guarded_body_is_what_verifies_the_account():
@@ -145,34 +161,39 @@ def test_the_loop_slice_is_not_empty():
     assert len(_loop_source()) > 5000
 
 
+def _guard_body() -> str:
+    """Source of the block the recheck guards.
+
+    Read from the AST rather than by slicing N characters after the first mention of
+    account_recheck_due. That slice broke the moment another feature was wired in
+    ahead of it: the first mention became an assignment, and the window no longer
+    reached the block these tests are about.
+    """
+    node = _recheck_guard()
+    assert node is not None, "no recheck guard found"
+    return "\n".join(ast.unparse(stmt) for stmt in node.body)
+
+
 def test_it_alerts_rather_than_aborting_the_running_bot():
     """The deliberate choice. A running bot holds a position; stopping it over a
     settings mismatch trades a known risk for a larger one."""
-    loop = _loop_source()
-    idx = loop.index("account_recheck_due(")
-    window = loop[idx:idx + 2000]
-    assert "ACCOUNT DRIFTED" in window
-    assert "abort_startup" not in window, "a mid-session recheck must not exit"
-    assert "SystemExit" not in window
+    body = _guard_body()
+    assert "ACCOUNT DRIFTED" in body
+    assert "abort_startup" not in body, "a mid-session recheck must not exit"
+    assert "SystemExit" not in body
 
 
 def test_an_unreadable_account_is_not_reported_as_drift():
     """An outage is not a settings change, and the loop has its own machinery for
     outages. Reporting it as drift would cry wolf every interval of a venue problem.
     Same UNKNOWN-is-not-a-verdict discipline as AUDIT #128/#132/#134."""
-    loop = _loop_source()
-    idx = loop.index("account_recheck_due(")
-    window = loop[idx:idx + 2000]
-    assert "ACCOUNT_UNREADABLE" in window
+    assert "ACCOUNT_UNREADABLE" in _guard_body()
 
 
 def test_the_timer_advances_even_when_the_check_fails():
     """Otherwise a raising endpoint turns the recheck into a per-poll retry against
     the account endpoints."""
-    loop = _loop_source()
-    idx = loop.index("account_recheck_due(")
-    window = loop[idx:idx + 600]
-    assert re.search(r"account_checked_at\s*=\s*time\.time\(\)", window), (
+    assert re.search(r"account_checked_at\s*=\s*time\.time\(\)", _guard_body()), (
         "the timestamp is not reset before the check runs"
     )
 
