@@ -448,9 +448,30 @@ class GridEngine:
         failure the AUDIT #32 break-even rule already produces on its own.
         """
         net = long_position - short_position          # signed, + is long
-        committed_long = max(0.0, net + self._resting_qty("buy"))
-        committed_short = max(0.0, self._resting_qty("sell") - net)
-        return committed_long, committed_short
+
+        # ONLY the side that would ADD to the current position is gated. The side that
+        # reduces it is how the position gets closed, and blocking that welds it.
+        #
+        # The first version of this gated both sides on net resting volume, and it
+        # broke the router handoff live on 2026-08-24. router.set_position_limit
+        # deliberately clamps the cap to the open size during a handoff -- "it can
+        # still close through its own levels but cannot open anything new" -- so with
+        # long 114 against a clamped cap of 114 and three sell rungs totalling 338
+        # resting, committed_short came to 224 and the SELL side blocked. The grid
+        # could no longer place the orders that would get it flat, which is precisely
+        # the state the handoff clamp exists to avoid, and the grace expires into the
+        # forced market dump AUDIT #29 measured at -46.16 across 18 handoffs.
+        #
+        # Gating the adding side alone still bounds the 2026-08-20 breach: that was a
+        # SHORT growing through resting sells while already short, so sells were the
+        # adding side and are gated. Overshoot past flat is bounded by the next poll,
+        # when the position has flipped and those sells become the adding side.
+        if net > 0:                                   # long: buys add, sells exit
+            return max(0.0, net + self._resting_qty("buy")), 0.0
+        if net < 0:                                   # short: sells add, buys exit
+            return 0.0, max(0.0, -net + self._resting_qty("sell"))
+        # Flat: either side opens, so both are gated on what they would open.
+        return self._resting_qty("buy"), self._resting_qty("sell")
 
     @staticmethod
     def _position_limit_state(current_position: float, max_position_qty: float) -> tuple[bool, float]:

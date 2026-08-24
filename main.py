@@ -2510,8 +2510,12 @@ def run_bot() -> None:
                 state_mgr.save(state_data)
 
                 logger.info(
-                    "PRICE={} | fills={} | gross={:.2f} fees={:.2f} net={:.2f} | session={:+.2f} "
-                    "account({})={:+.2f} today={:+.2f} | balance_free={:.2f} total_equity={:.2f} | "
+                    # "account(...)=-71.00" was read as a negative BALANCE. It is
+                    # cumulative realised P&L since the PNL epoch -- ten days, of which
+                    # -74.84 is one stop-out on 2026-08-20 -- sitting on the same line
+                    # as an equity of 4,866. Say which is which (AUDIT #144).
+                    "PRICE={} | fills={} | gross={:.2f} fees={:.2f} net={:.2f} | session_pnl={:+.2f} "
+                    "pnl_since({})={:+.2f} today={:+.2f} | balance_free={:.2f} total_equity={:.2f} | "
                     "grid={} | regime={} | spread={:.4f}%",
                     price, grid.total_fills, grid.total_pnl, grid.total_fees,
                     grid.total_pnl - grid.total_fees,

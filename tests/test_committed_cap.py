@@ -76,12 +76,43 @@ def test_a_sell_against_an_open_long_reduces_rather_than_shorts():
     assert committed_long == pytest.approx(1000.0)
 
 
-def test_only_the_part_beyond_the_long_becomes_short():
+def test_the_exit_side_is_not_gated_at_all_while_holding():
+    """Reversed deliberately, after this welded a live grid on 2026-08-24.
+
+    This used to assert that resting sells beyond the long counted as committed short
+    (1500 resting - 1000 long = 500). That is arithmetically true and operationally
+    fatal: the gate then BLOCKS the sell side, and sells are how a long gets closed.
+
+    router.set_position_limit clamps the cap to the open size during a handoff so the
+    outgoing strategy "can still close through its own levels but cannot open anything
+    new". With long 114 against a clamped cap of 114 and 338 of resting sells, the old
+    rule computed 224 >= 114 and blocked the exits -- the grid could not work itself
+    flat, and the grace expires into the forced market dump AUDIT #29 measured at
+    -46.16 across 18 handoffs.
+
+    Only the side that ADDS is gated now. Overshoot past flat is bounded by the next
+    poll, when the position has flipped and that side becomes the adding one.
+    """
     g = _grid([_resting("sell", 1500)])
 
     _, committed_short = g._committed_exposure(1000.0, 0.0)
 
-    assert committed_short == pytest.approx(500.0)
+    assert committed_short == 0.0, "the exit side is gated, which welds the position"
+
+
+def test_the_live_handoff_weld_does_not_recur():
+    """The exact 2026-08-24 state: long 114, cap clamped to 114 by the handoff, three
+    sell rungs of 113/113/112 resting."""
+    g = _grid([_resting("sell", 113, oid="a"), _resting("sell", 113, oid="b"),
+               _resting("sell", 112, oid="c")])
+
+    g.set_position_limit(114.0, 0.0, 114.0)
+
+    assert g._block_sells is False, (
+        "the grid cannot place the sells that would get it flat -- the handoff then "
+        "expires into a forced market close"
+    )
+    assert g._block_buys is True, "it must still refuse to grow the long"
 
 
 def test_resting_buys_add_to_the_long_side():
@@ -213,3 +244,30 @@ def test_the_two_triggers_are_genuinely_different():
     g.set_position_limit(0.0, 10.0, 1000.0)   # filled tiny, committed enormous
 
     assert g._block_sells is True and spy.cancelled == []
+
+
+# ------------------------------------------------- flat is where the ladder opens
+def test_a_flat_ladder_is_gated_on_what_its_resting_orders_would_open():
+    """M4: returning (0, 0) when flat left every other test in this file green.
+
+    Flat is not a safe state to leave ungated -- it is the state the opening ladder
+    starts from. AUDIT #138's breach began at flat: rungs went out, filled, and the
+    short ran to ~1,103 against a 243 cap. From flat either side opens, so both are
+    gated on the volume they would open.
+    """
+    g = _grid([_resting("buy", 600, oid="a"), _resting("sell", 900, oid="b")])
+
+    committed_long, committed_short = g._committed_exposure(0.0, 0.0)
+
+    assert committed_long == pytest.approx(600.0)
+    assert committed_short == pytest.approx(900.0)
+
+
+def test_a_flat_opening_ladder_over_the_cap_is_blocked_on_both_sides():
+    """The end-to-end shape of the same mutant, through the public gate."""
+    g = _grid([_resting("buy", 600, oid="a"), _resting("sell", 900, oid="b")])
+
+    g.set_position_limit(0.0, 0.0, 500.0)
+
+    assert g._block_buys is True, "a flat ladder committed 600 under a 500 cap"
+    assert g._block_sells is True, "a flat ladder committed 900 under a 500 cap"
