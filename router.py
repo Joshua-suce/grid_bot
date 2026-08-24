@@ -508,6 +508,19 @@ class StrategyRouter:
     def reset_trailing(self) -> None:
         self.strategy.reset_trailing()
 
+    def detect_external_close(self, price: float) -> dict | None:
+        """Delegate to the live strategy, like every other protocol member.
+
+        Explicit rather than left to __getattr__ because the router is checked against
+        the Strategy protocol by isinstance, and a member that only resolves through
+        delegation does not satisfy it -- tests/test_router.py caught exactly that
+        when this was added (AUDIT #143).
+
+        The active strategy is the right one to ask: one-way mode means a single net
+        position and whichever strategy is live owns it.
+        """
+        return self.strategy.detect_external_close(price)
+
     def reconcile_state(self) -> None:
         self.strategy.reconcile_state()
 

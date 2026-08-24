@@ -797,6 +797,75 @@ class GridEngine:
                 return self.POSITIONS_HOLDS, positions
         return self.POSITIONS_FLAT, positions
 
+    def detect_external_close(self, price: float) -> dict | None:
+        """The exchange closed our position and nothing told the ledger.
+
+        The hard stop-market leg fires ON THE EXCHANGE. The bot never initiates it, so
+        it never passes through _handle_fill: the ledger keeps a position that no
+        longer exists, total_pnl never books the loss, and no journal row is written.
+
+        2026-08-20, from the Binance execution ledger: stop_hard was 6 taker
+        executions for -76.98, one of them -74.84 -- 105% of the account's entire
+        -71.17 for the period. cycle_pnl for the same window showed 47 wins, 1 loss
+        and +10.96, and the -74.84 produced no row at all. Meanwhile the phantom
+        position stayed on the books, where the next fill gets priced against it
+        (AUDIT #143).
+
+        reconcile_position_entry cannot cover this: it returns early when the exchange
+        reads flat, because adopting "flat" was the AUDIT #80 hazard. So flat is
+        handled here instead, and only when CORROBORATED by a second read -- one bad
+        HTTP reply must not book a close that never happened (AUDIT #134's rule).
+
+        Returns a fill-shaped dict so the caller journals it exactly like any other
+        fill, or None when there is nothing to report. `profit` is an ESTIMATE priced
+        at `price`: detection happens within a poll of the close, but the exact exit
+        is the exchange's and only the income reconciler knows it. The estimate makes
+        total_pnl approximately right instead of definitely wrong, and AUDIT #139's
+        divergence alarm still watches the gap.
+        """
+        if abs(self._pos_qty) <= 1e-9 or price <= 0:
+            return None
+
+        state, _ = self._read_positions()
+        if state != self.POSITIONS_FLAT:
+            return None
+        second, _ = self._read_positions()
+        if second != self.POSITIONS_FLAT:
+            logger.warning(
+                "EXTERNAL CLOSE UNCONFIRMED | first read flat, second said {} -- "
+                "keeping the ledger of {} (AUDIT #143)", second, round(self._pos_qty, 4),
+            )
+            return None
+
+        qty, entry = self._pos_qty, self._pos_entry
+        # Long closes by selling, short closes by buying.
+        side = "sell" if qty > 0 else "buy"
+        profit = (price - entry) * qty if entry > 0 else 0.0
+
+        logger.error(
+            "EXTERNAL CLOSE | the exchange closed {} {} @ entry {} and the ladder was "
+            "never told -- booking an estimated {:+.4f} at {} and clearing the ledger. "
+            "A stop leg firing is the usual cause (AUDIT #143)",
+            "LONG" if qty > 0 else "SHORT", round(abs(qty), 4), round(entry, 8),
+            profit, price,
+        )
+        self.total_fills += 1
+        self.total_completed_cycles += 1
+        self.total_pnl += profit
+        self.seed_position(0.0, 0.0)
+        if self._event_journal:
+            self._event_journal.risk_check("external_close", abs(profit), 0.0, "BOOKED")
+        return {
+            "price": price,
+            "side": side,
+            "quantity": abs(qty),
+            "profit": profit,
+            "fee": 0.0,          # the taker fee is the exchange's; the reconciler has it
+            "completed_cycle": True,
+            "external": True,
+            "estimated": True,
+        }
+
     def _seed_position_from_exchange(self) -> None:
         """Adopt whatever the account already holds before trading starts.
 

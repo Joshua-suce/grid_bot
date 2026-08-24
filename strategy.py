@@ -173,6 +173,19 @@ class Strategy(Protocol):
 
     # --- reconciliation ----------------------------------------------------
 
+    def detect_external_close(self, price: float) -> dict | None:
+        """Book a position the EXCHANGE closed, which never passed through a fill.
+
+        A stop-market leg fires on the venue; the bot never initiates it, so nothing
+        in the fill path sees it. Every strategy that can hold a position needs an
+        answer here, because main.py calls it on whichever one is live -- and a
+        member that resolves on the grid but not the trend follower is an
+        AttributeError every iteration in router mode (AUDIT #143).
+
+        Returns a fill-shaped dict, or None when there is nothing to report.
+        """
+        ...
+
     def reconcile_state(self) -> None:
         """Verify tracked orders still exist on the exchange; repair what drifted."""
         ...

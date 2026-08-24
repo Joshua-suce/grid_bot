@@ -675,6 +675,64 @@ class TrendFollower:
             "reason": "take_profit",
         }
 
+    def detect_external_close(self, price: float) -> dict | None:
+        """The venue closed this position and nothing told the follower.
+
+        Same gap as the grid's (AUDIT #143), and the follower is exposed to it more:
+        main.py arms a hard stop leg for every trend position, so the venue closing
+        one is the NORMAL exit, not an edge case. reconcile_positions already clears
+        the tracked side when the account reads flat -- but it only clears, it never
+        books the P&L, so total_pnl kept counting a position that had been stopped
+        out.
+
+        Corroborated by a second read, for the same reason as everywhere else: one
+        bad HTTP reply must not book a close that did not happen.
+        """
+        if self._side is None or self._qty <= 0 or price <= 0:
+            return None
+
+        live = self._live_position_qty()
+        if live is None or live > 0:
+            return None
+        second = self._live_position_qty()
+        if second is None or second > 0:
+            logger.warning(
+                "TREND EXTERNAL CLOSE UNCONFIRMED | first read flat, second did not "
+                "agree -- keeping the tracked {} {} (AUDIT #143)", self._side, self._qty,
+            )
+            return None
+
+        qty, entry, side = self._qty, self._entry_price, self._side
+        direction = 1.0 if side == "long" else -1.0
+        profit = (price - entry) * qty * direction if entry > 0 else 0.0
+
+        logger.error(
+            "TREND EXTERNAL CLOSE | the venue closed {} {} @ entry {} and the follower "
+            "was never told -- booking an estimated {:+.4f} at {} (AUDIT #143)",
+            side.upper(), qty, entry, profit, price,
+        )
+        self.total_fills += 1
+        self.total_completed_cycles += 1
+        self.total_pnl += profit
+        self._disarm_take_profit("external_close")
+        self._side = None
+        self._entry_price = 0.0
+        self._qty = 0.0
+        self._entry_time = 0.0
+        self._initial_risk = 0.0
+        self._take_profit_price = None
+        self.reset_trailing()
+        return {
+            "price": price,
+            "side": "sell" if side == "long" else "buy",
+            "quantity": abs(qty),
+            "profit": profit,
+            "fee": 0.0,
+            "completed_cycle": True,
+            "external": True,
+            "estimated": True,
+        }
+
     def _live_position_qty(self) -> float | None:
         """Absolute size of this symbol's net position, or None if unreadable.
 

@@ -2173,6 +2173,26 @@ def run_bot() -> None:
                             logger.error("DORMANT WITH EXPOSURE | restarting to re-lay the ladder")
                             raise SystemExit(1)
                     fills = grid.check_fills(balance, open_orders=open_orders)
+
+                    # A stop leg that fired on the exchange never passes through
+                    # check_fills, so the ladder keeps a position that no longer
+                    # exists and the loss is never booked. On 2026-08-20 the -74.84
+                    # that was 105% of the period's loss produced no journal row at
+                    # all. Prepended so it is journalled ahead of anything the ladder
+                    # did afterwards (AUDIT #143).
+                    _closed = grid.detect_external_close(price)
+                    if _closed:
+                        fills = [_closed] + list(fills)
+                        try:
+                            notifier.send(
+                                "&#x26a0; <b>POSITION CLOSED BY THE EXCHANGE</b>\n"
+                                f"{_closed['quantity']:.1f} {settings.symbol} "
+                                f"@ ~{_closed['price']}\n"
+                                f"Estimated {_closed['profit']:+.2f} USDT. A stop leg "
+                                "firing is the usual cause."
+                            )
+                        except Exception:
+                            pass
                     if fills:
                         # Pull Binance's actual income ledger once per batch of fills so the
                         # PnL figures below reflect the exchange's own accounting rather than
