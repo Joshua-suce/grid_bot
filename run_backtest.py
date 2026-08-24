@@ -85,6 +85,38 @@ def _defaults_from_env() -> dict:
     }
 
 
+ROBUSTNESS_WARMUP = 50
+
+
+def disjoint_windows(n_candles: int, count: int, warmup: int = ROBUSTNESS_WARMUP
+                     ) -> list:
+    """Non-overlapping [start, end) slices, each able to absorb a warmup and trade.
+
+    --robustness did not test robustness. It shifted the START by 6 candles per run
+    via the warmup and never moved the end: 12 runs over 4,320 candles moved the start
+    66 candles -- 2.75 days of 180 -- and shared about 98.5% of their data. Twelve
+    views of one window reported as twelve trials, under a flag whose own help says
+    "Do this before believing any single result."
+
+    Every verdict this tool has issued rested on that, in BOTH directions: the
+    "indistinguishable from chance" readings and the configurations that appeared to
+    survive. A spread measured across 98.5%-identical data understates the real
+    variance, so it makes weak edges look robust -- exactly backwards from what the
+    flag promises (AUDIT #141).
+
+    Disjoint windows share nothing. Fewer trials, each of which is actually a trial.
+    """
+    if count < 2:
+        raise ValueError("robustness needs at least 2 windows")
+    size = n_candles // count
+    if size <= warmup * 2:
+        raise ValueError(
+            f"{count} windows of {size} candles cannot each absorb a {warmup}-candle "
+            f"warmup and still trade -- use fewer windows or more data"
+        )
+    return [(i * size, (i + 1) * size) for i in range(count)]
+
+
 def sizing_mismatch(cfg: dict, balance: float) -> tuple:
     """(backtest notional per order, live notional per order, ratio).
 
@@ -185,9 +217,14 @@ def main() -> None:
     p.add_argument("--sweep", default=None, metavar="KEY=v1,v2",
                    help=f"Compare values of one parameter. Sweepable: {', '.join(sorted(SWEEPABLE))}")
     p.add_argument("--robustness", action="store_true",
-                   help="Rerun across start offsets and report mean/stdev. Do this before "
-                        "believing any single result.")
-    p.add_argument("--offsets", type=int, default=12, help="Number of start offsets for --robustness.")
+                   help="Rerun across NON-OVERLAPPING windows and report mean/stdev. "
+                        "Do this before believing any single result.")
+    p.add_argument("--windows", type=int, default=4,
+                   help="Number of non-overlapping windows for --robustness (default 4).")
+    p.add_argument("--offsets", type=int, default=None,
+                   help="Deprecated alias for --windows. The old start-offset mode "
+                        "shared ~98.5%% of its data between runs and did not measure "
+                        "robustness at all.")
     p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                    help="Override any sweepable parameter, repeatable.")
     p.add_argument("--price-decimals", type=int, default=None,
@@ -224,25 +261,41 @@ def main() -> None:
     print()
 
     if args.robustness:
-        offsets = [50 + i * 6 for i in range(args.offsets)]
+        count = args.offsets if args.offsets is not None else args.windows
+        if args.offsets is not None:
+            print("  note: --offsets is a deprecated alias for --windows. The old "
+                  "start-offset mode shared ~98.5% of its data between runs.")
+        try:
+            windows = disjoint_windows(len(df), count)
+        except ValueError as exc:
+            print(f"  cannot run robustness: {exc}")
+            return
+        size = windows[0][1] - windows[0][0]
         nets = []
-        for w in offsets:
-            nets.append(run_backtest(df, starting_balance=args.balance, warmup=w, **cfg).net_pnl)
+        for a, b in windows:
+            nets.append(run_backtest(df.iloc[a:b], starting_balance=args.balance,
+                                     warmup=ROBUSTNESS_WARMUP, **cfg).net_pnl)
         mean = statistics.mean(nets)
         sd = statistics.stdev(nets) if len(nets) > 1 else 0.0
         ratio = mean / sd if sd else float("inf")
-        print(f"ROBUSTNESS over {len(offsets)} start offsets (config otherwise identical)")
+        print(f"ROBUSTNESS over {len(windows)} NON-OVERLAPPING windows of {size} "
+              f"candles (0% shared data)")
+        for i, net in enumerate(nets):
+            print(f"  window {i + 1}      {net:+10.2f}")
         print(f"  mean net       {mean:+10.2f}")
         print(f"  stdev          {sd:10.2f}")
         print(f"  range          {min(nets):+.2f} .. {max(nets):+.2f}")
         print(f"  positive runs  {sum(1 for x in nets if x > 0)}/{len(nets)}")
         print(f"  mean / stdev   {ratio:10.2f}")
+        print()
         if abs(ratio) < 0.5:
-            print("\n  VERDICT: indistinguishable from chance. Shifting the start candle moves")
-            print("  the result more than this configuration's supposed edge. Do not tune on it.")
+            print("  VERDICT: indistinguishable from chance. The window you happen to")
+            print("  measure moves the result more than this configuration's supposed")
+            print("  edge. Do not tune on it.")
         else:
-            print("\n  VERDICT: signal exceeds the noise floor on this data. Still confirm on a")
-            print("  different symbol and period before trusting it.")
+            print("  VERDICT: signal exceeds the noise floor on this data. With only")
+            print(f"  {len(windows)} independent windows this is weak evidence -- confirm")
+            print("  on a different symbol and period before trusting it.")
         return
 
     if args.sweep:
