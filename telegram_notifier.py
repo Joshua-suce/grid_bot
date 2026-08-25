@@ -229,30 +229,31 @@ class TelegramNotifier:
 
     def on_fill(
         self, side: str, price: float, pnl: float, fill_count: int, daily_pnl: float = 0.0,
+        total_pnl_verified: float | None = None,
         session_pnl: float | None = None,
+        pnl_window: str | None = None,
     ) -> None:
-        """A FILL message. Cycle/daily/session PnL only -- see AUDIT #153.
+        """A FILL message. Carries the account-wide rolling figure again -- AUDIT #154.
 
-        This used to also append _pnl_lines' account-wide "Account (Nd rolling, all
-        activity): X USDT" line, correctly labelled per AUDIT #59. But a fill fires on
-        every single trade -- 49 of them by early afternoon in one session -- and a
-        large negative account figure sitting right under "Cycle PnL: +0.85" that many
-        times a day reads as the account being negative no matter how precisely the
-        fine print underneath disagrees. #59's actual problem -- the account figure
-        needs to be visible somewhere, not hidden -- is still solved by
-        on_startup_summary, which shows it once per bot start instead of once per
-        trade.
+        AUDIT #153 dropped this to cut down on how often the large, correctly-labelled
+        but easily-misread account total appeared (a fill fires on every trade -- 49 of
+        them by early afternoon in one session). That reading was requested back by the
+        bot's own operator after seeing it live: the account figure being absent from
+        the message that fires on every trade read as losses being hidden, which is a
+        worse outcome than the one #153 was fixing. #59's original point -- the account
+        figure has to be labelled as the account's, not the bot's -- still holds; it's
+        just back on every fill instead of only on startup.
         """
         emoji = "&#x1f7e2;" if side == "sell" else "&#x1f534;"
         price_str = f"{price:.8f}".rstrip("0").rstrip(".")
-        session_line = _pnl_lines(session_pnl, None)
+        verified_line = _pnl_lines(session_pnl, total_pnl_verified, pnl_window or _DEFAULT_WINDOW)
         self.send(
             f"{emoji} <b>FILL #{fill_count}</b>\n"
             f"Side: {side.upper()}\n"
             f"Price: {price_str}\n"
             f"Cycle PnL: {pnl:.4f} USDT\n"
             f"Daily PnL: {daily_pnl:.4f} USDT"
-            f"{session_line}"
+            f"{verified_line}"
         )
 
     def on_trend_pause(self, regime: str, adx: float) -> None:

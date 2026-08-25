@@ -2215,7 +2215,9 @@ def run_bot() -> None:
                         fee = fill["fee"]
                         notifier.on_fill(
                             fill["side"], fill["price"], profit, grid.total_fills, pnl_reconciler.daily_net_pnl,
+                            total_pnl_verified=pnl_reconciler.net_realized_pnl,
                             session_pnl=pnl_reconciler.session_pnl,
+                            pnl_window=pnl_reconciler.window_label,
                         )
                         events.fill(
                             symbol=settings.symbol,

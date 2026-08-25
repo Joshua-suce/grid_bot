@@ -89,32 +89,28 @@ def test_balance_update_reads_unambiguous_even_when_account_pnl_is_negative():
     assert "+" not in message
 
 
-def test_fill_carries_no_account_wide_pnl_figure():
-    """AUDIT #153. A FILL message fires on every single trade -- 49 of them by early
-    afternoon in one real session -- so a large negative "Account (Nd rolling, all
-    activity)" figure sitting under a small positive "Cycle PnL" that many times a
-    day reads as the account being negative, no matter how correctly it is labelled.
-    Fixing this once on BALANCE (AUDIT #147) was not enough; the same figure kept
-    showing up here, at far higher frequency.
+def test_fill_carries_the_account_wide_pnl_figure_again():
+    """AUDIT #154. #153 dropped the account-wide figure from FILL to cut down how
+    often the easily-misread total appeared. Requested back by the bot's operator
+    after seeing it live: its absence from the message that fires on every trade
+    read as losses being hidden, which is worse than the noise #153 was fixing.
     """
     n = RecordingNotifier()
     n.on_fill(side="buy", price=0.2198, pnl=0.8532, fill_count=46, daily_pnl=1.2726,
-              session_pnl=0.8532)
+              total_pnl_verified=-69.48, session_pnl=0.8532, pnl_window="89d rolling")
     assert len(n.messages) == 1
     message = n.messages[0]
     assert "FILL #46" in message
     assert "Cycle PnL: 0.8532 USDT" in message
     assert "Daily PnL: 1.2726 USDT" in message
     assert "This run: +0.8532 USDT" in message
-    assert "Account (" not in message, "cumulative account PnL has no place on every fill"
+    assert "Account (89d rolling, all activity): -69.4800 USDT" in message
 
 
-def test_fill_reads_unambiguous_even_when_account_pnl_is_deeply_negative():
-    """The exact live scenario: a small, real, positive cycle profit must not be
-    buried under a large negative figure describing something else entirely."""
+def test_fill_falls_back_to_the_default_window_label_when_none_is_given():
     n = RecordingNotifier()
     n.on_fill(side="buy", price=0.2198, pnl=0.8532, fill_count=46, daily_pnl=1.2726,
-              session_pnl=0.8532)
+              total_pnl_verified=-69.48, session_pnl=0.8532)
     message = n.messages[0]
-    assert "-69" not in message
-    assert "-68" not in message
+    assert "Account (" in message
+    assert "rolling, all activity): -69.4800 USDT" in message
