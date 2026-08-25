@@ -76,6 +76,11 @@ class TrendFollower:
     _regime_confirmed = False
     _last_handoff_accel_time = 0.0
     HANDOFF_ACCEL_COOLDOWN_SECONDS = 60.0
+    # True once accelerate_handoff_exit has repriced/manufactured a take-profit for
+    # a handoff that has not yet completed. handoff_cancelled() reads this to know
+    # whether there is anything to undo (AUDIT #151).
+    _handoff_accel_active = False
+    _handoff_accel_pre_price = None
     """Holds at most one position, in the direction of the prevailing regime.
 
     Implements the `Strategy` protocol, plus no-op equivalents of the grid-specific
@@ -162,6 +167,8 @@ class TrendFollower:
         self._tp_retry_after = 0.0
         self._tp_band_deferred = False
         self._last_handoff_accel_time = 0.0
+        self._handoff_accel_active = False
+        self._handoff_accel_pre_price = None
 
         # --- stops (ratcheted, see update_trailing_sl) ---
         self._peak_price = 0.0
@@ -457,6 +464,10 @@ class TrendFollower:
         add to the position), and the unconfirmed-cancel contract (a cancel that
         cannot be confirmed keeps the old target claimed rather than risking two
         resting at once).
+
+        Remembers the target this replaces (the FIRST one, if this fires more than
+        once while one handoff waits) so handoff_cancelled() can put it back if the
+        handoff this was accelerating for never actually completes (AUDIT #151).
         """
         if self._side is None or self._qty <= 0 or self._entry_price <= 0:
             return False                          # already flat -- the handoff completes on its own
@@ -481,6 +492,9 @@ class TrendFollower:
         if not self._disarm_take_profit("handoff_accel"):
             return False                          # unconfirmed cancel -- stays claimed, retried later
 
+        if not self._handoff_accel_active:
+            self._handoff_accel_active = True
+            self._handoff_accel_pre_price = old_price
         self._take_profit_price = target
         self._tp_retry_after = 0.0
         logger.warning(
@@ -491,6 +505,41 @@ class TrendFollower:
         )
         self._arm_take_profit(self._qty)
         return True
+
+    def handoff_cancelled(self) -> None:
+        """Undo whatever accelerate_handoff_exit did, for a handoff that never
+        actually completed (AUDIT #151).
+
+        router.py cancels a pending handoff outright when the regime returns to the
+        strategy already trading -- cheaper than completing a switch it would only
+        reverse. But accelerate_handoff_exit can have already reset the take-profit
+        to break-even-or-better, or (trend_take_profit_r defaults to 0.0: no target
+        at all) manufactured one that did not exist before. Nothing told the
+        strategy the handoff it did that FOR was called off, so the accelerated
+        target survived and permanently capped a position that was supposed to keep
+        riding the trend uncapped.
+
+        Restores whatever the target was before the FIRST acceleration this handoff
+        (not the last -- accelerate_handoff_exit can fire more than once while one
+        handoff waits), including back to no target at all.
+        """
+        if not self._handoff_accel_active:
+            return
+        restore_to = self._handoff_accel_pre_price
+        self._handoff_accel_active = False
+        self._handoff_accel_pre_price = None
+        if self._take_profit_price == restore_to:
+            return                                # nothing actually changed since
+        self._disarm_take_profit("handoff_cancelled")
+        self._take_profit_price = restore_to
+        self._tp_retry_after = 0.0
+        logger.info(
+            "HANDOFF ACCEL UNDONE | take-profit restored to {} -- the handoff that "
+            "accelerated it never completed (AUDIT #151)",
+            restore_to if restore_to is not None else "none",
+        )
+        if restore_to is not None:
+            self._arm_take_profit(self._qty)
 
     # --- trading -----------------------------------------------------------
 
@@ -663,6 +712,10 @@ class TrendFollower:
         self._entry_time = time.time()
         self._order_id = None
         self.total_fills += 1
+        # A fresh trade's target is unrelated to whatever the last one's handoff
+        # acceleration was mid-undo -- nothing left to restore FOR this trade.
+        self._handoff_accel_active = False
+        self._handoff_accel_pre_price = None
 
         # Anchor the ratchet at entry so the first stop is a real level, not zero.
         self._peak_price = price

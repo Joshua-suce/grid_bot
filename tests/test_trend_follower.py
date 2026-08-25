@@ -640,3 +640,82 @@ def test_an_unconfirmed_cancel_keeps_the_target_claimed():
     assert tf._tp_order_id == "live-order"
     assert tf._take_profit_price == 0.2450
     assert ex.placed == []
+
+
+# --------------------------------------------------- undoing on cancellation (#151)
+def test_a_manufactured_target_is_removed_when_the_handoff_is_cancelled():
+    """trend_take_profit_r=0.0 is the documented common case: no target at all.
+    accelerate_handoff_exit manufactures one to give a stuck handoff something to
+    close through. If the handoff that motivated it never completes, the manufactured
+    target must not silently outlive it -- the position goes back to riding the
+    trailing stop with no cap, exactly as take_profit_r=0.0 promises."""
+    tf, ex = positioned(tp=None, tp_order_id=None, take_profit_r=0.0)
+    assert tf.accelerate_handoff_exit(0.2182, balance=4866.53) is True
+    assert tf._take_profit_price is not None
+    placed_before = len(ex.placed)
+
+    tf.handoff_cancelled()
+
+    assert tf._take_profit_price is None
+    assert tf._tp_order_id is None
+    assert "old-tp" not in ex.cancelled  # sanity: this run never had one
+    assert len(ex.placed) == placed_before, "must not arm a fresh target at None"
+
+
+def test_a_repriced_target_is_restored_to_its_original_price_on_cancellation():
+    """The other case: a real target already existed (take_profit_r > 0) and
+    accelerate_handoff_exit only pulled it closer to market. Cancelling the handoff
+    must put it back at its ORIGINAL price, not just remove it."""
+    tf, ex = positioned(tp=0.2450, tp_order_id="old-tp")
+    assert tf.accelerate_handoff_exit(0.2182, balance=4866.53) is True
+    assert tf._take_profit_price != 0.2450
+
+    tf.handoff_cancelled()
+
+    assert tf._take_profit_price == 0.2450
+    assert tf._tp_order_id is not None, "the restored target must be resting again"
+
+
+def test_only_the_first_acceleration_this_handoff_is_the_restore_point():
+    """accelerate_handoff_exit can fire more than once while one handoff waits (the
+    cooldown just spaces the calls out) -- cancellation must restore the price from
+    BEFORE THE FIRST call, not merely undo the last one."""
+    tf, ex = positioned(tp=0.2450, tp_order_id="old-tp")
+    assert tf.accelerate_handoff_exit(0.2182, balance=4866.53) is True
+    first_target = tf._take_profit_price
+    assert first_target != 0.2450
+
+    # Force a second acceleration past the cooldown, further toward market.
+    tf._last_handoff_accel_time = 0.0
+    tf._entry_price = 0.2179
+    assert tf.accelerate_handoff_exit(0.2176, balance=4866.53) is True
+    assert tf._take_profit_price != first_target
+
+    tf.handoff_cancelled()
+
+    assert tf._take_profit_price == 0.2450, (
+        "restored the intermediate price instead of the one before any acceleration"
+    )
+
+
+def test_handoff_cancelled_is_a_no_op_when_nothing_was_ever_accelerated():
+    tf, ex = positioned(tp=0.2450, tp_order_id="old-tp")
+
+    tf.handoff_cancelled()
+
+    assert tf._take_profit_price == 0.2450
+    assert tf._tp_order_id == "old-tp"
+    assert ex.cancelled == []
+
+
+def test_a_fresh_entry_clears_any_pending_undo_state():
+    """A new trade's target has nothing to do with a previous trade's handoff
+    acceleration -- a stale _handoff_accel_active must not carry over."""
+    tf, ex = positioned(tp=0.2450, tp_order_id="old-tp")
+    assert tf.accelerate_handoff_exit(0.2182, balance=4866.53) is True
+    assert tf._handoff_accel_active is True
+
+    tf._record_entry({"side": "buy", "average": 0.0720, "filled": 100.0})
+
+    assert tf._handoff_accel_active is False
+    assert tf._handoff_accel_pre_price is None

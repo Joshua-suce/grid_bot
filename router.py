@@ -180,6 +180,7 @@ class StrategyRouter:
                 )
                 self._handoff_target = None
                 self._handoff_started = 0.0
+                self._undo_handoff_acceleration()
             return
 
         now = time.time()
@@ -398,10 +399,11 @@ class StrategyRouter:
         just idling until the grace clock forces a market close.
 
         This reaches for the method with getattr rather than adding it to the Strategy
-        protocol: it moves a resting ladder rung, and strategy.py deliberately keeps
-        ladder-shaped members (`recenter`, `levels`, ...) out of the protocol because
-        they mean nothing to a strategy that is not a grid. A strategy without one has
-        nothing here to accelerate, and that is fine (AUDIT #145).
+        protocol: GridEngine reprices a resting ladder rung and TrendFollower reprices
+        (or arms from nothing) a single take-profit target -- different shapes on
+        different strategies, exactly the sort of member strategy.py deliberately keeps
+        out of the protocol (`recenter`, `levels`, ...). A strategy without one has
+        nothing here to accelerate, and that is fine (AUDIT #145, #148).
         """
         accelerate = getattr(self.strategy, "accelerate_handoff_exit", None)
         if accelerate is None or self.exchange is None:
@@ -411,6 +413,30 @@ class StrategyRouter:
             accelerate(price, self._current_balance())
         except Exception as e:
             logger.debug("ROUTER | handoff acceleration skipped ({})", e)
+
+    def _undo_handoff_acceleration(self) -> None:
+        """A handoff that gets cancelled must not leave a lasting mark on the
+        strategy it never actually left.
+
+        _accelerate_outgoing_exit can reprice an exit closer to market -- or, for
+        TrendFollower with no target configured (trend_take_profit_r=0.0, the
+        default: "ride the trailing stop, no target"), MANUFACTURE one that did not
+        exist before. If the regime that triggered the handoff flaps back before it
+        completes, the switch above is cancelled and nothing ever told the strategy
+        to give that up: the manufactured target survives, silently capping a
+        position that was supposed to ride the trend uncapped for the rest of the
+        trade (AUDIT #151).
+
+        Same getattr reasoning as _accelerate_outgoing_exit: only a strategy that
+        implements acceleration has anything here to undo.
+        """
+        undo = getattr(self.strategy, "handoff_cancelled", None)
+        if undo is None:
+            return
+        try:
+            undo()
+        except Exception as e:
+            logger.debug("ROUTER | handoff-acceleration undo skipped ({})", e)
 
     @property
     def handoff_in_progress(self) -> bool:

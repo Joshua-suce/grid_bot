@@ -574,6 +574,61 @@ def test_acceleration_is_not_offered_once_the_handoff_completes():
     assert len(grid.accel_calls) == calls_before, "accelerated an exit after going flat"
 
 
+class TrendExchange:
+    """Enough surface for a real TrendFollower to hold a position and trade against,
+    wired through a real StrategyRouter. Shared by every test that needs the real
+    class instead of a fake with a deliberately-present accelerate_handoff_exit."""
+    def __init__(self):
+        self.price = 0.2182
+        self.positions: list[dict] = []
+        self._orders: dict[str, dict] = {}
+        self._next = 0
+
+        class _inner:
+            @staticmethod
+            def price_to_precision(symbol, price):
+                return f"{float(price):.5f}"
+
+            @staticmethod
+            def amount_to_precision(symbol, amount):
+                return f"{float(amount):.0f}"
+
+        self.exchange = _inner()
+
+    def get_price(self, symbol):
+        return self.price
+
+    def get_positions(self, symbol):
+        return self.positions
+
+    def get_balance(self):
+        return 4866.53
+
+    def get_open_order_ids(self, symbol):
+        return {i for i, o in self._orders.items() if o["status"] == "open"}
+
+    def fetch_order(self, order_id, symbol):
+        return self._orders.get(order_id)
+
+    def cancel_order(self, order_id, symbol):
+        if order_id in self._orders:
+            self._orders[order_id]["status"] = "canceled"
+        return True
+
+    def place_limit_order(self, symbol, side, price, amount, max_attempts=3,
+                           params=None, post_only=True, allow_taker_fallback=False):
+        self._next += 1
+        oid = f"o{self._next}"
+        order = {"id": oid, "side": side, "price": price, "amount": amount,
+                 "filled": 0.0, "average": price, "status": "open"}
+        self._orders[oid] = order
+        return order
+
+    def close_position(self, symbol, side, amount, max_attempts=None):
+        self.positions = []
+        return True
+
+
 def test_the_real_trend_follower_is_actually_reached():
     """AUDIT #148. Every test above proves the WIRING with a fake that deliberately
     has accelerate_handoff_exit -- the actual regression was that the real trend
@@ -587,57 +642,6 @@ def test_the_real_trend_follower_is_actually_reached():
     repriced during the deferred tick -- not a stand-in that only proves the router
     calls something.
     """
-    class TrendExchange:
-        def __init__(self):
-            self.price = 0.2182
-            self.positions: list[dict] = []
-            self._orders: dict[str, dict] = {}
-            self._next = 0
-
-            class _inner:
-                @staticmethod
-                def price_to_precision(symbol, price):
-                    return f"{float(price):.5f}"
-
-                @staticmethod
-                def amount_to_precision(symbol, amount):
-                    return f"{float(amount):.0f}"
-
-            self.exchange = _inner()
-
-        def get_price(self, symbol):
-            return self.price
-
-        def get_positions(self, symbol):
-            return self.positions
-
-        def get_balance(self):
-            return 4866.53
-
-        def get_open_order_ids(self, symbol):
-            return {i for i, o in self._orders.items() if o["status"] == "open"}
-
-        def fetch_order(self, order_id, symbol):
-            return self._orders.get(order_id)
-
-        def cancel_order(self, order_id, symbol):
-            if order_id in self._orders:
-                self._orders[order_id]["status"] = "canceled"
-            return True
-
-        def place_limit_order(self, symbol, side, price, amount, max_attempts=3,
-                               params=None, post_only=True, allow_taker_fallback=False):
-            self._next += 1
-            oid = f"o{self._next}"
-            order = {"id": oid, "side": side, "price": price, "amount": amount,
-                     "filled": 0.0, "average": price, "status": "open"}
-            self._orders[oid] = order
-            return order
-
-        def close_position(self, symbol, side, amount, max_attempts=None):
-            self.positions = []
-            return True
-
     ex = TrendExchange()
     trend = TrendFollower(exchange=ex, symbol="ADAUSDT", min_hold_seconds=0)
     trend.active = True
@@ -665,3 +669,42 @@ def test_the_real_trend_follower_is_actually_reached():
     assert any(o["side"] == "sell" for o in ex._orders.values()), (
         "no reduce-only exit was actually rested on the book"
     )
+
+
+def test_a_cancelled_handoff_undoes_the_real_trend_followers_acceleration():
+    """AUDIT #151. Continues the scenario above one step further: the regime that
+    triggered the handoff flaps back before the position ever reaches flat. The
+    router cancels the pending switch -- but the take-profit
+    accelerate_handoff_exit manufactured a moment ago (trend_take_profit_r=0.0 here,
+    the documented common case: no target at all) must not silently survive that
+    cancellation and cap a position that is supposed to keep riding the trend.
+    """
+    ex = TrendExchange()
+    trend = TrendFollower(exchange=ex, symbol="ADAUSDT", min_hold_seconds=0)
+    trend.active = True
+    trend._side = "long"
+    trend._entry_price = 0.2179
+    trend._qty = 114.0
+    assert trend.take_profit_r == 0.0, "sanity: no target configured at all"
+
+    grid = FakeStrategy("grid")
+    r = StrategyRouter(
+        strategies={"grid": grid, "trend": trend},
+        min_regime_seconds=0, handoff_grace_seconds=3600, exchange=ex, symbol="ADAUSDT",
+    )
+    r.active_name = "trend"
+    ex.positions = [{"side": "long", "contracts": 114.0, "entryPrice": 0.2179}]
+
+    r.update_regime("ranging")   # begins a trend->grid handoff, accelerates
+    assert r.handoff_in_progress
+    assert trend._take_profit_price is not None, "sanity: acceleration fired"
+
+    r.update_regime("uptrend")   # regime flaps back -- cancels the pending handoff
+
+    assert r.handoff_in_progress is False
+    assert r.active_name == "trend"
+    assert trend._take_profit_price is None, (
+        "a take-profit manufactured for a handoff that never completed survived it "
+        "-- the position is now capped even though take_profit_r=0.0 promises no cap"
+    )
+    assert trend._tp_order_id is None, "the manufactured resting order was never disarmed"
