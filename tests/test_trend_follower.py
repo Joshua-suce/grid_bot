@@ -642,6 +642,24 @@ def test_an_unconfirmed_cancel_keeps_the_target_claimed():
     assert ex.placed == []
 
 
+def test_the_cooldown_is_claimed_even_when_the_cancel_fails():
+    """The docstring's own promise: 'claim the cooldown before any I/O ... a failed
+    cancel below must not retry every single poll.' An unconfirmed cancel must still
+    leave _last_handoff_accel_time updated."""
+    tf, ex = positioned(tp=0.2450, tp_order_id="live-order")
+
+    def refuse_cancel(order_id, symbol):
+        return False
+    ex.cancel_order = refuse_cancel
+
+    assert tf._last_handoff_accel_time == 0.0
+    tf.accelerate_handoff_exit(0.2182, balance=1000)
+
+    assert tf._last_handoff_accel_time > 0.0, (
+        "the cooldown was never claimed -- a failed cancel will retry every poll"
+    )
+
+
 # --------------------------------------------------- undoing on cancellation (#151)
 def test_a_manufactured_target_is_removed_when_the_handoff_is_cancelled():
     """trend_take_profit_r=0.0 is the documented common case: no target at all.
@@ -719,3 +737,46 @@ def test_a_fresh_entry_clears_any_pending_undo_state():
 
     assert tf._handoff_accel_active is False
     assert tf._handoff_accel_pre_price is None
+
+
+def test_the_undo_state_survives_a_restart():
+    """router.py deliberately persists _handoff_target/_handoff_started so a handoff
+    resumes across a restart -- if this strategy's own record of what to restore did
+    NOT also survive, a handoff cancelled after a restart would find
+    _handoff_accel_active reset to False and skip undoing the acceleration entirely,
+    exactly the AUDIT #151 bug this whole mechanism exists to prevent."""
+    tf, ex = positioned(tp=0.2450, tp_order_id="old-tp")
+    assert tf.accelerate_handoff_exit(0.2182, balance=4866.53) is True
+    assert tf._handoff_accel_active is True
+    accelerated_price = tf._take_profit_price
+    assert accelerated_price != 0.2450
+
+    snapshot = tf.to_dict()
+
+    restored = TrendFollower(exchange=FakeExchange(), symbol="DOGEUSDT")
+    restored.load_from_dict(snapshot, current_price=0.0720)
+
+    assert restored._handoff_accel_active is True
+    assert restored._handoff_accel_pre_price == 0.2450
+    assert restored._last_handoff_accel_time == tf._last_handoff_accel_time
+
+    restored._side = tf._side   # load_from_dict re-derives side elsewhere; not the
+    restored._qty = tf._qty     # point of this test -- just prove the undo works.
+    restored.handoff_cancelled()
+    assert restored._take_profit_price == 0.2450
+
+
+def test_a_flat_restore_clears_any_pending_undo_state_too():
+    """The mirror of the fresh-entry reset: restoring state that shows no position
+    at all must not leave a dangling 'undo me' claim with nothing left to undo."""
+    tf, ex = positioned(tp=0.2450, tp_order_id="old-tp")
+    assert tf.accelerate_handoff_exit(0.2182, balance=4866.53) is True
+    snapshot = tf.to_dict()
+    snapshot["side"] = None
+    snapshot["qty"] = 0.0
+
+    restored = TrendFollower(exchange=FakeExchange(), symbol="DOGEUSDT")
+    restored.load_from_dict(snapshot, current_price=0.0720)
+
+    assert restored._handoff_accel_active is False
+    assert restored._handoff_accel_pre_price is None

@@ -168,6 +168,35 @@ def test_an_unconfirmed_cancel_keeps_the_level_claimed():
     assert sell.status == "pending"
 
 
+def test_the_cooldown_is_claimed_even_when_the_cancel_fails():
+    """The docstring's own promise: 'claim the cooldown before any I/O ... a failed
+    cancel below must not retry every single poll.' An unconfirmed cancel must still
+    leave _last_handoff_accel_time updated, or the very next poll retries the
+    exchange call immediately instead of backing off."""
+    g, ex, _ = engine()
+    g.levels = [resting("sell", 0.2195, oid="live-order")]
+    ex.get_open_order_ids.return_value = {"live-order"}
+    ex.cancel_order.return_value = False
+
+    assert g._last_handoff_accel_time == 0.0
+    g.accelerate_handoff_exit(0.2182, balance=1000)
+
+    assert g._last_handoff_accel_time > 0.0, (
+        "the cooldown was never claimed -- a failed cancel will retry every poll"
+    )
+
+
+def test_the_cooldown_is_claimed_even_when_fetching_open_orders_fails():
+    g, ex, _ = engine()
+    g.levels = [resting("sell", 0.2195)]
+    ex.get_open_order_ids.side_effect = RuntimeError("exchange unreachable")
+
+    assert g._last_handoff_accel_time == 0.0
+    g.accelerate_handoff_exit(0.2182, balance=1000)
+
+    assert g._last_handoff_accel_time > 0.0
+
+
 def test_an_order_already_gone_is_repriced_without_a_cancel_call():
     """If the exchange no longer shows the order open (already filled or cancelled by
     something else), there is nothing to cancel -- just reclaim the level."""
@@ -283,3 +312,24 @@ def test_a_vanished_order_that_was_only_cancelled_still_reprices_normally():
 
     assert result is True
     assert ex.place_limit_order.called, "the level was never reclaimed and repriced"
+
+
+# ------------------------------------------------------------------- persistence
+def test_the_cooldown_survives_a_restart():
+    """_last_recenter_time (the closest analogous cooldown) is persisted; this one
+    silently wasn't, so a restart mid-handoff reset it to 0.0 regardless of how
+    recently a real acceleration (cancel + place, real exchange I/O) had actually
+    fired before the crash -- letting the very next poll re-fire immediately."""
+    g, ex, _ = engine()
+    sell = resting("sell", 0.2195, qty=30.0)
+    g.levels = [sell]
+    assert g.accelerate_handoff_exit(0.2182, balance=4866.53) is True
+    assert g._last_handoff_accel_time > 0.0
+
+    snapshot = g.to_dict()
+    assert snapshot.get("_last_handoff_accel_time") == g._last_handoff_accel_time
+
+    restored, _, _ = engine()
+    restored.load_from_dict(snapshot)
+
+    assert restored._last_handoff_accel_time == g._last_handoff_accel_time

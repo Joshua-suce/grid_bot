@@ -1211,6 +1211,15 @@ class TrendFollower:
             "total_pnl": self.total_pnl,
             "total_fees": self.total_fees,
             "total_completed_cycles": self.total_completed_cycles,
+            # Restart mid-handoff resumes the SAME handoff -- router.py persists
+            # _handoff_target/_handoff_started specifically so it survives, and this
+            # has to survive with it: without it, a handoff cancelled after a restart
+            # would find _handoff_accel_active reset to False and skip undoing
+            # whatever accelerate_handoff_exit already did, exactly the AUDIT #151
+            # bug this exists to prevent (AUDIT #151).
+            "handoff_accel_active": self._handoff_accel_active,
+            "handoff_accel_pre_price": self._handoff_accel_pre_price,
+            "last_handoff_accel_time": self._last_handoff_accel_time,
         }
 
     def load_from_dict(self, data: dict, current_price: float) -> None:
@@ -1240,6 +1249,10 @@ class TrendFollower:
             self.total_pnl = float(data.get("total_pnl", 0.0))
             self.total_fees = float(data.get("total_fees", 0.0))
             self.total_completed_cycles = int(data.get("total_completed_cycles", 0))
+            self._handoff_accel_active = bool(data.get("handoff_accel_active", False))
+            pre_price = data.get("handoff_accel_pre_price")
+            self._handoff_accel_pre_price = None if pre_price is None else float(pre_price)
+            self._last_handoff_accel_time = float(data.get("last_handoff_accel_time", 0.0))
         except (TypeError, ValueError) as e:
             logger.error("TREND FOLLOWER | corrupt state ({}), starting fresh", e)
             self.state_corrupted = True
@@ -1254,6 +1267,10 @@ class TrendFollower:
             # have reconcile_positions arming an order with no position behind it.
             self._tp_order_id = None
             self._take_profit_price = None
+            # Nothing to undo FOR either -- whatever handoff this was tracking closed
+            # along with the position.
+            self._handoff_accel_active = False
+            self._handoff_accel_pre_price = None
 
     # --- grid-specific surface main.py still calls -------------------------
     # Implemented as harmless equivalents so the router can delegate blindly and

@@ -199,8 +199,13 @@ class GridEngine:
     _break_even_cache: "tuple[str, float] | None" = None
     _break_even_time = 0.0
 
-    # Same reason: accelerate_handoff_exit is reached from router tests that build the
-    # engine with __new__ too (AUDIT #145).
+    # Same defensive placement as the two above, on principle rather than a specific
+    # incident this time: no test currently builds an engine with __new__ and reaches
+    # accelerate_handoff_exit, but _last_deform_warn_time and _break_even_cache/_time
+    # were both bitten by exactly that combination once each, and this field has the
+    # identical shape (a transient __init__-only clock, read before any __init__ has
+    # necessarily run). Cheaper to default it here now than to rediscover the pattern
+    # a third time (AUDIT #145).
     _last_handoff_accel_time = 0.0
     HANDOFF_ACCEL_COOLDOWN_SECONDS = 60.0
 
@@ -3423,6 +3428,7 @@ class GridEngine:
             "total_fills": self.total_fills,
             "total_completed_cycles": self.total_completed_cycles,
             "_last_recenter_time": self._last_recenter_time,
+            "_last_handoff_accel_time": self._last_handoff_accel_time,
             "_trailing_sl_price": self._trailing_sl_price,
             "_trailing_sl_trigger": self._trailing_sl_trigger,
             "_peak_price": self._peak_price,
@@ -3657,6 +3663,7 @@ class GridEngine:
         self.total_fills = data.get("total_fills", 0)
         self.total_completed_cycles = data.get("total_completed_cycles", 0)
         self._last_recenter_time = data.get("_last_recenter_time", 0.0)
+        self._last_handoff_accel_time = data.get("_last_handoff_accel_time", 0.0)
         self._trailing_sl_price = data.get("_trailing_sl_price", None)
         self._trailing_sl_trigger = data.get("_trailing_sl_trigger", self._trailing_sl_trigger)
         self._peak_price = data.get("_peak_price", 0.0)
