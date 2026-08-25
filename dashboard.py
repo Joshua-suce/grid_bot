@@ -38,10 +38,20 @@ REFRESH_SECONDS = 5
 
 # The bot's per-iteration status line. Parsed rather than recomputed so the dashboard
 # reports the same numbers the bot does, from the same instant.
+#
+# f4db690 relabelled the line ("account(...)=-71.00" read as a negative BALANCE --
+# AUDIT #144) but never touched this regex or its own fixture in
+# tests/test_dashboard.py, which hand-copies a real log line rather than deriving it
+# from main.py's format string. Both silently went stale together: every log line
+# main.py wrote from that commit forward stopped matching, load_status() returned
+# None for the whole file, and the dashboard's status card went blank with no error
+# anywhere -- the tests still passed because they were testing the regex against
+# themselves, not against what main.py emits (AUDIT #152). Group names are
+# unchanged -- render() below reads them by name -- only the literal labels moved.
 STATUS = re.compile(
     r"PRICE=(?P<price>[\d.]+) \| fills=(?P<fills>\d+) \| "
     r"gross=(?P<gross>-?[\d.]+) fees=(?P<fees>-?[\d.]+) net=(?P<net>-?[\d.]+) \| "
-    r"session=(?P<session>[+-][\d.]+) account\((?P<window>[^)]*)\)=(?P<account>[+-][\d.]+) "
+    r"session_pnl=(?P<session>[+-][\d.]+) pnl_since\((?P<window>[^)]*)\)=(?P<account>[+-][\d.]+) "
     r"today=(?P<today>[+-][\d.]+) \| balance_free=(?P<free>[\d.]+) "
     r"total_equity=(?P<equity>[\d.]+) \| grid=(?P<grid>\w+) \| "
     r"regime=(?P<regime>[\w.]+)\(adx=(?P<adx>[\d.]+)\) \| spread=(?P<spread>[\d.]+)%"

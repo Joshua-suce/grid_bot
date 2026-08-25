@@ -21,10 +21,15 @@ import pytest
 
 import dashboard
 
-# Verbatim from logs/grid_2026-08-14.log.
+# Verbatim from a post-AUDIT#144 log line (main.py relabelled session=/account(...)=
+# to session_pnl=/pnl_since(...)= there -- see AUDIT #152. This fixture went stale
+# alongside dashboard.py's own regex when that happened the first time, silently,
+# because it was a hand-copied string disconnected from main.py's real format
+# string rather than derived from it -- test_status_line_matches_mains_own_format
+# below now pins the two together so that can't happen twice.
 STATUS_LINE = (
     "2026-08-14 22:34:11 | INFO    | __main__:run_bot:1720 | PRICE=0.06971 | fills=0 | "
-    "gross=0.00 fees=0.00 net=0.00 | session=+0.00 account(since 2026-08-14)=+1.98 "
+    "gross=0.00 fees=0.00 net=0.00 | session_pnl=+0.00 pnl_since(since 2026-08-14)=+1.98 "
     "today=+1.98 | balance_free=4911.10 total_equity=4931.09 | grid=ON | "
     "regime=uncertain(adx=14.8) | spread=0.0143%"
 )
@@ -97,6 +102,52 @@ def test_the_status_line_parses(env):
     assert s["regime"] == "uncertain"
     assert s["adx"] == "14.8"
     assert s["spread"] == "0.0143"
+
+
+def test_status_line_matches_mains_own_format():
+    """AUDIT #152. STATUS_LINE above and dashboard.STATUS were both hand-written
+    against what main.py's status log line looked like AT THE TIME -- nothing tied
+    them to what main.py actually emits. f4db690 relabelled that line and both
+    stayed frozen on the old format: dashboard.STATUS silently stopped matching any
+    real log line, load_status() returned None for the whole file, and the
+    dashboard's status card went blank with no exception anywhere. 27/27 tests in
+    this file kept passing the whole time, because they were testing the regex
+    against a fixture, not against main.py.
+
+    This derives a status line from main.py's REAL format string (via AST, not a
+    second hand-copy) and feeds it through the real STATUS regex -- so a future
+    relabelling that updates one side and not the other fails here, loudly, instead
+    of going live silently.
+    """
+    import ast
+    import inspect
+
+    import main as main_module
+
+    tree = ast.parse(inspect.getsource(main_module))
+    fmt = None
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute) and node.func.attr == "info"
+                and node.args and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+                and node.args[0].value.startswith("PRICE=")):
+            fmt = node.args[0].value
+            break
+    assert fmt is not None, "could not find the PRICE= status format string in main.py"
+
+    # loguru renders {}-style placeholders via str.format() under the hood -- feed it
+    # placeholder values of the right type/count rather than main.py's real ones.
+    rendered = fmt.format(
+        0.06971, 0, 0.0, 0.0, 0.0, 0.0,
+        "since 2026-08-14", 1.98, 1.98,
+        4911.10, 4931.09, "ON", "uncertain(adx=14.8)", 0.0143,
+    )
+
+    m = dashboard.STATUS.search(rendered)
+    assert m is not None, (
+        f"dashboard.STATUS does not match main.py's own current format string: {fmt!r}"
+    )
 
 
 def test_the_latest_status_line_wins(env):
