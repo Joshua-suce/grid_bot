@@ -355,6 +355,41 @@ class TestWiring:
         assert r < t, \
             "reset_trailing wipes the stop anchor; the strategy must reconcile FIRST"
 
+    def test_a_failed_reconcile_does_not_commit_the_flip(self):
+        """AUDIT #160. reconcile_positions() failing after an external close used to
+        still advance _last_side/reset_trailing unconditionally -- committing to a flat
+        belief the code had not actually managed to reconcile, and permanently losing
+        this branch's own retry (the guard is `position_side != _last_side`; once
+        _last_side matches, it never fires again for this flip)."""
+        src = self._src("main.py")
+        i = src.index("if position_side != _last_side:")
+        block = src[i:i + 3000]
+        commit_at = block.index("commit_flip = True")
+        reconcile_try_at = block.index("grid.reconcile_positions()")
+        reconcile_except_at = block.index("except Exception as e:", reconcile_try_at)
+        commit_false_at = block.index("commit_flip = False", reconcile_except_at)
+        gate_at = block.index("if commit_flip:")
+        last_side_at = block.index("_last_side = position_side", gate_at)
+        assert commit_at < reconcile_try_at < reconcile_except_at < commit_false_at < gate_at < last_side_at, (
+            "a failed reconcile no longer withholds the flip from being committed"
+        )
+
+    def test_an_unverifiable_or_still_held_flat_reading_is_not_committed_either(self):
+        """The still_held re-verify already fails safe (defaults still_held=True), but
+        that alone did nothing if _last_side/reset_trailing then advanced anyway --
+        AUDIT #160 closes that gap too."""
+        src = self._src("main.py")
+        i = src.index("if position_side != _last_side:")
+        block = src[i:i + 3000]
+        still_held_at = block.index("still_held = True")
+        if_still_held_at = block.index("if still_held:", still_held_at)
+        commit_false_at = block.index("commit_flip = False", if_still_held_at)
+        gate_at = block.index("if commit_flip:", commit_false_at)
+        assert if_still_held_at < commit_false_at < gate_at, (
+            "a still-held (or unverifiable) flat reading is not withheld from being "
+            "committed as though the flip were handled"
+        )
+
     def test_main_reconciles_at_startup_unconditionally(self):
         src = self._src("main.py")
         assert src.count("grid.reconcile_positions()") >= 2, \

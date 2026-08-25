@@ -2001,15 +2001,25 @@ class GridEngine:
             if amount is not None:
                 level.quantity = float(amount)
             return True
-        if not self.exchange.can_place_order(self.symbol):
+        try:
+            # can_place_order chains through get_open_order_count -> get_open_orders ->
+            # a real network call that can raise after retries exhaust; amount_to_precision
+            # is a ccxt call too. Both used to sit outside any try here, so a transient
+            # failure on one level aborted place_initial_orders' whole loop over
+            # self.levels partway through instead of just failing this one rung the way
+            # every other per-level failure in this same loop already does (AUDIT #164).
+            if not self.exchange.can_place_order(self.symbol):
+                return False
+            usdt_per_grid = self._calc_usdt_per_grid(balance)
+            quantity = usdt_per_grid / level.price
+            if level.side == "buy":
+                quantity *= self._buy_scale
+            else:
+                quantity *= self._sell_scale
+            quantity = self.exchange.exchange.amount_to_precision(self.symbol, quantity)
+        except Exception as e:
+            logger.error("PLACE ORDER PRECHECK FAILED @ {} {} | {}", level.side.upper(), level.price, e)
             return False
-        usdt_per_grid = self._calc_usdt_per_grid(balance)
-        quantity = usdt_per_grid / level.price
-        if level.side == "buy":
-            quantity *= self._buy_scale
-        else:
-            quantity *= self._sell_scale
-        quantity = self.exchange.exchange.amount_to_precision(self.symbol, quantity)
         if float(quantity) <= 0:
             if self._event_journal:
                 self._event_journal.order_failed(self.symbol, level.side, level.price, 0.0, "quantity_zero")

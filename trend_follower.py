@@ -921,6 +921,14 @@ class TrendFollower:
             qty = live
 
         try:
+            # Fetched BEFORE the close, not after: once the close call below succeeds,
+            # everything that follows is pure bookkeeping with no exchange call left
+            # to fail on. It used to be fetched after a successful close -- a real
+            # money close with the PnL/fill-count bookkeeping that records it skipped
+            # entirely if this read then failed, permanently (AUDIT #162). It is only
+            # ever used as an approximation of the fill price either way, so fetching
+            # a moment earlier changes nothing about its accuracy.
+            exit_price = self.exchange.get_price(self.symbol)
             # Exchange.close_position(symbol, side, amount) -- `side` is the POSITION
             # side ("long"/"short"), which it converts to the closing order side.
             #
@@ -941,7 +949,6 @@ class TrendFollower:
             logger.error("TREND FOLLOWER | close failed: {}", e)
             return None
 
-        exit_price = self.exchange.get_price(self.symbol)
         direction = 1.0 if side == "long" else -1.0
         profit = (exit_price - entry) * qty * direction
 

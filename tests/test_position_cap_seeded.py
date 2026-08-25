@@ -164,9 +164,13 @@ def _seed_call_sites(src: str) -> list[int]:
     seed survived both.
 
     Calls are indented; the definition is at column zero. That is the whole distinction.
+
+    Matches `grid` or `new_grid` -- AUDIT #161 gave the recovery rebuild its own local
+    `new_grid` so a mid-rebuild failure cannot leave the outer `grid` swapped to a
+    zeroed engine before its stats were restored. Same call, different local name.
     """
     return [m.start() for m in re.finditer(
-        r"^[ 	]+seed_position_limit\(exchange, grid", src, re.M)]
+        r"^[ 	]+seed_position_limit\(exchange, (?:new_)?grid\b", src, re.M)]
 
 
 def test_the_call_site_scan_excludes_the_definition():

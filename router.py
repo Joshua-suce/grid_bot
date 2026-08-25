@@ -381,17 +381,33 @@ class StrategyRouter:
 
         # Flat (naturally or forced): stand the outgoing strategy down and switch.
         self.strategy.pause()
+        incoming = self.strategies[target]
+        incoming.reset_trailing()
+        incoming.update_regime(self._regime)
+        try:
+            incoming.activate(balance)
+        except Exception as e:
+            # active_name/_handoff_target are deliberately NOT committed until activate()
+            # actually succeeds (AUDIT #158). update_regime()'s early-return
+            # (`if target == self.active_name: return`) means a handoff whose bookkeeping
+            # was committed before a failed activate() could never be retried -- the
+            # router would believe the switch had already happened while the incoming
+            # strategy never placed anything at all, stuck trading through neither
+            # strategy. Leaving _handoff_target untouched here means _continue_handoff
+            # runs again next tick and retries the same activation.
+            logger.error(
+                "ROUTER | handoff activation to {} failed ({}) -- retrying next tick, "
+                "{} stays the active strategy (paused) in the meantime",
+                target, e, self.active_name,
+            )
+            return
+
         previous = self.active_name
         self.active_name = target
         self._handoff_target = None
         self._pending_name = None
         self._pending_since = 0.0
         self.switches += 1
-
-        incoming = self.strategy
-        incoming.reset_trailing()
-        incoming.update_regime(self._regime)
-        incoming.activate(balance)
         logger.info(
             "ROUTER | handoff complete {} -> {} | regime={} | switches={}",
             previous, target, self._regime, self.switches,

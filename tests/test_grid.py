@@ -684,6 +684,60 @@ def test_place_order_skips_sell_when_short_blocked():
     assert level.order_id is None
 
 
+def test_a_failed_can_place_order_check_fails_this_level_without_raising():
+    """AUDIT #164. can_place_order() chains through a real network call and used to
+    sit outside any try here -- a transient failure on one level raised straight out
+    of _place_order_for_level, aborting place_initial_orders' whole loop over
+    self.levels partway through instead of just failing this one rung."""
+    class FakeExchange:
+        def __init__(self):
+            class _ex:
+                @staticmethod
+                def amount_to_precision(symbol, amount):
+                    return f"{amount:.6f}"
+            self.exchange = _ex()
+
+        def can_place_order(self, symbol):
+            raise RuntimeError("exchange unreachable")
+
+    ex = FakeExchange()
+    grid = GridEngine(
+        exchange=ex, symbol="TEST", grid_lower=100.0, grid_upper=120.0,
+        grid_count=5, capital_per_grid_pct=0.1, stop_loss_pct=0.03,
+    )
+    level = GridLevel(price=115.0, side="sell", quantity=1.0)
+
+    result = grid._place_order_for_level(level, balance=1000.0)
+
+    assert result is False
+    assert level.order_id is None
+
+
+def test_a_failed_precision_lookup_fails_this_level_without_raising():
+    class FakeExchange:
+        def __init__(self):
+            class _ex:
+                @staticmethod
+                def amount_to_precision(symbol, amount):
+                    raise RuntimeError("precision lookup failed")
+            self.exchange = _ex()
+
+        def can_place_order(self, symbol):
+            return True
+
+    ex = FakeExchange()
+    grid = GridEngine(
+        exchange=ex, symbol="TEST", grid_lower=100.0, grid_upper=120.0,
+        grid_count=5, capital_per_grid_pct=0.1, stop_loss_pct=0.03,
+    )
+    level = GridLevel(price=115.0, side="buy", quantity=1.0)
+
+    result = grid._place_order_for_level(level, balance=1000.0)
+
+    assert result is False
+    assert level.order_id is None
+
+
 def test_place_order_scales_sell_quantity_by_sell_scale():
     class FakeExchange:
         def __init__(self):

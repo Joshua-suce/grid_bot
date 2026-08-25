@@ -780,3 +780,43 @@ def test_a_flat_restore_clears_any_pending_undo_state_too():
 
     assert restored._handoff_accel_active is False
     assert restored._handoff_accel_pre_price is None
+
+
+# --- AUDIT #162: exit_price is fetched before the close, not after -----------------
+
+def test_a_price_read_failure_prevents_the_close_from_being_attempted_at_all():
+    """exit_price used to be fetched AFTER a successful close -- a real close with
+    the PnL/fill-count bookkeeping that records it silently skipped if that read then
+    failed, permanently (nothing re-attempts the bookkeeping later). Fetched first
+    now: a failed read means the close itself is never even attempted."""
+    class BrokenPriceExchange(FakeExchange):
+        def get_price(self, symbol):
+            raise RuntimeError("price feed down")
+
+    ex = BrokenPriceExchange()
+    tf, _ = make(ex=ex)
+    tf._side = "long"
+    tf._entry_price = 0.070
+    tf._qty = 100.0
+    ex._positions = [{"contracts": 100.0, "side": "long", "entryPrice": 0.070}]
+
+    result = tf._close_position("test")
+
+    assert result is None
+    assert ex.closed == 0, "the exchange close was attempted despite the price read failing"
+    assert tf._side == "long", "state was cleared even though nothing was actually closed"
+
+
+def test_the_close_still_completes_normally_when_the_price_read_succeeds():
+    tf, ex = make()
+    tf._side = "long"
+    tf._entry_price = 0.070
+    tf._qty = 100.0
+    ex._positions = [{"contracts": 100.0, "side": "long", "entryPrice": 0.070}]
+
+    result = tf._close_position("test")
+
+    assert result is not None
+    assert ex.closed == 1
+    assert tf._side is None
+    assert tf.total_fills == 1

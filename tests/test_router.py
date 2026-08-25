@@ -807,6 +807,53 @@ def test_a_restored_pending_clock_lets_a_still_agreeing_regime_switch_immediatel
     )
 
 
+def test_a_failed_handoff_activation_does_not_strand_the_router_between_strategies():
+    """AUDIT #158. active_name/_handoff_target used to be committed BEFORE
+    incoming.activate(balance) ran. If that call threw, the router believed the
+    switch had already happened (update_regime()'s `if target == self.active_name:
+    return` early-exits on the very next tick) while the incoming strategy never
+    actually placed anything -- stuck trading through neither strategy, with no
+    automatic retry possible."""
+    r, grid, trend, ex = make()   # position=0.0, min_regime_seconds=0 -- flat immediately
+
+    def boom(balance):
+        raise RuntimeError("exchange unreachable")
+    trend.activate = boom
+
+    r.update_regime("uptrend")
+
+    assert r.active_name == "grid", "active_name was committed despite the failed activation"
+    assert r._handoff_target == "trend", (
+        "the pending handoff was dropped instead of staying in place for a retry"
+    )
+    assert trend.activated == 0, "sanity: the fake's own activate() never completed"
+    assert grid.paused >= 1, "the outgoing strategy must stay paused, not resume trading"
+    assert r.switches == 0
+
+
+def test_a_failed_handoff_activation_is_retried_and_can_still_complete():
+    r, grid, trend, ex = make()
+    calls = {"n": 0}
+    real_activate = trend.activate
+
+    def flaky(balance):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient")
+        real_activate(balance)
+    trend.activate = flaky
+
+    r.update_regime("uptrend")   # fails; handoff stays pending
+    assert r.active_name == "grid"
+
+    r.update_regime("uptrend")   # retried, this time it succeeds
+
+    assert r.active_name == "trend"
+    assert r._handoff_target is None
+    assert r.switches == 1
+    assert trend.activated == 1
+
+
 def test_a_restored_pending_clock_does_not_switch_early_on_its_own():
     """Restoring the clock must not itself trigger a switch -- only a subsequent
     update_regime() call (a fresh, real observation) can complete it."""

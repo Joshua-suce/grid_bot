@@ -479,6 +479,86 @@ def test_the_post_cleanup_ladder_placement_is_gated_on_recovery():
     )
 
 
+import ast as _ast
+
+
+def test_the_startup_sequence_is_wrapped_in_its_own_exception_safety_net():
+    """AUDIT #157. The ~560-line startup stretch between grid/trend/risk construction
+    and the main loop used to have no enclosing try/except of its own -- a crash there
+    propagated straight out of run_bot() with zero cleanup, unlike the main loop which
+    always gets emergency_stop() via its own finally. Structural check, not a full
+    run_bot() integration test -- "run_bot is not unit-testable", per this file's own
+    established precedent (see test_startup_cleanup_asks_to_keep_stops).
+    """
+    tree = _ast.parse(_main_source())
+    run_bot = next(n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef) and n.name == "run_bot")
+    top_level_tries = [n for n in run_bot.body if isinstance(n, _ast.Try)]
+    assert len(top_level_tries) >= 2, "expected the startup wrapper plus the loop's own try"
+
+    startup_try, loop_try = top_level_tries[-2], top_level_tries[-1]
+    assert startup_try.lineno < loop_try.lineno, (
+        "the startup wrapper must sit before the main loop's own try, not after or "
+        "nested inside it"
+    )
+
+    handler_names = [h.type.id for h in startup_try.handlers if isinstance(h.type, _ast.Name)]
+    assert handler_names == ["Exception"], (
+        "the startup wrapper must catch exactly Exception, not a bare except or "
+        "BaseException -- SystemExit (abort_startup's mechanism, and the deliberate "
+        "sys.exit on a failed balance read) must keep propagating through untouched"
+    )
+
+
+def test_the_startup_exception_handler_attempts_cleanup_and_reraises():
+    src = _main_source()
+    handler_at = src.index("    except Exception as e:\n        # The main loop already gets this")
+    cleanup_at = src.index("grid.emergency_stop(", handler_at)
+    reraise_at = src.index("raise", cleanup_at)
+    assert handler_at < cleanup_at < reraise_at, (
+        "the startup handler does not attempt cleanup before re-raising"
+    )
+    # A bare re-raise -- the original exception must reach supervise.py unaltered so
+    # its logging and exit-code handling stay correct, not get swallowed or replaced.
+    line = src[reraise_at:].splitlines()[0]
+    assert line.strip() == "raise", f"expected a bare re-raise, got: {line!r}"
+
+
+def test_the_cleanup_attempt_itself_cannot_mask_the_original_exception():
+    """A failure inside the cleanup attempt (e.g. the exchange is ALSO unreachable for
+    the emergency_stop call) must not replace or hide the original exception that
+    triggered this handler in the first place."""
+    src = _main_source()
+    handler_at = src.index("    except Exception as e:\n        # The main loop already gets this")
+    reraise_at = src.index("raise", handler_at)
+    between = src[handler_at:reraise_at]
+    assert "except Exception as cleanup_err:" in between, (
+        "the cleanup attempt is not itself guarded -- a failed cleanup would replace "
+        "the original exception instead of the startup failure reaching supervise.py"
+    )
+
+
+def test_the_startup_wrapper_actually_encloses_ladder_placement_and_the_trend_gate():
+    """Not just present somewhere in the file -- it has to actually contain the two
+    places a ladder gets placed at startup, or a crash there is still unmanaged."""
+    src = _main_source()
+    try_at = src.index("    grid = None\n    try:\n        trend = TrendFilter(")
+    except_at = src.index("    except Exception as e:\n        # The main loop already gets this", try_at)
+    zone = src[try_at:except_at]
+    assert "grid.place_initial_orders(exchange.get_balance())" in zone
+    assert "grid.activate(exchange.get_balance())" in zone
+
+
+def test_grid_is_defined_before_the_try_so_the_handler_never_name_errors():
+    """The handler reads `grid` unconditionally (`if grid is not None`) -- if an
+    exception fired before grid.load_from_dict's branch even ran, `grid` must still
+    be bound, or the cleanup attempt itself throws NameError and masks the original
+    failure instead of handling it."""
+    src = _main_source()
+    grid_none_at = src.index("    grid = None\n    try:")
+    try_at = src.index("    try:\n        trend = TrendFilter(")
+    assert grid_none_at < try_at, "grid = None must be set before the try begins"
+
+
 def test_trend_state_is_restored_right_after_construction():
     """AUDIT #155/#156. TrendFilter used to have no persistence at all -- every
     restart started at UNCERTAIN regardless of what was confirmed right before the
@@ -531,6 +611,131 @@ def test_lone_trend_alert_is_wired_into_the_periodic_regime_check():
     alert_call_at = src.index("notifier.on_lone_trend(")
     assert check_at < regime_log_at < lone_call_at < alert_call_at, (
         "the lone-trend alert is not wired into the periodic regime recheck in order"
+    )
+
+
+def test_optional_timeframe_fetch_failures_are_logged_not_silently_swallowed():
+    """AUDIT #163. These two used to be bare `except Exception: pass` -- unlike every
+    other narrow-purpose catch in this file, which logs at least at debug. A sustained
+    feed outage degraded regime confirmation with nothing in the log to explain it."""
+    src = _main_source()
+    fast_sites = [
+        i for i in range(len(src))
+        if src.startswith('trend.add_timeframe(ohlcv_fast, settings.trend_timeframe_fast)', i)
+    ]
+    day_sites = [
+        i for i in range(len(src))
+        if src.startswith('trend.add_timeframe(ohlcv_1d, "1d")', i)
+    ]
+    assert len(fast_sites) >= 2 and len(day_sites) >= 2, "expected both call sites (startup + loop)"
+    for site in fast_sites + day_sites:
+        following = src[site:site + 500]
+        assert "except Exception" in following
+        except_at = following.index("except Exception")
+        after_except = following[except_at:except_at + 400]
+        assert "logger.debug(" in after_except, (
+            f"a fetch at offset {site} still swallows its failure without logging it"
+        )
+
+
+def test_the_recovery_rebuild_only_swaps_grid_after_everything_succeeds():
+    """AUDIT #161. `grid` used to be reassigned to the fresh, zeroed GridEngine BEFORE
+    its stats were restored and BEFORE activate() ran -- a throw anywhere in between
+    left the outer `grid` pointing at a zeroed engine, with the bot's whole cumulative
+    fill/PnL/fee/cycle history reading zero even though nothing happened on the
+    exchange. The rebuild must happen on a local `new_grid` and only replace the outer
+    `grid` once construction, sizing, stat restoration, and activation have all
+    already succeeded.
+    """
+    src = _main_source()
+    section_at = src.index('logger.info("RECOVERY READY | recalculating grid around current price {}", price)')
+    except_at = src.index("except Exception as e:\n                            if new_grid is not None:")
+    section = src[section_at:except_at]
+
+    construct_at = section.index("new_grid = GridEngine(")
+    stats_at = section.index("new_grid.total_fills = old_fills")
+    activate_at = section.index("new_grid.activate(exchange.get_balance())")
+    swap_at = section.index("\n                            grid = new_grid\n")
+    # Search from swap_at on: an explanatory comment above also mentions
+    # "risk.exit_recovery()" in prose, which an unanchored search would match first.
+    exit_recovery_at = section.index("risk.exit_recovery()", swap_at)
+    notify_at = section.index("notifier.on_grid_start(settings.symbol, grid.grid_lower", swap_at)
+
+    assert (construct_at < stats_at < activate_at < swap_at
+            < exit_recovery_at < notify_at), (
+        "the recovery rebuild does not defer swapping `grid` (and exiting recovery) "
+        "until every throwable step has already succeeded"
+    )
+
+
+def test_a_failed_recovery_rebuild_leaves_the_old_grid_and_recovery_state_untouched():
+    """Reads as: `grid = new_grid` and `risk.exit_recovery()` must be UNREACHABLE if
+    anything above them throws -- i.e. inside the same try, before the except."""
+    src = _main_source()
+    section_at = src.index('logger.info("RECOVERY READY | recalculating grid around current price {}", price)')
+    try_at = src.index("new_grid = None\n                        try:", section_at)
+    except_at = src.index("except Exception as e:\n                            if new_grid is not None:", try_at)
+    swap_at = src.index("grid = new_grid", try_at)
+    assert try_at < swap_at < except_at, (
+        "the grid swap is not inside the recovery rebuild's own try block"
+    )
+
+
+def test_a_failed_recovery_rebuild_cleans_up_whatever_new_grid_managed_to_place():
+    src = _main_source()
+    except_at = src.index("except Exception as e:\n                            if new_grid is not None:")
+    block = src[except_at:except_at + 800]
+    cleanup_at = block.index("new_grid.emergency_stop(")
+    guard_at = block.index("except Exception as cleanup_err:")
+    assert 0 < cleanup_at < guard_at, (
+        "a failed recovery rebuild does not attempt to clean up whatever new_grid "
+        "already placed on the exchange, or does not guard that cleanup attempt itself"
+    )
+
+
+def test_a_genuine_code_defect_in_recovery_rebuild_gets_the_same_treatment_as_the_loop():
+    """AUDIT #161. Without this, a real bug in the recovery path retried silently
+    forever at poll_interval with no traceback, no dedup, no alert -- unlike every
+    other code defect in the loop (AUDIT #31's BUG_ERRORS handling)."""
+    src = _main_source()
+    except_at = src.index("except Exception as e:\n                            if new_grid is not None:")
+    block = src[except_at:except_at + 2000]
+    assert "isinstance(e, BUG_ERRORS)" in block
+    assert "seen_bug_errors" in block
+
+
+def test_the_startup_stop_loss_check_probes_positions_readability_first():
+    """AUDIT #159. get_net_position() swallows a failed read and returns ("", 0.0) --
+    indistinguishable from genuinely flat. Skipping the stop-loss block on that value
+    let grid.activate() add fresh exposure on top of a real, silently-unprotected
+    inherited position. seed_position_limit() already probes explicitly for exactly
+    this reason (AUDIT #125); the startup stop-loss check must too."""
+    src = _main_source()
+    probe_at = src.index("exchange.get_positions(settings.symbol)\n            positions_readable = True")
+    net_position_at = src.index("position_side, position_qty = get_net_position(exchange, settings.symbol)")
+    assert probe_at < net_position_at, (
+        "positions readability is not probed before the swallowed-failure "
+        "get_net_position() call"
+    )
+
+
+def test_an_unreadable_book_blocks_both_sides_at_startup():
+    src = _main_source()
+    probe_at = src.index("positions_readable = False")
+    block_buy_at = src.index('grid.block_side("buy", "positions unreadable at startup")', probe_at)
+    block_sell_at = src.index('grid.block_side("sell", "positions unreadable at startup")', probe_at)
+    assert probe_at < block_buy_at < block_sell_at, (
+        "an unreadable book at startup does not block both sides"
+    )
+
+
+def test_the_stop_loss_placement_is_gated_on_positions_being_readable():
+    src = _main_source()
+    gate_at = src.index("if positions_readable and position_side in")
+    assert gate_at > 0, (
+        "the startup stop-loss placement no longer checks positions_readable -- a "
+        "swallowed failed read (position_side='') would silently skip it either way, "
+        "but so would a successful read of a real position, indistinguishably"
     )
 
 

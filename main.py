@@ -1225,571 +1225,611 @@ def run_bot() -> None:
         notifier.send(f"&#x1f6a8; <b>STARTUP ABORTED</b>\n{len(leftover)} stale orders could not be cancelled (exchange write path down). Book was left untouched.")
         abort_startup(transient=True)
 
-    trend = TrendFilter(
-        ema_fast=settings.ema_fast,
-        ema_slow=settings.ema_slow,
-        adx_period=settings.adx_period,
-        trend_threshold=settings.adx_trend_threshold,
-        range_threshold=settings.adx_range_threshold,
-        check_interval=settings.trend_check_interval,
-        confirmation_seconds=settings.trend_confirmation_seconds,
-        flat_range_window=settings.flat_range_window,
-        flat_range_pct=settings.flat_range_pct,
-        trend_min_votes=settings.regime_trend_min_votes,
-    )
-    # Restores the confirmed regime and both confirmation clocks if the saved snapshot
-    # is fresh enough to trust -- see TrendFilter.STALE_AFTER_SECONDS. A no-op on a
-    # missing/stale/first-ever state file: trend stays at its just-constructed default
-    # (AUDIT #155/#156).
-    trend.load_from_dict((saved_state or {}).get("trend", {}))
-
-    # Deliberately given no exchange handle -- it reports on regime changes and cannot
-    # act on them. See signals.py.
-    signal_gen = (
-        SignalGenerator(
-            symbol=settings.symbol,
-            log_dir=settings.log_dir,
-            notifier=notifier,
-            event_journal=events,
-            notify=settings.signals_notify,
-        )
-        if settings.signals_enabled
-        else None
-    )
-
-    risk = RiskManager(
-        stop_loss_pct=settings.stop_loss_pct,
-        daily_loss_limit_pct=settings.daily_loss_limit_pct,
-        max_drawdown_pct=settings.max_drawdown_pct,
-        cooldown_seconds=settings.cooldown_seconds,
-        max_exposure_pct=settings.max_exposure_pct,
-        max_consecutive_losses=settings.max_consecutive_losses,
-        max_recovery_count=settings.max_recovery_count,
-        event_journal=events,
-    )
-
     grid = None
-    journal = TradeJournal(settings.log_dir, demo=settings.demo_mode)
+    try:
+        trend = TrendFilter(
+            ema_fast=settings.ema_fast,
+            ema_slow=settings.ema_slow,
+            adx_period=settings.adx_period,
+            trend_threshold=settings.adx_trend_threshold,
+            range_threshold=settings.adx_range_threshold,
+            check_interval=settings.trend_check_interval,
+            confirmation_seconds=settings.trend_confirmation_seconds,
+            flat_range_window=settings.flat_range_window,
+            flat_range_pct=settings.flat_range_pct,
+            trend_min_votes=settings.regime_trend_min_votes,
+        )
+        # Restores the confirmed regime and both confirmation clocks if the saved snapshot
+        # is fresh enough to trust -- see TrendFilter.STALE_AFTER_SECONDS. A no-op on a
+        # missing/stale/first-ever state file: trend stays at its just-constructed default
+        # (AUDIT #155/#156).
+        trend.load_from_dict((saved_state or {}).get("trend", {}))
 
-    # PnL reconciler: reports cumulative PnL sourced from Binance's own income
-    # ledger (realized PnL + commission + funding) rather than the grid engine's
-    # internal per-level bookkeeping, so the number shown to the user always
-    # agrees with the real account equity trajectory. Read-only — does not
-    # affect order placement or fill handling.
-    pnl_reconciler = PnLReconciler.from_dict(saved_state.get("pnl_reconciler") if saved_state else None)
-    # Before the sync: a changed PNL_EPOCH has to clear the accumulated totals, or sync()
-    # simply resumes from the old cursor and the operator reads a number they believe
-    # they changed (AUDIT #60).
-    pnl_reconciler.reset_for_epoch(settings.pnl_epoch_ms)
-    pnl_reconciler.sync(exchange, settings.symbol)
-    # Anchor session PnL before the first order. Everything the bot reported was either
-    # the 89-day account lifetime or today, so a fresh start opened by announcing
-    # "Total PnL (verified): -30.20" -- accurate, but it is account history (including a
-    # -50.49 day from defects since fixed), not this run, and it reads as starting in
-    # the red (AUDIT #59).
-    pnl_reconciler.begin_session()
-    # From the reconciler, never from settings: the label has to describe the value that
-    # actually produced the number, or the two can disagree (AUDIT #60).
-    pnl_window = pnl_reconciler.window_label
-    logger.info(
-        "PNL RECONCILER READY | session starts at 0.00 | account ({}) net={:+.4f} USDT "
-        "(realized={:+.4f} commission={:+.4f} funding={:+.4f})",
-        pnl_window,
-        pnl_reconciler.net_realized_pnl, pnl_reconciler.realized_pnl,
-        pnl_reconciler.commission, pnl_reconciler.funding_fee,
-    )
+        # Deliberately given no exchange handle -- it reports on regime changes and cannot
+        # act on them. See signals.py.
+        signal_gen = (
+            SignalGenerator(
+                symbol=settings.symbol,
+                log_dir=settings.log_dir,
+                notifier=notifier,
+                event_journal=events,
+                notify=settings.signals_notify,
+            )
+            if settings.signals_enabled
+            else None
+        )
 
-    if saved_state and "grid" in saved_state:
-        logger.info("Restoring saved grid state")
-        balance = exchange.get_balance()
-        risk.initialize(balance)
-        # Restored here, before anything below decides whether to place an order. This
-        # used to run one step later, after place_initial_orders() -- a restart landing
-        # inside an active kill-switch recovery cooldown re-armed a full ladder into the
-        # very conditions that tripped the switch, silently, because in_recovery was
-        # still the freshly-constructed False at the moment that decision was made. The
-        # loop's own is_in_recovery() check (below) only ever sees state AFTER the first
-        # ladder was already resting on the exchange (AUDIT #155).
-        risk.load_from_dict(saved_state.get("risk", {}))
+        risk = RiskManager(
+            stop_loss_pct=settings.stop_loss_pct,
+            daily_loss_limit_pct=settings.daily_loss_limit_pct,
+            max_drawdown_pct=settings.max_drawdown_pct,
+            cooldown_seconds=settings.cooldown_seconds,
+            max_exposure_pct=settings.max_exposure_pct,
+            max_consecutive_losses=settings.max_consecutive_losses,
+            max_recovery_count=settings.max_recovery_count,
+            event_journal=events,
+        )
 
-        # GRID_COUNT comes from CONFIG, not from the saved state. Taking it from state
-        # meant a config change was silently inert for as long as a state file existed:
-        # GRID_COUNT 8 -> 14 was edited, the bot restarted, and it ran 8 rungs all night
-        # while MAX_POSITION_PCT 0.12 -> 0.20 -- read from settings like everything else
-        # -- took effect immediately. Half a geometry change applied is worse than none:
-        # the cap doubled while the ladder stayed the same size, so the bot could carry
-        # twice the one-sided inventory before anything stopped it (AUDIT #76).
-        #
-        # The BOUNDS still come from state on purpose. They are where the live orders
-        # and the open position actually sit; recalculating them here would orphan the
-        # book. load_from_dict rebuilds the levels across those bounds when the count
-        # disagrees, and a recenter recomputes bounds from config soon enough.
-        saved_count = int(saved_state["grid"].get("grid_count") or settings.grid_count)
-        if saved_count != settings.grid_count:
-            logger.warning(
-                "GRID COUNT CHANGED | saved state has {} rungs, config says {} — "
-                "rebuilding the ladder at {} across the saved bounds",
-                saved_count, settings.grid_count, settings.grid_count,
+        grid = None
+        journal = TradeJournal(settings.log_dir, demo=settings.demo_mode)
+
+        # PnL reconciler: reports cumulative PnL sourced from Binance's own income
+        # ledger (realized PnL + commission + funding) rather than the grid engine's
+        # internal per-level bookkeeping, so the number shown to the user always
+        # agrees with the real account equity trajectory. Read-only — does not
+        # affect order placement or fill handling.
+        pnl_reconciler = PnLReconciler.from_dict(saved_state.get("pnl_reconciler") if saved_state else None)
+        # Before the sync: a changed PNL_EPOCH has to clear the accumulated totals, or sync()
+        # simply resumes from the old cursor and the operator reads a number they believe
+        # they changed (AUDIT #60).
+        pnl_reconciler.reset_for_epoch(settings.pnl_epoch_ms)
+        pnl_reconciler.sync(exchange, settings.symbol)
+        # Anchor session PnL before the first order. Everything the bot reported was either
+        # the 89-day account lifetime or today, so a fresh start opened by announcing
+        # "Total PnL (verified): -30.20" -- accurate, but it is account history (including a
+        # -50.49 day from defects since fixed), not this run, and it reads as starting in
+        # the red (AUDIT #59).
+        pnl_reconciler.begin_session()
+        # From the reconciler, never from settings: the label has to describe the value that
+        # actually produced the number, or the two can disagree (AUDIT #60).
+        pnl_window = pnl_reconciler.window_label
+        logger.info(
+            "PNL RECONCILER READY | session starts at 0.00 | account ({}) net={:+.4f} USDT "
+            "(realized={:+.4f} commission={:+.4f} funding={:+.4f})",
+            pnl_window,
+            pnl_reconciler.net_realized_pnl, pnl_reconciler.realized_pnl,
+            pnl_reconciler.commission, pnl_reconciler.funding_fee,
+        )
+
+        if saved_state and "grid" in saved_state:
+            logger.info("Restoring saved grid state")
+            balance = exchange.get_balance()
+            risk.initialize(balance)
+            # Restored here, before anything below decides whether to place an order. This
+            # used to run one step later, after place_initial_orders() -- a restart landing
+            # inside an active kill-switch recovery cooldown re-armed a full ladder into the
+            # very conditions that tripped the switch, silently, because in_recovery was
+            # still the freshly-constructed False at the moment that decision was made. The
+            # loop's own is_in_recovery() check (below) only ever sees state AFTER the first
+            # ladder was already resting on the exchange (AUDIT #155).
+            risk.load_from_dict(saved_state.get("risk", {}))
+
+            # GRID_COUNT comes from CONFIG, not from the saved state. Taking it from state
+            # meant a config change was silently inert for as long as a state file existed:
+            # GRID_COUNT 8 -> 14 was edited, the bot restarted, and it ran 8 rungs all night
+            # while MAX_POSITION_PCT 0.12 -> 0.20 -- read from settings like everything else
+            # -- took effect immediately. Half a geometry change applied is worse than none:
+            # the cap doubled while the ladder stayed the same size, so the bot could carry
+            # twice the one-sided inventory before anything stopped it (AUDIT #76).
+            #
+            # The BOUNDS still come from state on purpose. They are where the live orders
+            # and the open position actually sit; recalculating them here would orphan the
+            # book. load_from_dict rebuilds the levels across those bounds when the count
+            # disagrees, and a recenter recomputes bounds from config soon enough.
+            saved_count = int(saved_state["grid"].get("grid_count") or settings.grid_count)
+            if saved_count != settings.grid_count:
+                logger.warning(
+                    "GRID COUNT CHANGED | saved state has {} rungs, config says {} — "
+                    "rebuilding the ladder at {} across the saved bounds",
+                    saved_count, settings.grid_count, settings.grid_count,
+                )
+
+            grid = GridEngine(
+                exchange, settings.symbol,
+                grid_lower=saved_state["grid"]["grid_lower"],
+                grid_upper=saved_state["grid"]["grid_upper"],
+                grid_count=settings.grid_count,
+                capital_per_grid_pct=settings.capital_per_grid_pct,
+                stop_loss_pct=settings.stop_loss_pct,
+                maker_fee_pct=settings.maker_fee_pct / 100,
+                taker_fee_pct=settings.taker_fee_pct / 100,
+                taker_fill_share=settings.taker_fill_share_pct / 100,
+                recenter_cooldown=settings.recenter_cooldown,
+                replacement_cooldown=settings.replacement_cooldown,
+                order_pacing_seconds=settings.order_pacing_seconds,
+                capital_per_grid_usdt=settings.capital_per_grid_usdt,
+                leverage=settings.leverage,
+                trailing_sl_trigger_pct=settings.trailing_sl_trigger_pct,
+                max_exposure_pct=settings.max_exposure_pct,
+                min_profit_multiplier=settings.min_profit_multiplier,
+                rung_loss_cap_pct=settings.rung_loss_cap_pct,
+                max_open_loss_usdt=settings.max_open_loss_usdt,
+                event_journal=events,
+                notifier=notifier,
+            )
+            grid = _install_strategy(grid, exchange, events, notifier)
+            grid.load_from_dict(saved_state["grid"], current_price=exchange.get_price(settings.symbol))
+
+            if grid.state_corrupted:
+                logger.warning("Deleting corrupt state file so next startup recalculates fresh bounds")
+                state_mgr.delete()
+
+            has_exchange_positions = any(
+                float(p.get("contracts", 0) or 0) != 0
+                for p in exchange.get_positions(settings.symbol)
             )
 
-        grid = GridEngine(
-            exchange, settings.symbol,
-            grid_lower=saved_state["grid"]["grid_lower"],
-            grid_upper=saved_state["grid"]["grid_upper"],
-            grid_count=settings.grid_count,
-            capital_per_grid_pct=settings.capital_per_grid_pct,
-            stop_loss_pct=settings.stop_loss_pct,
-            maker_fee_pct=settings.maker_fee_pct / 100,
-            taker_fee_pct=settings.taker_fee_pct / 100,
-            taker_fill_share=settings.taker_fill_share_pct / 100,
-            recenter_cooldown=settings.recenter_cooldown,
-            replacement_cooldown=settings.replacement_cooldown,
-            order_pacing_seconds=settings.order_pacing_seconds,
-            capital_per_grid_usdt=settings.capital_per_grid_usdt,
-            leverage=settings.leverage,
-            trailing_sl_trigger_pct=settings.trailing_sl_trigger_pct,
-            max_exposure_pct=settings.max_exposure_pct,
-            min_profit_multiplier=settings.min_profit_multiplier,
-            rung_loss_cap_pct=settings.rung_loss_cap_pct,
-            max_open_loss_usdt=settings.max_open_loss_usdt,
-            event_journal=events,
-            notifier=notifier,
-        )
-        grid = _install_strategy(grid, exchange, events, notifier)
-        grid.load_from_dict(saved_state["grid"], current_price=exchange.get_price(settings.symbol))
+            seed_position_limit(exchange, grid, settings.symbol, settings)
 
-        if grid.state_corrupted:
-            logger.warning("Deleting corrupt state file so next startup recalculates fresh bounds")
-            state_mgr.delete()
+            # Reconcile BEFORE deciding what to place, and whether the exchange holds a
+            # position or not. Gating this on has_exchange_positions left one wedge: a
+            # state file that still claimed a position while the exchange was flat. The
+            # strategy's place_initial_orders no-ops while it believes it holds anything,
+            # so nothing was ever placed again -- 2026-08-20 19:34 -> 21:31, the trend
+            # follower sat "long" 647 ADA that an exchange-side stop had already closed,
+            # polling in silence for two hours. The flat path of reconcile_positions is
+            # exactly what clears that ghost; the holding path adopts real inventory as
+            # before.
+            grid.reconcile_state()
+            grid.reconcile_positions()
 
-        has_exchange_positions = any(
-            float(p.get("contracts", 0) or 0) != 0
-            for p in exchange.get_positions(settings.symbol)
-        )
+            if not has_exchange_positions:
+                if risk.is_in_recovery():
+                    logger.warning(
+                        "STARTUP DEFERRED | recovery cooldown {}s remaining -- leaving the "
+                        "grid flat instead of re-arming a ladder into what tripped the kill "
+                        "switch (AUDIT #155)",
+                        risk.recovery_cooldown_remaining(),
+                    )
+                else:
+                    logger.info("No exchange positions — resetting stale grid levels to pending")
+                    grid.reset_levels_to_pending(exchange.get_price(settings.symbol))
+                    logger.info("Placing fresh grid orders after cleanup")
+                    grid.place_initial_orders(exchange.get_balance())
+        else:
+            logger.info("Calculating grid range from recent price action")
+            ohlcv = exchange.get_ohlcv(settings.symbol, settings.grid_timeframe, limit=candles_for_lookback(settings.grid_timeframe, settings.range_lookback_days))
+            current_price = exchange.get_price(settings.symbol)
 
+            grid_lower, grid_upper = calculate_grid_range(
+                ohlcv, current_price,
+                lookback_days=settings.range_lookback_days,
+                atr_multiplier=settings.range_atr_multiplier,
+                timeframe=settings.grid_timeframe,
+                mode=settings.range_mode,
+            )
+
+            atr_series = calc_atr(ohlcv["high"], ohlcv["low"], ohlcv["close"], period=14)
+            current_atr = float(atr_series.iloc[-1]) if not np.isnan(atr_series.iloc[-1]) else current_price * 0.02
+            atr_pct = current_atr / current_price
+            dynamic_count = calculate_dynamic_grid_count(atr_pct, settings.grid_count)
+            if dynamic_count != settings.grid_count:
+                logger.info("DYNAMIC GRID COUNT | ATR%={:.3f} | {} -> {} levels", atr_pct * 100, settings.grid_count, dynamic_count)
+
+            dynamic_allocation = dynamic_count * settings.capital_per_grid_pct
+            if dynamic_allocation > 0.5:
+                logger.warning(
+                    "Dynamic grid allocation {:.0%} exceeds 50% limit — clamping grid_count",
+                    dynamic_allocation,
+                )
+                dynamic_count = min(int(0.5 / settings.capital_per_grid_pct), settings.grid_count)
+
+            min_total_range = current_price * settings.range_min_spacing_pct * dynamic_count
+            current_range = grid_upper - grid_lower
+            if current_range < min_total_range:
+                needed_half = min_total_range / 2 * 1.01
+                grid_lower = current_price - needed_half
+                grid_upper = current_price + needed_half
+                logger.info(
+                    "GRID RANGE WIDENED for min spacing | new lower={} new upper={} (was {})",
+                    round(grid_lower, 8), round(grid_upper, 8), round(current_range, 8),
+                )
+
+            if not validate_grid_spacing(grid_lower, grid_upper, dynamic_count, settings.range_min_spacing_pct, current_price):
+                logger.error("Grid spacing validation failed. Adjust grid_count or range parameters.")
+                abort_startup(transient=False)
+
+            balance = exchange.get_balance()
+            risk.initialize(balance)
+
+            grid = GridEngine(
+                exchange, settings.symbol,
+                grid_lower=grid_lower,
+                grid_upper=grid_upper,
+                grid_count=dynamic_count,
+                capital_per_grid_pct=settings.capital_per_grid_pct,
+                stop_loss_pct=settings.stop_loss_pct,
+                maker_fee_pct=settings.maker_fee_pct / 100,
+                taker_fee_pct=settings.taker_fee_pct / 100,
+                taker_fill_share=settings.taker_fill_share_pct / 100,
+                recenter_cooldown=settings.recenter_cooldown,
+                replacement_cooldown=settings.replacement_cooldown,
+                order_pacing_seconds=settings.order_pacing_seconds,
+                capital_per_grid_usdt=settings.capital_per_grid_usdt,
+                leverage=settings.leverage,
+                trailing_sl_trigger_pct=settings.trailing_sl_trigger_pct,
+                max_exposure_pct=settings.max_exposure_pct,
+                min_profit_multiplier=settings.min_profit_multiplier,
+                rung_loss_cap_pct=settings.rung_loss_cap_pct,
+                max_open_loss_usdt=settings.max_open_loss_usdt,
+                event_journal=events,
+                notifier=notifier,
+            )
+            grid = _install_strategy(grid, exchange, events, notifier)
+            grid.initialize(current_price, balance)
+
+        # Can one side of the ladder actually fill, or will the cap strand the outer rungs?
+        #
+        # config.validate() answers this for PERCENT sizing but cannot for the
+        # CAPITAL_PER_GRID_USDT path: that size is absolute while the cap is a fraction of
+        # equity, so the comparison needs a balance config time does not have. #63 correctly
+        # stopped validating a figure that no longer decides anything and left nothing in its
+        # place -- so the guard vanished exactly as the USDT path became the live one.
+        #
+        # The failure it guards is documented: a grid wider than its cap goes permanently
+        # one-sided, the cap blocks that side partway through, and the bot lives in the
+        # capped state that makes recentering destructive (89 recenters in one session).
+        #
+        # A warning, not an abort. The cap and the size taper keep this SAFE, only degraded,
+        # and equity moves -- a restart after a drawdown should not refuse to start
+        # (AUDIT #66).
         seed_position_limit(exchange, grid, settings.symbol, settings)
 
-        # Reconcile BEFORE deciding what to place, and whether the exchange holds a
-        # position or not. Gating this on has_exchange_positions left one wedge: a
-        # state file that still claimed a position while the exchange was flat. The
-        # strategy's place_initial_orders no-ops while it believes it holds anything,
-        # so nothing was ever placed again -- 2026-08-20 19:34 -> 21:31, the trend
-        # follower sat "long" 647 ADA that an exchange-side stop had already closed,
-        # polling in silence for two hours. The flat path of reconcile_positions is
-        # exactly what clears that ghost; the holding path adopts real inventory as
-        # before.
-        grid.reconcile_state()
-        grid.reconcile_positions()
-
-        if not has_exchange_positions:
-            if risk.is_in_recovery():
+        try:
+            _one_side = grid.one_side_notional(balance)
+            _cap = balance * settings.max_position_pct
+            # A position already open eats the SAME cap the ladder is measured against, so
+            # the ladder's real headroom is the cap minus what is already held. Without that
+            # term this compares the ladder against the whole cap and passes a book that is
+            # already over it.
+            #
+            # 2026-08-19 10:01:24, restarting with SHORT 4284 ADA carried over:
+            #
+            #   LADDER FITS THE CAP | one side commits 750.00 of 982.39 (77%), 1.9 rung(s) spare
+            #
+            # The held short was ~749 USDT at 0.1749. 750 + 749 = 1499 against a 982 cap --
+            # 53% OVER before a single order was placed, reported as fitting with room to
+            # spare. The sell side then filled its way to 6307 ADA, set_position_limit hard-
+            # blocked it, every buy sat below break-even and was skipped, and the grid stood
+            # with an empty book for three hours while price ran 3.6% away (AUDIT #120).
+            _held = abs(getattr(grid, '_pos_qty', 0.0) or 0.0) * (current_price or 0.0)
+            _fits, _room = ladder_cap_room(_one_side, _cap, _held)
+            if not _fits:
+                _per_order = _one_side / max(1, settings.grid_count / 2)
                 logger.warning(
-                    "STARTUP DEFERRED | recovery cooldown {}s remaining -- leaving the "
-                    "grid flat instead of re-arming a ladder into what tripped the kill "
-                    "switch (AUDIT #155)",
-                    risk.recovery_cooldown_remaining(),
+                    "LADDER OUTGROWS THE CAP | {:.0f} rungs a side at {:.2f} USDT commits "
+                    "{:.2f}, and {:.2f} is already held, against the {:.0%} position cap of "
+                    "{:.2f} -- {:.2f} of room. The outer {:.1f} rung(s) can never fill and the "
+                    "book will go one-sided. Lower GRID_COUNT, lower CAPITAL_PER_GRID_USDT or "
+                    "LEVERAGE, or raise MAX_POSITION_PCT",
+                    settings.grid_count / 2, _per_order, _one_side, _held,
+                    settings.max_position_pct, _cap, _room,
+                    (_one_side - _room) / _per_order,
                 )
             else:
-                logger.info("No exchange positions — resetting stale grid levels to pending")
-                grid.reset_levels_to_pending(exchange.get_price(settings.symbol))
-                logger.info("Placing fresh grid orders after cleanup")
-                grid.place_initial_orders(exchange.get_balance())
-    else:
-        logger.info("Calculating grid range from recent price action")
-        ohlcv = exchange.get_ohlcv(settings.symbol, settings.grid_timeframe, limit=candles_for_lookback(settings.grid_timeframe, settings.range_lookback_days))
-        current_price = exchange.get_price(settings.symbol)
+                logger.info(
+                    "LADDER FITS THE CAP | one side commits {:.2f} of {:.2f} room ({:.2f} cap "
+                    "less {:.2f} held), {:.1f} rung(s) spare",
+                    _one_side, _room, _cap, _held,
+                    (_room - _one_side) / max(1e-9, _one_side / max(1, settings.grid_count / 2)),
+                )
+        except Exception as e:
+            logger.debug("Ladder/cap coherence check skipped: {}", e)
 
-        grid_lower, grid_upper = calculate_grid_range(
-            ohlcv, current_price,
-            lookback_days=settings.range_lookback_days,
-            atr_multiplier=settings.range_atr_multiplier,
-            timeframe=settings.grid_timeframe,
-            mode=settings.range_mode,
-        )
-
-        atr_series = calc_atr(ohlcv["high"], ohlcv["low"], ohlcv["close"], period=14)
-        current_atr = float(atr_series.iloc[-1]) if not np.isnan(atr_series.iloc[-1]) else current_price * 0.02
-        atr_pct = current_atr / current_price
-        dynamic_count = calculate_dynamic_grid_count(atr_pct, settings.grid_count)
-        if dynamic_count != settings.grid_count:
-            logger.info("DYNAMIC GRID COUNT | ATR%={:.3f} | {} -> {} levels", atr_pct * 100, settings.grid_count, dynamic_count)
-
-        dynamic_allocation = dynamic_count * settings.capital_per_grid_pct
-        if dynamic_allocation > 0.5:
-            logger.warning(
-                "Dynamic grid allocation {:.0%} exceeds 50% limit — clamping grid_count",
-                dynamic_allocation,
-            )
-            dynamic_count = min(int(0.5 / settings.capital_per_grid_pct), settings.grid_count)
-
-        min_total_range = current_price * settings.range_min_spacing_pct * dynamic_count
-        current_range = grid_upper - grid_lower
-        if current_range < min_total_range:
-            needed_half = min_total_range / 2 * 1.01
-            grid_lower = current_price - needed_half
-            grid_upper = current_price + needed_half
-            logger.info(
-                "GRID RANGE WIDENED for min spacing | new lower={} new upper={} (was {})",
-                round(grid_lower, 8), round(grid_upper, 8), round(current_range, 8),
-            )
-
-        if not validate_grid_spacing(grid_lower, grid_upper, dynamic_count, settings.range_min_spacing_pct, current_price):
-            logger.error("Grid spacing validation failed. Adjust grid_count or range parameters.")
-            abort_startup(transient=False)
-
-        balance = exchange.get_balance()
-        risk.initialize(balance)
-
-        grid = GridEngine(
-            exchange, settings.symbol,
-            grid_lower=grid_lower,
-            grid_upper=grid_upper,
-            grid_count=dynamic_count,
-            capital_per_grid_pct=settings.capital_per_grid_pct,
-            stop_loss_pct=settings.stop_loss_pct,
-            maker_fee_pct=settings.maker_fee_pct / 100,
-            taker_fee_pct=settings.taker_fee_pct / 100,
-            taker_fill_share=settings.taker_fill_share_pct / 100,
-            recenter_cooldown=settings.recenter_cooldown,
-            replacement_cooldown=settings.replacement_cooldown,
-            order_pacing_seconds=settings.order_pacing_seconds,
-            capital_per_grid_usdt=settings.capital_per_grid_usdt,
-            leverage=settings.leverage,
-            trailing_sl_trigger_pct=settings.trailing_sl_trigger_pct,
-            max_exposure_pct=settings.max_exposure_pct,
-            min_profit_multiplier=settings.min_profit_multiplier,
-            rung_loss_cap_pct=settings.rung_loss_cap_pct,
-            max_open_loss_usdt=settings.max_open_loss_usdt,
-            event_journal=events,
-            notifier=notifier,
-        )
-        grid = _install_strategy(grid, exchange, events, notifier)
-        grid.initialize(current_price, balance)
-
-    # Can one side of the ladder actually fill, or will the cap strand the outer rungs?
-    #
-    # config.validate() answers this for PERCENT sizing but cannot for the
-    # CAPITAL_PER_GRID_USDT path: that size is absolute while the cap is a fraction of
-    # equity, so the comparison needs a balance config time does not have. #63 correctly
-    # stopped validating a figure that no longer decides anything and left nothing in its
-    # place -- so the guard vanished exactly as the USDT path became the live one.
-    #
-    # The failure it guards is documented: a grid wider than its cap goes permanently
-    # one-sided, the cap blocks that side partway through, and the bot lives in the
-    # capped state that makes recentering destructive (89 recenters in one session).
-    #
-    # A warning, not an abort. The cap and the size taper keep this SAFE, only degraded,
-    # and equity moves -- a restart after a drawdown should not refuse to start
-    # (AUDIT #66).
-    seed_position_limit(exchange, grid, settings.symbol, settings)
-
-    try:
-        _one_side = grid.one_side_notional(balance)
-        _cap = balance * settings.max_position_pct
-        # A position already open eats the SAME cap the ladder is measured against, so
-        # the ladder's real headroom is the cap minus what is already held. Without that
-        # term this compares the ladder against the whole cap and passes a book that is
-        # already over it.
-        #
-        # 2026-08-19 10:01:24, restarting with SHORT 4284 ADA carried over:
-        #
-        #   LADDER FITS THE CAP | one side commits 750.00 of 982.39 (77%), 1.9 rung(s) spare
-        #
-        # The held short was ~749 USDT at 0.1749. 750 + 749 = 1499 against a 982 cap --
-        # 53% OVER before a single order was placed, reported as fitting with room to
-        # spare. The sell side then filled its way to 6307 ADA, set_position_limit hard-
-        # blocked it, every buy sat below break-even and was skipped, and the grid stood
-        # with an empty book for three hours while price ran 3.6% away (AUDIT #120).
-        _held = abs(getattr(grid, '_pos_qty', 0.0) or 0.0) * (current_price or 0.0)
-        _fits, _room = ladder_cap_room(_one_side, _cap, _held)
-        if not _fits:
-            _per_order = _one_side / max(1, settings.grid_count / 2)
-            logger.warning(
-                "LADDER OUTGROWS THE CAP | {:.0f} rungs a side at {:.2f} USDT commits "
-                "{:.2f}, and {:.2f} is already held, against the {:.0%} position cap of "
-                "{:.2f} -- {:.2f} of room. The outer {:.1f} rung(s) can never fill and the "
-                "book will go one-sided. Lower GRID_COUNT, lower CAPITAL_PER_GRID_USDT or "
-                "LEVERAGE, or raise MAX_POSITION_PCT",
-                settings.grid_count / 2, _per_order, _one_side, _held,
-                settings.max_position_pct, _cap, _room,
-                (_one_side - _room) / _per_order,
-            )
-        else:
-            logger.info(
-                "LADDER FITS THE CAP | one side commits {:.2f} of {:.2f} room ({:.2f} cap "
-                "less {:.2f} held), {:.1f} rung(s) spare",
-                _one_side, _room, _cap, _held,
-                (_room - _one_side) / max(1e-9, _one_side / max(1, settings.grid_count / 2)),
-            )
-    except Exception as e:
-        logger.debug("Ladder/cap coherence check skipped: {}", e)
-
-    sl_orders: dict[str, dict] = {}
-    _scale_out_done = False
-    # _sl_needs_update compares desired stops against `sl_orders`, which is a BELIEF.
-    # If reality drifts from it -- a leg cancelled out of band, an exchange-side
-    # expiry -- the belief still matches and the position silently stops being
-    # covered. So verification is forced on a timer regardless of belief (AUDIT #54).
-    _sl_last_verified = 0.0
-    SL_VERIFY_INTERVAL_SECONDS = 120.0
-
-    def _reset_sl():
-        nonlocal sl_orders, _scale_out_done, _sl_last_verified
-        sl_orders = {}
+        sl_orders: dict[str, dict] = {}
         _scale_out_done = False
+        # _sl_needs_update compares desired stops against `sl_orders`, which is a BELIEF.
+        # If reality drifts from it -- a leg cancelled out of band, an exchange-side
+        # expiry -- the belief still matches and the position silently stops being
+        # covered. So verification is forced on a timer regardless of belief (AUDIT #54).
         _sl_last_verified = 0.0
+        SL_VERIFY_INTERVAL_SECONDS = 120.0
 
-    def _desired_sl_orders(side: str, qty: float) -> list[tuple[str, float, float]]:
-        """Return list of (kind, qty, price) stop-market orders for the open position.
-
-        Scale-out design: the trailing stop covers sl_scale_out_pct of the position at the
-        trailing level; the remainder is covered by a hard stop at the static stop-loss level.
-        When the trailing level equals the hard level (no trailing protection yet), the
-        startup anchor (peak*(1-stop_loss_pct)) is used so the split arms immediately.
-        """
-        if side == "long":
-            trail_price = grid.get_stop_loss_price()
-            # Ratcheted, not recomputed from grid_lower: a recenter must not push the
-            # hard stop away from an open position (AUDIT #25).
-            hard_price = grid.get_hard_stop_loss_price()
-        else:
-            trail_price = grid.get_short_stop_loss_price()
-            hard_price = grid.get_short_hard_stop_loss_price()
-        return build_scale_out_orders(
-            side, qty, settings.sl_scale_out_pct, trail_price, hard_price,
-            rounder=lambda q: float(exchange.exchange.amount_to_precision(settings.symbol, q)),
-            scale_out_done=_scale_out_done,
-            startup_trail_price=grid.get_scale_out_trail_price(side),
-            min_notional=MIN_NOTIONAL_USDT,
-        )
-
-    def _refresh_sl_stops(side: str, qty: float) -> bool:
-        """Re-arm the stop-loss legs. Returns True only if the position ends up covered.
-
-        AUDIT #50. This cancels every stop FIRST and then places replacements inside a
-        try/except that only logs. Any failure in between leaves an open position with
-        no stop at all, and the caller could not tell -- it returned None either way.
-
-        That is the 2026-08-08 sequence exactly: the cancel succeeded, four consecutive
-        placements raised `Exchange.amount_to_precision() missing 1 required positional
-        argument` (#47), each was logged and swallowed, and a position already 1.8x
-        through its cap (#49) ran completely unprotected until EMERGENCY STOP. That day
-        was -50.49, 60% of the fortnight's loss.
-
-        The window cannot be closed entirely -- Binance has no atomic replace for stop
-        orders -- but it can be made loud and it can be made to stop the bleeding: the
-        caller blocks new exposure while uncovered, so an unprotected position can no
-        longer also be a growing one.
-        """
-        nonlocal sl_orders, _sl_last_verified
-        close_side = "sell" if side == "long" else "buy"
-        desired = list(_desired_sl_orders(side, qty))
-        if not desired:
+        def _reset_sl():
+            nonlocal sl_orders, _scale_out_done, _sl_last_verified
             sl_orders = {}
-            return True
+            _scale_out_done = False
+            _sl_last_verified = 0.0
 
-        live = exchange.get_stop_orders(settings.symbol)
-        if live is None:
-            # Unknown state. Tearing down protection we cannot see is precisely how a
-            # position ends up naked, so change NOTHING and report uncovered: the caller
-            # stops adding exposure and the next pass tries again (AUDIT #54).
-            logger.error(
-                "STOP REFRESH ABORTED | stop book unreadable — existing stops left in "
-                "place, new exposure blocked until it can be verified",
+        def _desired_sl_orders(side: str, qty: float) -> list[tuple[str, float, float]]:
+            """Return list of (kind, qty, price) stop-market orders for the open position.
+
+            Scale-out design: the trailing stop covers sl_scale_out_pct of the position at the
+            trailing level; the remainder is covered by a hard stop at the static stop-loss level.
+            When the trailing level equals the hard level (no trailing protection yet), the
+            startup anchor (peak*(1-stop_loss_pct)) is used so the split arms immediately.
+            """
+            if side == "long":
+                trail_price = grid.get_stop_loss_price()
+                # Ratcheted, not recomputed from grid_lower: a recenter must not push the
+                # hard stop away from an open position (AUDIT #25).
+                hard_price = grid.get_hard_stop_loss_price()
+            else:
+                trail_price = grid.get_short_stop_loss_price()
+                hard_price = grid.get_short_hard_stop_loss_price()
+            return build_scale_out_orders(
+                side, qty, settings.sl_scale_out_pct, trail_price, hard_price,
+                rounder=lambda q: float(exchange.exchange.amount_to_precision(settings.symbol, q)),
+                scale_out_done=_scale_out_done,
+                startup_trail_price=grid.get_scale_out_trail_price(side),
+                min_notional=MIN_NOTIONAL_USDT,
             )
+
+        def _refresh_sl_stops(side: str, qty: float) -> bool:
+            """Re-arm the stop-loss legs. Returns True only if the position ends up covered.
+
+            AUDIT #50. This cancels every stop FIRST and then places replacements inside a
+            try/except that only logs. Any failure in between leaves an open position with
+            no stop at all, and the caller could not tell -- it returned None either way.
+
+            That is the 2026-08-08 sequence exactly: the cancel succeeded, four consecutive
+            placements raised `Exchange.amount_to_precision() missing 1 required positional
+            argument` (#47), each was logged and swallowed, and a position already 1.8x
+            through its cap (#49) ran completely unprotected until EMERGENCY STOP. That day
+            was -50.49, 60% of the fortnight's loss.
+
+            The window cannot be closed entirely -- Binance has no atomic replace for stop
+            orders -- but it can be made loud and it can be made to stop the bleeding: the
+            caller blocks new exposure while uncovered, so an unprotected position can no
+            longer also be a growing one.
+            """
+            nonlocal sl_orders, _sl_last_verified
+            close_side = "sell" if side == "long" else "buy"
+            desired = list(_desired_sl_orders(side, qty))
+            if not desired:
+                sl_orders = {}
+                return True
+
+            live = exchange.get_stop_orders(settings.symbol)
+            if live is None:
+                # Unknown state. Tearing down protection we cannot see is precisely how a
+                # position ends up naked, so change NOTHING and report uncovered: the caller
+                # stops adding exposure and the next pass tries again (AUDIT #54).
+                logger.error(
+                    "STOP REFRESH ABORTED | stop book unreadable — existing stops left in "
+                    "place, new exposure blocked until it can be verified",
+                )
+                return False
+
+            sl_orders, covered_qty, desired_qty = reconcile_stop_orders(
+                exchange, settings.symbol, close_side, desired, live,
+                over_coverage_tolerance=SL_OVER_COVERAGE_TOLERANCE,
+                price_tolerance_pct=SL_PRICE_DRIFT_TOLERANCE,
+            )
+            _sl_last_verified = time.time()
+
+            covered = covered_qty >= desired_qty - max(1e-8, desired_qty * 1e-6)
+            if not covered:
+                logger.error(
+                    "POSITION UNDER-PROTECTED | {} {} — stops cover {:.8g} of {:.8g} "
+                    "({:.0f}%). Blocking new exposure until fully covered (AUDIT #54)",
+                    side, qty, covered_qty, desired_qty,
+                    100.0 * covered_qty / desired_qty if desired_qty else 0.0,
+                )
+                events.risk_check("stop_loss_coverage", covered_qty, desired_qty, "UNPROTECTED")
+            return covered
+
+        def _detect_trail_fill() -> None:
+            """Mark the scale-out done only when the trailing stop actually triggered.
+
+            Order absence alone does not mean it fired -- we cancel stops ourselves on every
+            refresh, on pause(), and inside recenter(). Observed live on 2026-08-12 at
+            14:06: a recenter cancelled both legs, this read the missing id as a fire, and
+            _scale_out_done latched permanently. The trailing leg was never re-placed and a
+            7108 DOGE long spent the rest of its life on the hard stop alone.
+
+            So confirm with the exchange: only a genuinely filled/closed order counts. A
+            cancelled or unreadable one leaves the flag alone, and _refresh_sl_stops
+            re-places the leg on the next pass (AUDIT #26).
+            """
+            nonlocal _scale_out_done
+            if _scale_out_done or "trail" not in sl_orders:
+                return
+            if exchange.demo and not exchange.has_credentials:
+                return
+            trail_id = sl_orders["trail"]["id"]
+            live_stops = exchange.get_stop_orders(settings.symbol)
+            if live_stops is None:
+                # Unreadable book. "Absent" cannot be concluded from a failed read, and
+                # concluding it here would latch _scale_out_done permanently (AUDIT #54).
+                logger.debug("SCALE-OUT CHECK | stop book unreadable — deferring")
+                return
+            open_ids = {o.get("id") for o in live_stops}
+            if trail_id in open_ids:
+                return
+
+            try:
+                order = exchange.fetch_order(trail_id, settings.symbol)
+            except Exception as e:
+                logger.debug("SCALE-OUT CHECK | could not fetch {} ({}) — assuming not fired", trail_id, e)
+                order = None
+
+            status = (order or {}).get("status")
+            if trail_stop_fired(order):
+                _scale_out_done = True
+                logger.warning(
+                    "SCALE-OUT STOP FIRED | trailing leg filled at {} — remainder on hard stop only",
+                    sl_orders["trail"]["price"],
+                )
+                return
+
+            logger.debug(
+                "SCALE-OUT CHECK | trail stop {} gone with status={} (cancelled, not fired) "
+                "— leg will be re-placed",
+                trail_id, status,
+            )
+            sl_orders.pop("trail", None)
+
+        # Refreshing a stop means cancel-then-place, which leaves the position unprotected
+        # for the round trip. Rebuilding on every quantity change made that gap recur on
+        # literally every partial fill. Stops are reduceOnly, so a stop LARGER than the
+        # position is harmless (it closes whatever remains) -- only under-coverage is a
+        # real exposure. So: always refresh when the stop no longer covers the position or
+        # the trigger price moved; tolerate over-coverage until it drifts materially.
+        SL_OVER_COVERAGE_TOLERANCE = 0.10
+
+        # How far a live trigger may drift from the desired one before the leg is re-placed.
+        # This is the caller's half of a pair: reconcile_stop_orders must match at least this
+        # loosely or the 120-second verify re-places legs this test would have left alone,
+        # which is where ~14 stop cancels an hour came from on 2026-08-17. One constant, both
+        # sides, so the two can no longer disagree.
+        SL_PRICE_DRIFT_TOLERANCE = 0.001
+
+        def _sl_needs_update(side: str, qty: float) -> bool:
+            if not sl_orders:
+                return True
+            if time.time() - _sl_last_verified >= SL_VERIFY_INTERVAL_SECONDS:
+                return True                      # periodic trust-but-verify (AUDIT #54)
+            desired = _desired_sl_orders(side, qty)
+            if len(desired) != len(sl_orders):
+                return True
+            for kind, oqty, oprice in desired:
+                cur = sl_orders.get(kind)
+                if cur is None:
+                    return True
+                if abs(cur["price"] - oprice) > max(oprice * SL_PRICE_DRIFT_TOLERANCE, 1e-8):
+                    return True
+                if cur["qty"] < oqty - max(1e-8, oqty * 1e-6):
+                    return True  # under-covered: the position outgrew its stop
+                if cur["qty"] > oqty * (1 + SL_OVER_COVERAGE_TOLERANCE) + 1e-8:
+                    return True  # stale oversized stop, resize to keep sizing honest
             return False
 
-        sl_orders, covered_qty, desired_qty = reconcile_stop_orders(
-            exchange, settings.symbol, close_side, desired, live,
-            over_coverage_tolerance=SL_OVER_COVERAGE_TOLERANCE,
-            price_tolerance_pct=SL_PRICE_DRIFT_TOLERANCE,
-        )
-        _sl_last_verified = time.time()
-
-        covered = covered_qty >= desired_qty - max(1e-8, desired_qty * 1e-6)
-        if not covered:
+        # get_net_position swallows a failed read and returns ("", 0.0) -- indistinguishable
+        # from genuinely flat. Silently skipping the stop-loss check below on that value
+        # would let grid.activate() add fresh exposure on top of a position that might be
+        # real and completely unprotected. Probe explicitly first and refuse to guess,
+        # mirroring seed_position_limit's AUDIT #125 pattern (AUDIT #159).
+        try:
+            exchange.get_positions(settings.symbol)
+            positions_readable = True
+        except Exception as e:
+            positions_readable = False
             logger.error(
-                "POSITION UNDER-PROTECTED | {} {} — stops cover {:.8g} of {:.8g} "
-                "({:.0f}%). Blocking new exposure until fully covered (AUDIT #54)",
-                side, qty, covered_qty, desired_qty,
-                100.0 * covered_qty / desired_qty if desired_qty else 0.0,
+                "STARTUP STOP-LOSS CHECK SKIPPED | positions unreadable ({}) -- blocking "
+                "both sides until the exchange is readable again",
+                e,
             )
-            events.risk_check("stop_loss_coverage", covered_qty, desired_qty, "UNPROTECTED")
-        return covered
+            grid.block_side("buy", "positions unreadable at startup")
+            grid.block_side("sell", "positions unreadable at startup")
 
-    def _detect_trail_fill() -> None:
-        """Mark the scale-out done only when the trailing stop actually triggered.
-
-        Order absence alone does not mean it fired -- we cancel stops ourselves on every
-        refresh, on pause(), and inside recenter(). Observed live on 2026-08-12 at
-        14:06: a recenter cancelled both legs, this read the missing id as a fire, and
-        _scale_out_done latched permanently. The trailing leg was never re-placed and a
-        7108 DOGE long spent the rest of its life on the hard stop alone.
-
-        So confirm with the exchange: only a genuinely filled/closed order counts. A
-        cancelled or unreadable one leaves the flag alone, and _refresh_sl_stops
-        re-places the leg on the next pass (AUDIT #26).
-        """
-        nonlocal _scale_out_done
-        if _scale_out_done or "trail" not in sl_orders:
-            return
-        if exchange.demo and not exchange.has_credentials:
-            return
-        trail_id = sl_orders["trail"]["id"]
-        live_stops = exchange.get_stop_orders(settings.symbol)
-        if live_stops is None:
-            # Unreadable book. "Absent" cannot be concluded from a failed read, and
-            # concluding it here would latch _scale_out_done permanently (AUDIT #54).
-            logger.debug("SCALE-OUT CHECK | stop book unreadable — deferring")
-            return
-        open_ids = {o.get("id") for o in live_stops}
-        if trail_id in open_ids:
-            return
-
-        try:
-            order = exchange.fetch_order(trail_id, settings.symbol)
-        except Exception as e:
-            logger.debug("SCALE-OUT CHECK | could not fetch {} ({}) — assuming not fired", trail_id, e)
-            order = None
-
-        status = (order or {}).get("status")
-        if trail_stop_fired(order):
-            _scale_out_done = True
-            logger.warning(
-                "SCALE-OUT STOP FIRED | trailing leg filled at {} — remainder on hard stop only",
-                sl_orders["trail"]["price"],
-            )
-            return
-
-        logger.debug(
-            "SCALE-OUT CHECK | trail stop {} gone with status={} (cancelled, not fired) "
-            "— leg will be re-placed",
-            trail_id, status,
-        )
-        sl_orders.pop("trail", None)
-
-    # Refreshing a stop means cancel-then-place, which leaves the position unprotected
-    # for the round trip. Rebuilding on every quantity change made that gap recur on
-    # literally every partial fill. Stops are reduceOnly, so a stop LARGER than the
-    # position is harmless (it closes whatever remains) -- only under-coverage is a
-    # real exposure. So: always refresh when the stop no longer covers the position or
-    # the trigger price moved; tolerate over-coverage until it drifts materially.
-    SL_OVER_COVERAGE_TOLERANCE = 0.10
-
-    # How far a live trigger may drift from the desired one before the leg is re-placed.
-    # This is the caller's half of a pair: reconcile_stop_orders must match at least this
-    # loosely or the 120-second verify re-places legs this test would have left alone,
-    # which is where ~14 stop cancels an hour came from on 2026-08-17. One constant, both
-    # sides, so the two can no longer disagree.
-    SL_PRICE_DRIFT_TOLERANCE = 0.001
-
-    def _sl_needs_update(side: str, qty: float) -> bool:
-        if not sl_orders:
-            return True
-        if time.time() - _sl_last_verified >= SL_VERIFY_INTERVAL_SECONDS:
-            return True                      # periodic trust-but-verify (AUDIT #54)
-        desired = _desired_sl_orders(side, qty)
-        if len(desired) != len(sl_orders):
-            return True
-        for kind, oqty, oprice in desired:
-            cur = sl_orders.get(kind)
-            if cur is None:
-                return True
-            if abs(cur["price"] - oprice) > max(oprice * SL_PRICE_DRIFT_TOLERANCE, 1e-8):
-                return True
-            if cur["qty"] < oqty - max(1e-8, oqty * 1e-6):
-                return True  # under-covered: the position outgrew its stop
-            if cur["qty"] > oqty * (1 + SL_OVER_COVERAGE_TOLERANCE) + 1e-8:
-                return True  # stale oversized stop, resize to keep sizing honest
-        return False
-
-    position_side, position_qty = get_net_position(exchange, settings.symbol)
-    _last_side = position_side
-    if position_side in ("long", "short"):
-        try:
-            start_price = exchange.get_price(settings.symbol)
-            if position_side == "long":
-                grid.update_trailing_sl(start_price)
-            else:
-                grid.update_trailing_sl_short(start_price)
-            # The third caller, and the one that matters most: this runs at STARTUP with
-            # an inherited position, before the loop has done anything. Discarding the
-            # answer here meant a restart that could not re-establish stops went on to
-            # activate the grid and add exposure to a naked position (AUDIT #52).
-            if not _refresh_sl_stops(position_side, position_qty):
+        position_side, position_qty = get_net_position(exchange, settings.symbol)
+        _last_side = position_side
+        if positions_readable and position_side in ("long", "short"):
+            try:
+                start_price = exchange.get_price(settings.symbol)
+                if position_side == "long":
+                    grid.update_trailing_sl(start_price)
+                else:
+                    grid.update_trailing_sl_short(start_price)
+                # The third caller, and the one that matters most: this runs at STARTUP with
+                # an inherited position, before the loop has done anything. Discarding the
+                # answer here meant a restart that could not re-establish stops went on to
+                # activate the grid and add exposure to a naked position (AUDIT #52).
+                if not _refresh_sl_stops(position_side, position_qty):
+                    grid.block_side("buy" if position_side == "long" else "sell",
+                                    "stop-loss missing at startup")
+                grid.log_sl_status(position_side)
+            except Exception as e:
+                logger.error("Failed to place stop-loss on startup: {}", e)
                 grid.block_side("buy" if position_side == "long" else "sell",
-                                "stop-loss missing at startup")
-            grid.log_sl_status(position_side)
-        except Exception as e:
-            logger.error("Failed to place stop-loss on startup: {}", e)
-            grid.block_side("buy" if position_side == "long" else "sell",
-                            "stop-loss placement raised at startup")
+                                "stop-loss placement raised at startup")
 
-    price_now = exchange.get_price(settings.symbol)
-    balance_info = exchange.get_balance_info()
-    logger.info("Current price: {}", price_now)
-    logger.info(
-        "Balance: free={:.2f} USDT total={:.2f} USDT used={:.2f} USDT",
-        balance_info["free"], balance_info["total"], balance_info["used"],
-    )
-    logger.info("Grid range: [{} - {}] | levels: {}", round(grid.grid_lower, 8), round(grid.grid_upper, 8), grid.grid_count)
-
-    ohlcv_tf = exchange.get_ohlcv(settings.symbol, settings.trend_timeframe, limit=100)
-    trend.update(ohlcv_tf, settings.trend_timeframe)
-    try:
-        ohlcv_fast = exchange.get_ohlcv(settings.symbol, settings.trend_timeframe_fast, limit=100)
-        trend.add_timeframe(ohlcv_fast, settings.trend_timeframe_fast)
-    except Exception:
-        pass
-    try:
-        ohlcv_1d = exchange.get_ohlcv(settings.symbol, "1d", limit=100)
-        trend.add_timeframe(ohlcv_1d, "1d")
-    except Exception:
-        pass
-
-    if risk.is_in_recovery():
-        # Second, redundant check -- the branch above already refuses to place a fresh
-        # ladder during a recovery cooldown, but this is also where an inherited grid
-        # would otherwise get switched on regardless (AUDIT #155).
-        if grid.active:
-            grid.pause()
-            _reset_sl()
-        logger.warning(
-            "STARTUP DEFERRED | recovery cooldown {}s remaining -- grid stays inactive",
-            risk.recovery_cooldown_remaining(),
+        price_now = exchange.get_price(settings.symbol)
+        balance_info = exchange.get_balance_info()
+        logger.info("Current price: {}", price_now)
+        logger.info(
+            "Balance: free={:.2f} USDT total={:.2f} USDT used={:.2f} USDT",
+            balance_info["free"], balance_info["total"], balance_info["used"],
         )
-    elif settings.force_trade_now or trend.is_ranging():
-        grid.activate(exchange.get_balance())
-        notifier.on_grid_start(settings.symbol, grid.grid_lower, grid.grid_upper, grid.grid_count)
-        if settings.force_trade_now:
-            logger.warning("Force trade mode enabled; bypassing trend gate and activating grid immediately.")
-    else:
-        if grid.active:
-            grid.pause()
-            _reset_sl()
-        logger.info("Market is trending ({}), grid will wait for ranging conditions", trend.regime.value)
+        logger.info("Grid range: [{} - {}] | levels: {}", round(grid.grid_lower, 8), round(grid.grid_upper, 8), grid.grid_count)
 
-    logger.info("Bot running in {} mode. Press Ctrl+C to stop.", mode)
-    logger.info("Poll interval: {}s | Trend check: {}s", settings.poll_interval, settings.trend_check_interval)
+        ohlcv_tf = exchange.get_ohlcv(settings.symbol, settings.trend_timeframe, limit=100)
+        trend.update(ohlcv_tf, settings.trend_timeframe)
+        try:
+            ohlcv_fast = exchange.get_ohlcv(settings.symbol, settings.trend_timeframe_fast, limit=100)
+            trend.add_timeframe(ohlcv_fast, settings.trend_timeframe_fast)
+        except Exception as e:
+            # AUDIT #163. This used to swallow with zero trace -- unlike every other
+            # narrow-purpose catch in this file, which logs at least at debug. A
+            # sustained outage on this feed silently degraded regime confirmation for
+            # the whole session with nothing in the log to explain why.
+            logger.debug("Fast timeframe ({}) unavailable at startup: {}", settings.trend_timeframe_fast, e)
+        try:
+            ohlcv_1d = exchange.get_ohlcv(settings.symbol, "1d", limit=100)
+            trend.add_timeframe(ohlcv_1d, "1d")
+        except Exception as e:
+            logger.debug("1d timeframe unavailable at startup: {}", e)
 
-    notifier.on_startup_summary(
-        symbol=settings.symbol,
-        mode=mode,
-        price=price_now,
-        grid_lower=grid.grid_lower,
-        grid_upper=grid.grid_upper,
-        grid_count=grid.grid_count,
-        balance_free=balance_info["free"],
-        equity=exchange.get_total_equity(),
-        leverage=settings.leverage,
-        regime=trend.regime.value,
-        adx=trend.adx_value,
-        grid_active=grid.active,
-        total_pnl_verified=pnl_reconciler.net_realized_pnl,
-                        session_pnl=pnl_reconciler.session_pnl,
-                        pnl_window=pnl_reconciler.window_label,
-    )
-    _notify_status(notifier, exchange, settings.symbol, price_now)
+        if risk.is_in_recovery():
+            # Second, redundant check -- the branch above already refuses to place a fresh
+            # ladder during a recovery cooldown, but this is also where an inherited grid
+            # would otherwise get switched on regardless (AUDIT #155).
+            if grid.active:
+                grid.pause()
+                _reset_sl()
+            logger.warning(
+                "STARTUP DEFERRED | recovery cooldown {}s remaining -- grid stays inactive",
+                risk.recovery_cooldown_remaining(),
+            )
+        elif settings.force_trade_now or trend.is_ranging():
+            grid.activate(exchange.get_balance())
+            notifier.on_grid_start(settings.symbol, grid.grid_lower, grid.grid_upper, grid.grid_count)
+            if settings.force_trade_now:
+                logger.warning("Force trade mode enabled; bypassing trend gate and activating grid immediately.")
+        else:
+            if grid.active:
+                grid.pause()
+                _reset_sl()
+            logger.info("Market is trending ({}), grid will wait for ranging conditions", trend.regime.value)
+
+        logger.info("Bot running in {} mode. Press Ctrl+C to stop.", mode)
+        logger.info("Poll interval: {}s | Trend check: {}s", settings.poll_interval, settings.trend_check_interval)
+
+        notifier.on_startup_summary(
+            symbol=settings.symbol,
+            mode=mode,
+            price=price_now,
+            grid_lower=grid.grid_lower,
+            grid_upper=grid.grid_upper,
+            grid_count=grid.grid_count,
+            balance_free=balance_info["free"],
+            equity=exchange.get_total_equity(),
+            leverage=settings.leverage,
+            regime=trend.regime.value,
+            adx=trend.adx_value,
+            grid_active=grid.active,
+            total_pnl_verified=pnl_reconciler.net_realized_pnl,
+                            session_pnl=pnl_reconciler.session_pnl,
+                            pnl_window=pnl_reconciler.window_label,
+        )
+        _notify_status(notifier, exchange, settings.symbol, price_now)
+    except Exception as e:
+        # The main loop already gets this via its own try/except/finally below --
+        # this mirrors it for the startup stretch above, which used to have nothing
+        # of its own. A crash here (a network blip mid-startup, an exchange 5xx)
+        # used to propagate straight out of run_bot() uncaught, leaving whatever had
+        # just been placed (a partial ladder, a lone entry order) completely
+        # unmanaged until the next restart's blanket cleanup swept it up. Cancel/
+        # close reads exchange state directly rather than trusting local tracking,
+        # so it cleans up correctly regardless of how far startup got (AUDIT #157).
+        logger.error("STARTUP FAILED | {} -- attempting cleanup before re-raising", e)
+        try:
+            if grid is not None:
+                grid.emergency_stop(reason="startup_failure")
+        except Exception as cleanup_err:
+            logger.error("Cleanup after startup failure also failed: {}", cleanup_err)
+        raise
 
     loop_count = 0
     consecutive_errors = 0
@@ -1825,6 +1865,7 @@ def run_bot() -> None:
                         continue
                     else:
                         logger.info("RECOVERY READY | recalculating grid around current price {}", price)
+                        new_grid = None
                         try:
                             ohlcv = exchange.get_ohlcv(settings.symbol, settings.grid_timeframe, limit=candles_for_lookback(settings.grid_timeframe, settings.range_lookback_days))
                             grid_lower, grid_upper = calculate_grid_range(
@@ -1881,7 +1922,7 @@ def run_bot() -> None:
                             old_peak = grid.peak_price
                             old_grid_lower, old_grid_upper = grid.grid_lower, grid.grid_upper
 
-                            grid = GridEngine(
+                            new_grid = GridEngine(
                                 exchange, settings.symbol,
                                 grid_lower=grid_lower,
                                 grid_upper=grid_upper,
@@ -1904,7 +1945,7 @@ def run_bot() -> None:
                                 event_journal=events,
                                 notifier=notifier,
                             )
-                            grid = _install_strategy(grid, exchange, events, notifier)
+                            new_grid = _install_strategy(new_grid, exchange, events, notifier)
                             # The third placement site, and the one AUDIT #125 missed.
                             # The cooldown ends with whatever position triggered the
                             # kill switch still open, so rebuilding here without the
@@ -1913,15 +1954,29 @@ def run_bot() -> None:
                             # short to 6,307 on 2026-08-19. The ordering test asserted
                             # ">= 2 call sites" and passed while this one had none
                             # (AUDIT #130).
-                            seed_position_limit(exchange, grid, settings.symbol, settings)
-                            grid.initialize(price, exchange.get_balance())
-                            grid.total_fills = old_fills
-                            grid.total_pnl = old_pnl
-                            grid.total_fees = old_fees
-                            grid.total_completed_cycles = old_cycles
-                            grid.peak_price = old_peak
+                            seed_position_limit(exchange, new_grid, settings.symbol, settings)
+                            new_grid.initialize(price, exchange.get_balance())
+                            new_grid.total_fills = old_fills
+                            new_grid.total_pnl = old_pnl
+                            new_grid.total_fees = old_fees
+                            new_grid.total_completed_cycles = old_cycles
+                            new_grid.peak_price = old_peak
+                            new_grid.activate(exchange.get_balance())
+
+                            # Everything throwable above succeeded -- only now does the
+                            # outer `grid` and recovery state actually change (AUDIT
+                            # #161). `grid` used to be reassigned to the fresh, zeroed
+                            # engine BEFORE its stats were restored and BEFORE
+                            # activate() ran; a throw anywhere in between left the outer
+                            # `grid` pointing at a zeroed engine with risk.exit_recovery()
+                            # sometimes already called too -- the bot's whole cumulative
+                            # fill/PnL/fee history reading zero, and the retry path
+                            # disabled since is_in_recovery() was already False. A
+                            # mid-rebuild failure now leaves the OLD grid (real stats
+                            # intact) and risk.is_in_recovery()==True completely
+                            # untouched, so the next cycle retries cleanly.
+                            grid = new_grid
                             risk.exit_recovery()
-                            grid.activate(exchange.get_balance())
                             notifier.on_grid_start(settings.symbol, grid.grid_lower, grid.grid_upper, grid.grid_count)
                             notifier.on_recovery_resume(recovery_mult)
                             notifier.on_grid_recalculated(settings.symbol, grid_lower, grid_upper, dynamic_count, "recovery")
@@ -1933,7 +1988,40 @@ def run_bot() -> None:
                             _notify_status(notifier, exchange, settings.symbol, price)
                             logger.info("Grid recovered and activated with {}% sizing", int(recovery_mult * 100))
                         except Exception as e:
-                            logger.error("Recovery failed: {} — will retry next cycle", e)
+                            if new_grid is not None:
+                                # Whatever new_grid managed to place before the throw is
+                                # real exchange state the OLD grid knows nothing about --
+                                # sweep it via new_grid's own emergency_stop (reads the
+                                # exchange directly) rather than leaving it untracked.
+                                try:
+                                    new_grid.emergency_stop(reason="recovery_rebuild_failed")
+                                except Exception as cleanup_err:
+                                    logger.error(
+                                        "Cleanup after failed recovery rebuild also failed: {}",
+                                        cleanup_err,
+                                    )
+                            if isinstance(e, BUG_ERRORS):
+                                # A defect in this program, not a market/network problem
+                                # -- same distinction and treatment as the outer loop
+                                # handler (AUDIT #31), which this nested try/continue
+                                # would otherwise hide from forever at poll_interval.
+                                signature = f"{type(e).__name__}: {e}"
+                                first_time = signature not in seen_bug_errors
+                                logger.opt(exception=first_time).error(
+                                    "BUG IN RECOVERY REBUILD | {} -- this is a code "
+                                    "defect, not a connection problem", signature,
+                                )
+                                if first_time:
+                                    seen_bug_errors.add(signature)
+                                    try:
+                                        notifier.send(
+                                            f"<b>BOT DEFECT</b>\n{signature}\n"
+                                            f"Recovery rebuild is raising every cycle."
+                                        )
+                                    except Exception:
+                                        pass
+                            else:
+                                logger.error("Recovery failed: {} — will retry next cycle", e)
                             time.sleep(settings.poll_interval)
                             continue
 
@@ -1944,13 +2032,14 @@ def run_bot() -> None:
                     try:
                         ohlcv_fast = exchange.get_ohlcv(settings.symbol, settings.trend_timeframe_fast, limit=100)
                         trend.add_timeframe(ohlcv_fast, settings.trend_timeframe_fast)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # AUDIT #163: was a silent pass -- see the startup fetch above.
+                        logger.debug("Fast timeframe ({}) unavailable: {}", settings.trend_timeframe_fast, e)
                     try:
                         ohlcv_1d = exchange.get_ohlcv(settings.symbol, "1d", limit=100)
                         trend.add_timeframe(ohlcv_1d, "1d")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("1d timeframe unavailable: {}", e)
 
                     logger.info("REGIME | {} -> {}", trend.explain(), trend.regime.value)
 
@@ -2345,6 +2434,7 @@ def run_bot() -> None:
                     grid.apply_open_loss_guard(price)
 
                     if position_side != _last_side:
+                        commit_flip = True
                         if position_side == "" and _last_side in ("long", "short"):
                             # The exchange just went flat under us -- a stop leg fired,
                             # a manual close, an ADL. Tell the live strategy BEFORE
@@ -2372,19 +2462,25 @@ def run_bot() -> None:
                                     "leaving strategy state alone this tick", e,
                                 )
                                 still_held = True
-                            if not still_held:
+                            if still_held:
+                                # AUDIT #160: don't commit a flat reading this branch
+                                # just refused to trust -- retry the re-verify next tick.
+                                commit_flip = False
+                            else:
                                 try:
                                     grid.reconcile_positions()
                                 except Exception as e:
                                     logger.warning(
                                         "SIDE FLIP | reconcile after external close "
-                                        "failed: {}", e,
+                                        "failed: {} — retrying next tick", e,
                                     )
-                        _last_side = position_side
-                        grid.reset_trailing()
-                        if _scale_out_done:
-                            _scale_out_done = False
-                            sl_orders = {}
+                                    commit_flip = False
+                        if commit_flip:
+                            _last_side = position_side
+                            grid.reset_trailing()
+                            if _scale_out_done:
+                                _scale_out_done = False
+                                sl_orders = {}
 
                     # AUDIT #50. An unprotected position must not also be a growing one.
                     # On 08-08 the stop legs all failed to place and the grid kept
