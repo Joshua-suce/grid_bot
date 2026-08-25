@@ -312,6 +312,70 @@ def test_reconcile_clears_a_position_the_exchange_does_not_have():
     assert tf._side is None
 
 
+def test_clearing_a_phantom_position_also_clears_its_regime():
+    """AUDIT #146. A restored state file's claimed position and its regime label are
+    exactly as stale as each other -- proving one false and trusting the other is how
+    a bot with a flat exchange still opens a fresh trade on the next activate().
+
+    ADAUSDT 2026-08-25 00:01: cleanup.py flattened the book the night before while the
+    bot was stopped. On restart, load_from_dict restored _side="long" and
+    _regime="uptrend" from before the flatten. reconcile_positions correctly found the
+    exchange flat and cleared _side -- but left _regime alone, and activate() (called
+    moments later, before update_regime ever ran this session) opened a brand new long
+    off that stale label alone.
+    """
+    ex = FakeExchange()
+    tf = TrendFollower(exchange=ex, symbol="DOGEUSDT")
+    tf.load_from_dict(
+        {"side": "long", "qty": 4000.0, "entry_price": 0.0715, "regime": "uptrend"},
+        current_price=0.0720,
+    )
+    assert tf._regime == "uptrend"      # sanity: the stale claim really did restore
+
+    ex._positions = []                  # the exchange disagrees: flat
+    tf.reconcile_positions()
+
+    assert tf._side is None
+    assert tf._regime == "uncertain", (
+        "the phantom position's regime survived the position that carried it"
+    )
+
+    tf.active = True
+    tf.place_initial_orders(5000)
+    assert ex.placed == [], "opened a fresh position on a regime reconciliation just disproved"
+
+
+def test_loading_state_revokes_a_prior_live_confirmation():
+    """load_from_dict can run on an instance that already had a genuine, live-confirmed
+    regime -- restoring on top of it must not leave that confirmation standing, or a
+    stale restored regime would be trusted as if it were the live one that preceded it."""
+    tf = TrendFollower(exchange=FakeExchange(), symbol="DOGEUSDT")
+    tf.update_regime("uptrend")
+    assert tf._regime_confirmed is True
+
+    tf.load_from_dict({"regime": "downtrend"}, current_price=0.0720)
+
+    assert tf._regime_confirmed is False
+
+
+def test_a_genuinely_resumed_position_keeps_its_regime():
+    """The mirror case: when the exchange DOES still hold what state claimed, the
+    regime that explains why must survive -- it is what lets a later regime flip
+    still trigger the regime_change exit."""
+    ex = FakeExchange()
+    ex._positions = [{"side": "long", "contracts": 4000.0, "entryPrice": 0.0715}]
+    tf = TrendFollower(exchange=ex, symbol="DOGEUSDT")
+    tf.load_from_dict(
+        {"side": "long", "qty": 4000.0, "entry_price": 0.0715, "regime": "uptrend"},
+        current_price=0.0720,
+    )
+
+    tf.reconcile_positions()
+
+    assert tf._side == "long"
+    assert tf._regime == "uptrend"
+
+
 def test_reconcile_handles_negative_contracts_encoding():
     """Binance reports a short as side=long with negative contracts in some payloads."""
     ex = FakeExchange()

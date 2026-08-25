@@ -69,6 +69,11 @@ SHORT_REGIMES = {"downtrend"}
 class TrendFollower:
 
     _tp_band_deferred = False
+    # True once update_regime() has been called with a genuine, live-computed value
+    # this session. False for whatever load_from_dict restored from disk -- a restored
+    # regime has never been confirmed against anything live and reconcile_positions
+    # relies on this to tell the two apart (AUDIT #146).
+    _regime_confirmed = False
     """Holds at most one position, in the direction of the prevailing regime.
 
     Implements the `Strategy` protocol, plus no-op equivalents of the grid-specific
@@ -131,6 +136,7 @@ class TrendFollower:
 
         # --- position / order tracking ---
         self._regime = "uncertain"
+        self._regime_confirmed = False
         self._side: str | None = None          # "long" | "short" | None
         self._entry_price = 0.0
         self._qty = 0.0
@@ -891,6 +897,7 @@ class TrendFollower:
 
     def update_regime(self, regime: str) -> None:
         self._regime = regime
+        self._regime_confirmed = True
 
     # --- stops (ratcheted) -------------------------------------------------
 
@@ -982,6 +989,27 @@ class TrendFollower:
                 self._qty = 0.0
                 self._entry_price = 0.0
                 self.reset_trailing()
+                # Only a RESTORED regime is suspect here, not a live one. _desired_side()
+                # reads _regime directly, so a restart that finds a phantom position also
+                # finds whatever regime label load_from_dict restored next to it, with no
+                # live confirmation behind it -- activate() calls place_initial_orders()
+                # straight after this, on the same startup pass, before update_regime()
+                # has ever run this session.
+                #
+                # ADAUSDT 2026-08-25 00:01: cleanup.py had flattened the book at 23:57
+                # the night before while the bot was stopped. On restart, the freshly
+                # computed live regime read UNCERTAIN -> ranging (ADX=11.8, ranging
+                # threshold 20) -- one log line later, "TREND FOLLOWER ACTIVATED |
+                # regime=uptrend" fired anyway and bought 112 ADAUSDT, entirely off a
+                # restored label this branch had just proven false a second earlier
+                # (AUDIT #146).
+                #
+                # A position that closed mid-session (a stop fired between polls, say)
+                # is the opposite case: _regime came from a genuine update_regime() call
+                # this session, not a restore, and clearing it would block a same-regime
+                # re-entry for no reason. _regime_confirmed is what tells the two apart.
+                if not self._regime_confirmed:
+                    self._regime = "uncertain"
             # A stray resting target must not outlive its position. Reduce-only means
             # it can never fill now, but it still sits on the book -- where main.py's
             # dormancy watchdog counts it as a working order that will never resolve,
@@ -1069,6 +1097,9 @@ class TrendFollower:
         }
 
     def load_from_dict(self, data: dict, current_price: float) -> None:
+        # A restored regime has not been confirmed by anything live -- it is whatever
+        # update_regime() last saw before the file was saved, however old that is.
+        self._regime_confirmed = False
         try:
             self._side = data.get("side")
             self._entry_price = float(data.get("entry_price", 0.0))
