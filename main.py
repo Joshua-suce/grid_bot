@@ -1237,6 +1237,11 @@ def run_bot() -> None:
         flat_range_pct=settings.flat_range_pct,
         trend_min_votes=settings.regime_trend_min_votes,
     )
+    # Restores the confirmed regime and both confirmation clocks if the saved snapshot
+    # is fresh enough to trust -- see TrendFilter.STALE_AFTER_SECONDS. A no-op on a
+    # missing/stale/first-ever state file: trend stays at its just-constructed default
+    # (AUDIT #155/#156).
+    trend.load_from_dict((saved_state or {}).get("trend", {}))
 
     # Deliberately given no exchange handle -- it reports on regime changes and cannot
     # act on them. See signals.py.
@@ -1792,6 +1797,10 @@ def run_bot() -> None:
     account_checked_at = time.time()   # verify_account_config ran during startup
     pnl_marks: tuple[float, float] | None = None   # (engine_net, account_session)
     dormant_alerted_at = 0.0
+    # (timeframe, regime.value) already alerted this lone-trend episode -- fires once
+    # per episode, not once per trend_check_interval for as long as it persists
+    # (AUDIT #156).
+    lone_trend_alerted_key: tuple[str, str] | None = None
     # Bound before the loop: the unrealised figure is now only recomputed when the
     # account was actually readable, so a failed first poll would leave it unset.
     unrealized = 0.0
@@ -1853,6 +1862,7 @@ def run_bot() -> None:
                                 state_data = {
                                     "grid": grid.to_dict(),
                                     "risk": risk.to_dict(),
+                                    "trend": trend.to_dict(),
                                     "pnl_reconciler": pnl_reconciler.to_dict(),
                                     "last_update": datetime.now().isoformat(),
                                 }
@@ -1943,6 +1953,27 @@ def run_bot() -> None:
                         pass
 
                     logger.info("REGIME | {} -> {}", trend.explain(), trend.regime.value)
+
+                    # Observational only -- does not pause the grid or change sizing,
+                    # just surfaces a genuinely persistent lone-timeframe trend that
+                    # would otherwise read identically to a fresh one (AUDIT #156).
+                    lone = trend.lone_trend_duration() if settings.lone_trend_alert_seconds > 0 else None
+                    if lone is not None:
+                        lone_tf, lone_regime, lone_duration = lone
+                        lone_key = (lone_tf, lone_regime.value)
+                        if lone_duration >= settings.lone_trend_alert_seconds and lone_trend_alerted_key != lone_key:
+                            lone_trend_alerted_key = lone_key
+                            logger.warning(
+                                "LONE TREND | {} has read {} for {:.0f}m without enough "
+                                "agreement to act on it",
+                                lone_tf, lone_regime.value, lone_duration / 60,
+                            )
+                            notifier.on_lone_trend(
+                                lone_tf, lone_regime.value, lone_duration,
+                                trend.adx_for(lone_tf),
+                            )
+                    elif lone_trend_alerted_key is not None:
+                        lone_trend_alerted_key = None
 
                     if trend.regime.value != old_regime:
                         events.trend_change(old_regime, trend.regime.value, trend.adx_value, settings.trend_timeframe)
@@ -2452,6 +2483,7 @@ def run_bot() -> None:
                         state_data = {
                             "grid": grid.to_dict(),
                             "risk": risk.to_dict(),
+                            "trend": trend.to_dict(),
                             "pnl_reconciler": pnl_reconciler.to_dict(),
                             "last_update": datetime.now().isoformat(),
                         }
@@ -2530,6 +2562,7 @@ def run_bot() -> None:
                 state_data = {
                     "grid": grid.to_dict(),
                     "risk": risk.to_dict(),
+                    "trend": trend.to_dict(),
                     "pnl_reconciler": pnl_reconciler.to_dict(),
                     "last_update": datetime.now().isoformat(),
                 }
@@ -2626,6 +2659,7 @@ def run_bot() -> None:
                             state_data = {
                                 "grid": grid.to_dict() if grid is not None else {},
                                 "risk": risk.to_dict() if risk is not None else {},
+                                "trend": trend.to_dict(),
                                 "pnl_reconciler": pnl_reconciler.to_dict(),
                                 "last_update": datetime.now().isoformat(),
                             }
@@ -2653,6 +2687,7 @@ def run_bot() -> None:
             state_data = {
                 "grid": grid.to_dict() if grid is not None else {},
                 "risk": risk.to_dict() if risk is not None else {},
+                "trend": trend.to_dict(),
                 "pnl_reconciler": pnl_reconciler.to_dict(),
                 "last_update": datetime.now().isoformat(),
             }

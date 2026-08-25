@@ -479,6 +479,61 @@ def test_the_post_cleanup_ladder_placement_is_gated_on_recovery():
     )
 
 
+def test_trend_state_is_restored_right_after_construction():
+    """AUDIT #155/#156. TrendFilter used to have no persistence at all -- every
+    restart started at UNCERTAIN regardless of what was confirmed right before the
+    stop. The restore must run before the very first live update() overwrites
+    whatever a fresh construction defaulted to."""
+    src = _main_source()
+    construct_at = src.index("trend = TrendFilter(")
+    restore_at = src.index('trend.load_from_dict((saved_state or {}).get("trend", {}))')
+    first_update_at = src.index("trend.update(ohlcv_tf, settings.trend_timeframe)")
+    assert construct_at < restore_at < first_update_at, (
+        "trend state is not restored between construction and the first live update"
+    )
+
+
+def test_trend_state_is_included_in_every_state_save():
+    """A restore is worthless if nothing ever wrote it -- every state_data dict main.py
+    builds must carry the trend snapshot alongside grid/risk/pnl_reconciler."""
+    src = _main_source()
+    save_sites = [
+        i for i in range(len(src))
+        if src.startswith("state_data = {", i)
+    ]
+    assert len(save_sites) >= 4, "expected multiple state_data construction sites"
+    for site in save_sites:
+        # Brace-depth scan, not the first "}" -- dict values like
+        # "grid.to_dict() if grid is not None else {}" contain their own braces.
+        depth = 0
+        end = site
+        for idx in range(site, len(src)):
+            if src[idx] == "{":
+                depth += 1
+            elif src[idx] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = idx
+                    break
+        block = src[site:end]
+        assert '"trend": trend.to_dict()' in block, (
+            f"a state_data dict at offset {site} does not persist trend state"
+        )
+
+
+def test_lone_trend_alert_is_wired_into_the_periodic_regime_check():
+    """AUDIT #156. The alert must be driven from the same periodic recheck that
+    already re-evaluates the regime, not left uncalled."""
+    src = _main_source()
+    check_at = src.index("if trend.time_to_check():")
+    regime_log_at = src.index('logger.info("REGIME | {} -> {}", trend.explain(), trend.regime.value)')
+    lone_call_at = src.index("trend.lone_trend_duration()")
+    alert_call_at = src.index("notifier.on_lone_trend(")
+    assert check_at < regime_log_at < lone_call_at < alert_call_at, (
+        "the lone-trend alert is not wired into the periodic regime recheck in order"
+    )
+
+
 def test_the_startup_grid_activation_is_also_gated_on_recovery():
     """The second activation point (the trend-gate block, reached ~20-25 minutes of
     blind re-confirmation later) must independently refuse to switch the grid on

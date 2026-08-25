@@ -438,6 +438,20 @@ class TelegramNotifier:
             f"Loss: {unrealized_loss:.4f} USDT"
         )
 
+    def on_lone_trend(self, timeframe: str, regime: str, duration_seconds: float, adx: float) -> None:
+        """AUDIT #156. A single timeframe has held one direction long enough to be
+        worth a human knowing about, even though REGIME_TREND_MIN_VOTES never let the
+        router act on it. Purely informational -- nothing about this changes what the
+        bot does; main.py fires it at most once per lone-trend episode.
+        """
+        hours = duration_seconds / 3600
+        self.send(
+            f"&#x1f440; <b>LONE TREND</b>\n"
+            f"{self._esc(timeframe)}: {self._esc(regime)} for {hours:.1f}h\n"
+            f"ADX: {adx:.1f}\n"
+            f"Not enough timeframes agree to act on this yet."
+        )
+
     def on_trend_change(self, old_regime: str, new_regime: str, adx: float) -> None:
         self.send(
             f"&#x1f4c8; <b>TREND CHANGE</b>\n"

@@ -429,3 +429,163 @@ def test_no_override_note_when_the_market_is_actually_moving():
     tf._timeframes["1h"] = MarketRegime.DOWNTREND
     tf._adx_by_timeframe["1h"] = 31.1
     assert "FLAT OVERRIDE" not in tf.explain()
+
+
+# --- AUDIT #155/#156: regime + confirmation clocks survive a restart, and a lone
+# persistent timeframe is tracked and can be alerted on ---------------------------
+
+def test_to_dict_round_trips_the_regime_and_confirmation_clocks():
+    tf = TrendFilter()
+    tf.regime = MarketRegime.DOWNTREND
+    tf.last_check = time.time() - 30
+    tf._pending_regime = MarketRegime.UPTREND
+    tf._pending_since = time.time() - 10
+    tf._timeframes = {"30m": MarketRegime.DOWNTREND, "1h": MarketRegime.RANGING}
+    tf._timeframe_since = {"30m": time.time() - 400, "1h": time.time() - 50}
+
+    restored = TrendFilter()
+    restored.load_from_dict(tf.to_dict())
+
+    assert restored.regime == MarketRegime.DOWNTREND
+    assert restored._pending_regime == MarketRegime.UPTREND
+    assert restored._pending_since == pytest.approx(tf._pending_since)
+    assert restored._timeframes == tf._timeframes
+    assert restored._timeframe_since["30m"] == pytest.approx(tf._timeframe_since["30m"])
+
+
+def test_load_from_dict_is_a_noop_on_empty_or_missing_data():
+    tf = TrendFilter()
+    tf.load_from_dict({})
+    assert tf.regime == MarketRegime.UNCERTAIN
+    tf.load_from_dict(None)
+    assert tf.regime == MarketRegime.UNCERTAIN
+
+
+def test_load_from_dict_rejects_a_snapshot_older_than_stale_after_seconds():
+    """A restart down for longer than STALE_AFTER_SECONDS must not trust a saved
+    regime -- the gap could span a real reversal the bot never observed."""
+    tf = TrendFilter()
+    saved = tf.to_dict()
+    saved["regime"] = MarketRegime.DOWNTREND.value
+    saved["last_check"] = time.time() - (TrendFilter.STALE_AFTER_SECONDS + 60)
+
+    restored = TrendFilter()
+    restored.load_from_dict(saved)
+
+    assert restored.regime == MarketRegime.UNCERTAIN, (
+        "a stale saved regime was trusted instead of discarded"
+    )
+
+
+def test_load_from_dict_accepts_a_snapshot_just_inside_the_staleness_window():
+    tf = TrendFilter()
+    saved = tf.to_dict()
+    saved["regime"] = MarketRegime.DOWNTREND.value
+    saved["last_check"] = time.time() - (TrendFilter.STALE_AFTER_SECONDS - 60)
+
+    restored = TrendFilter()
+    restored.load_from_dict(saved)
+
+    assert restored.regime == MarketRegime.DOWNTREND
+
+
+def test_load_from_dict_rejects_a_future_timestamp():
+    """A hand-edited or corrupt state file reading a future last_check must not be
+    trusted -- same plausibility guard as router.py's handoff_started."""
+    tf = TrendFilter()
+    saved = tf.to_dict()
+    saved["regime"] = MarketRegime.DOWNTREND.value
+    saved["last_check"] = time.time() + 3600
+
+    restored = TrendFilter()
+    restored.load_from_dict(saved)
+
+    assert restored.regime == MarketRegime.UNCERTAIN
+
+
+def test_load_from_dict_drops_a_timeframe_since_with_no_matching_regime():
+    tf = TrendFilter()
+    saved = tf.to_dict()
+    saved["last_check"] = time.time()
+    saved["timeframes"] = {"30m": MarketRegime.DOWNTREND.value}
+    saved["timeframe_since"] = {"30m": time.time() - 100, "1h": time.time() - 100}
+
+    restored = TrendFilter()
+    restored.load_from_dict(saved)
+
+    assert set(restored._timeframe_since) == {"30m"}
+
+
+def test_timeframe_since_only_stamps_on_a_real_regime_change(monkeypatch):
+    """Repeated identical readings must accumulate duration, not reset it -- the whole
+    point of lone_trend_duration() is measuring how long a disagreement has held."""
+    tf = TrendFilter()
+    monkeypatch.setattr(tf, "_evaluate_timeframe", lambda ohlcv: (MarketRegime.DOWNTREND, 28.0))
+    df = make_trend_data(200, "down")
+
+    tf.update(df, "30m")
+    first_stamp = tf._timeframe_since["30m"]
+    tf.update(df, "30m")
+    second_stamp = tf._timeframe_since["30m"]
+
+    assert first_stamp == second_stamp, "an unchanged regime reading reset the duration clock"
+
+
+def test_timeframe_since_restamps_when_the_regime_actually_changes(monkeypatch):
+    tf = TrendFilter()
+    monkeypatch.setattr(tf, "_evaluate_timeframe", lambda ohlcv: (MarketRegime.DOWNTREND, 28.0))
+    df = make_trend_data(200, "down")
+    tf.update(df, "30m")
+    first_stamp = tf._timeframe_since["30m"]
+
+    monkeypatch.setattr(tf, "_evaluate_timeframe", lambda ohlcv: (MarketRegime.UPTREND, 28.0))
+    tf.update(df, "30m")
+
+    assert tf._timeframe_since["30m"] != first_stamp
+
+
+def test_lone_trend_duration_is_none_when_nothing_is_trending():
+    tf = TrendFilter()
+    tf._timeframes = {"30m": MarketRegime.RANGING, "1h": MarketRegime.UNCERTAIN}
+    assert tf.lone_trend_duration() is None
+
+
+def test_lone_trend_duration_is_none_when_the_trend_agrees_with_the_merged_verdict():
+    """Two timeframes agreeing on a direction IS the merged verdict (2-of-3) -- that
+    is a normal, acted-on trend, not a lone one."""
+    tf = TrendFilter()
+    tf.regime = MarketRegime.DOWNTREND
+    tf._timeframes = {"30m": MarketRegime.DOWNTREND, "1h": MarketRegime.DOWNTREND}
+    tf._timeframe_since = {"30m": time.time() - 5000, "1h": time.time() - 5000}
+    assert tf.lone_trend_duration() is None
+
+
+def test_lone_trend_duration_reports_a_timeframe_outvoting_the_merged_verdict():
+    """The exact live scenario: 30m has been trending for hours, 1h/1d never agree,
+    so the merged verdict stays uncertain and the grid never sees anything different
+    on hour 3 than it saw on minute 3."""
+    tf = TrendFilter()
+    tf.regime = MarketRegime.UNCERTAIN
+    tf._timeframes = {
+        "30m": MarketRegime.DOWNTREND, "1h": MarketRegime.RANGING, "1d": MarketRegime.UPTREND,
+    }
+    tf._timeframe_since = {"30m": time.time() - 10800, "1h": time.time() - 100, "1d": time.time() - 50}
+
+    result = tf.lone_trend_duration()
+
+    assert result is not None
+    tf_name, regime, duration = result
+    assert tf_name == "30m"
+    assert regime == MarketRegime.DOWNTREND
+    assert duration == pytest.approx(10800, abs=5)
+
+
+def test_lone_trend_duration_picks_the_longest_running_when_more_than_one_dissents():
+    tf = TrendFilter()
+    tf.regime = MarketRegime.UNCERTAIN
+    tf._timeframes = {"30m": MarketRegime.DOWNTREND, "1d": MarketRegime.UPTREND}
+    tf._timeframe_since = {"30m": time.time() - 200, "1d": time.time() - 9000}
+
+    tf_name, _, _ = tf.lone_trend_duration()
+
+    assert tf_name == "1d"

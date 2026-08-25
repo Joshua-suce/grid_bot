@@ -63,6 +63,16 @@ _ROUTER_OWNED = frozenset({
 class StrategyRouter:
     """Presents one Strategy to main.py; switches which one is really trading."""
 
+    # How long a restored _pending_since may be trusted (AUDIT #155/#156). Unlike
+    # _handoff_started's 30-day plausibility window -- an active handoff already in
+    # progress is worth resuming even after a long outage -- this clock counts
+    # accumulated OBSERVATION of a regime holding steady toward min_regime_seconds. A
+    # gap long enough to have missed a full reversal must not be trusted as continued
+    # confirmation; letting a stale clock instantly satisfy min_regime_seconds on the
+    # first post-restart tick would switch strategies off one restored timestamp alone,
+    # with no fresh confirmation behind it at all.
+    PENDING_STALE_SECONDS = 3600
+
     def __init__(
         self,
         strategies: dict,
@@ -614,6 +624,8 @@ class StrategyRouter:
             "regime": self._regime,
             "handoff_target": self._handoff_target,
             "handoff_started": self._handoff_started,
+            "pending_name": self._pending_name,
+            "pending_since": self._pending_since,
             "switches": self.switches,
             "failed_handoffs": self.failed_handoffs,
             "forced_flattens": self.forced_flattens,
@@ -654,6 +666,30 @@ class StrategyRouter:
             # deadline, so it has to be allowed through here.
             plausible = 0.0 < saved <= now + 1.0 and (now - saved) < 30 * 86400
             self._handoff_started = saved if plausible else now
+
+        pending_name = router_state.get("pending_name")
+        pending_since = router_state.get("pending_since")
+        try:
+            pending_since = float(pending_since) if pending_since is not None else 0.0
+        except (TypeError, ValueError):
+            pending_since = 0.0
+        now = time.time()
+        plausible_pending = (
+            pending_name in self.strategies
+            and 0.0 < pending_since <= now + 1.0
+            and (now - pending_since) < self.PENDING_STALE_SECONDS
+        )
+        if plausible_pending:
+            self._pending_name = pending_name
+            self._pending_since = pending_since
+            logger.info(
+                "ROUTER | resuming a {}s-old pending switch to '{}' instead of "
+                "restarting its confirmation clock from zero",
+                int(now - pending_since), pending_name,
+            )
+        else:
+            self._pending_name = None
+            self._pending_since = 0.0
 
         sub_states = (data or {}).get("strategies") or {}
         if sub_states:

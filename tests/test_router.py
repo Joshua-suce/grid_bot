@@ -708,3 +708,115 @@ def test_a_cancelled_handoff_undoes_the_real_trend_followers_acceleration():
         "-- the position is now capped even though take_profit_r=0.0 promises no cap"
     )
     assert trend._tp_order_id is None, "the manufactured resting order was never disarmed"
+
+
+# --- AUDIT #155/#156: the pending-switch confirmation clock survives a restart ----
+
+import time as _time
+
+
+def test_pending_switch_clock_round_trips_through_to_dict():
+    r, grid, trend, ex = make(min_regime_seconds=900)
+    r._pending_name = "trend"
+    r._pending_since = _time.time() - 300
+
+    saved = r.to_dict()
+
+    r2, _, _, _ = make(min_regime_seconds=900)
+    r2.load_from_dict(saved, current_price=0.072)
+
+    assert r2._pending_name == "trend"
+    assert r2._pending_since == pytest.approx(r._pending_since)
+
+
+def test_a_stale_pending_clock_is_not_restored():
+    """Down long enough that the gap could span a real reversal -- the elapsed time
+    must not be trusted as continued confirmation the router never actually observed.
+    """
+    r, grid, trend, ex = make(min_regime_seconds=900)
+    r._pending_name = "trend"
+    r._pending_since = _time.time() - (StrategyRouter.PENDING_STALE_SECONDS + 60)
+    saved = r.to_dict()
+
+    r2, _, _, _ = make(min_regime_seconds=900)
+    r2.load_from_dict(saved, current_price=0.072)
+
+    assert r2._pending_name is None
+    assert r2._pending_since == 0.0
+
+
+def test_a_pending_clock_just_inside_the_staleness_window_is_restored():
+    r, grid, trend, ex = make(min_regime_seconds=900)
+    r._pending_name = "trend"
+    r._pending_since = _time.time() - (StrategyRouter.PENDING_STALE_SECONDS - 60)
+    saved = r.to_dict()
+
+    r2, _, _, _ = make(min_regime_seconds=900)
+    r2.load_from_dict(saved, current_price=0.072)
+
+    assert r2._pending_name == "trend"
+
+
+def test_a_future_pending_timestamp_is_rejected():
+    r, grid, trend, ex = make(min_regime_seconds=900)
+    r._pending_name = "trend"
+    r._pending_since = _time.time() + 3600
+    saved = r.to_dict()
+
+    r2, _, _, _ = make(min_regime_seconds=900)
+    r2.load_from_dict(saved, current_price=0.072)
+
+    assert r2._pending_name is None
+    assert r2._pending_since == 0.0
+
+
+def test_a_pending_target_no_longer_in_strategies_is_dropped():
+    r, grid, trend, ex = make(min_regime_seconds=900)
+    r._pending_name = "trend"
+    r._pending_since = _time.time() - 100
+    saved = r.to_dict()
+    saved["router"]["pending_name"] = "some_removed_strategy"
+
+    r2, _, _, _ = make(min_regime_seconds=900)
+    r2.load_from_dict(saved, current_price=0.072)
+
+    assert r2._pending_name is None
+    assert r2._pending_since == 0.0
+
+
+def test_a_restored_pending_clock_lets_a_still_agreeing_regime_switch_immediately():
+    """The whole point: a regime that had already held past min_regime_seconds before
+    a restart should not need another full min_regime_seconds after it -- the very
+    next observation that still agrees should complete the switch right away,
+    instead of restarting a 15-minute wait from a blank clock."""
+    r, grid, trend, ex = make(min_regime_seconds=900)
+    r._pending_name = "trend"
+    r._pending_since = _time.time() - 950   # already past min_regime_seconds=900
+    saved = r.to_dict()
+
+    r2, grid2, trend2, ex2 = make(min_regime_seconds=900)
+    r2.load_from_dict(saved, current_price=0.072)
+    assert r2.active_name == "grid"
+
+    r2.update_regime("uptrend")   # target is still "trend" -- clock is already satisfied
+
+    assert r2.handoff_in_progress or r2.active_name == "trend", (
+        "the restored pending clock was not honoured -- update_regime treated this "
+        "as a brand-new pending switch instead of continuing the one from before "
+        "the restart"
+    )
+
+
+def test_a_restored_pending_clock_does_not_switch_early_on_its_own():
+    """Restoring the clock must not itself trigger a switch -- only a subsequent
+    update_regime() call (a fresh, real observation) can complete it."""
+    r, grid, trend, ex = make(min_regime_seconds=900)
+    r._pending_name = "trend"
+    r._pending_since = _time.time() - 890
+    saved = r.to_dict()
+
+    r2, _, _, _ = make(min_regime_seconds=900)
+    r2.load_from_dict(saved, current_price=0.072)
+
+    assert r2.active_name == "grid"
+    assert not r2.handoff_in_progress

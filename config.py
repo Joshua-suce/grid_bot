@@ -336,6 +336,17 @@ class Settings(BaseSettings):
         default=300, ge=0, le=3600,
         description="Seconds a new regime must persist before acting on it (0 = instant)",
     )
+    lone_trend_alert_seconds: int = Field(
+        default=3600, ge=0, le=86400,
+        description=(
+            "Alert (log + Telegram) when a single timeframe has voted the same trend "
+            "direction this long without REGIME_TREND_MIN_VOTES worth of agreement to "
+            "act on it -- e.g. 30m trending for hours while 1h/1d never agree. "
+            "Observational only: this does not pause the grid or change sizing, it "
+            "just makes a genuinely persistent lone trend visible instead of reading "
+            "identically to a fresh five-minute one. 0 disables the alert."
+        ),
+    )
     flat_range_window: int = Field(
         default=6, ge=2, le=48,
         description="Candles used to measure the recent price range for the flat-market override",

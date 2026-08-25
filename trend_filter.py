@@ -69,6 +69,15 @@ def timeframe_minutes(tf: str) -> int:
 
 
 class TrendFilter:
+    # How long a restored regime/timeframe-duration snapshot may be trusted (AUDIT
+    # #155/#156). A fresh TrendFilter starts at UNCERTAIN and takes confirmation_seconds
+    # to re-earn its verdict -- correct in steady state, but every restart used to pay
+    # that cost again from zero regardless of how settled the regime actually was right
+    # before the stop. Longer than this and a downtime gap could span a real reversal
+    # the bot never observed; picking back up as though nothing happened would trust
+    # silence as confirmation, which is worse than the slow re-earn it replaces.
+    STALE_AFTER_SECONDS = 3600
+
     def __init__(
         self,
         ema_fast: int = 20,
@@ -104,6 +113,10 @@ class TrendFilter:
         self._pending_regime: MarketRegime | None = None
         self._pending_since: float = 0.0
         self._last_ohlcv: pd.DataFrame | None = None
+        # When each timeframe's OWN regime label last changed -- not the merged verdict.
+        # Lets lone_trend_duration() answer "how long has this one timeframe been
+        # saying this" independent of whether enough others agree to act on it.
+        self._timeframe_since: dict[str, float] = {}
 
     def time_to_check(self) -> bool:
         return (time.time() - self.last_check) >= self.check_interval
@@ -192,6 +205,8 @@ class TrendFilter:
 
     def update(self, ohlcv: pd.DataFrame, timeframe: str = "4h") -> MarketRegime:
         regime, adx_val = self._evaluate_timeframe(ohlcv)
+        if self._timeframes.get(timeframe) != regime:
+            self._timeframe_since[timeframe] = time.time()
         self._timeframes[timeframe] = regime
         self._adx_by_timeframe[timeframe] = adx_val
         self.adx_value = adx_val
@@ -343,6 +358,8 @@ class TrendFilter:
 
     def add_timeframe(self, ohlcv: pd.DataFrame, timeframe: str) -> None:
         regime, adx_val = self._evaluate_timeframe(ohlcv)
+        if self._timeframes.get(timeframe) != regime:
+            self._timeframe_since[timeframe] = time.time()
         self._timeframes[timeframe] = regime
         self._adx_by_timeframe[timeframe] = adx_val
         self._ohlcv[timeframe] = ohlcv
@@ -390,3 +407,111 @@ class TrendFilter:
 
     def is_trending(self) -> bool:
         return self.regime in (MarketRegime.UPTREND, MarketRegime.DOWNTREND)
+
+    def adx_for(self, timeframe: str) -> float:
+        """The most recent ADX reading for one timeframe, or 0.0 if never evaluated."""
+        return self._adx_by_timeframe.get(timeframe, 0.0)
+
+    def lone_trend_duration(self) -> tuple[str, MarketRegime, float] | None:
+        """The longest-running timeframe currently trending without enough agreement
+        for the merged verdict to reach that direction (AUDIT #156).
+
+        Purely observational -- nothing here changes what the merged verdict is or
+        what the bot does with it. A genuine, hours-long single-timeframe trend used
+        to look identical in every log line to a fresh five-minute one: nothing
+        tracked how long the disagreement itself had persisted. Callers decide what,
+        if anything, to do with the answer (today: an alert, nothing more).
+
+        Returns (timeframe, regime, seconds) for the longest-standing lone trend, or
+        None if every currently-trending timeframe already agrees with the merged
+        verdict (or nothing is trending at all).
+        """
+        now = time.time()
+        candidates = []
+        for tf, regime in self._timeframes.items():
+            if regime not in (MarketRegime.UPTREND, MarketRegime.DOWNTREND):
+                continue
+            if regime == self.regime:
+                continue   # this agrees with (and may be driving) the merged verdict
+            since = self._timeframe_since.get(tf, now)
+            candidates.append((tf, regime, now - since))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda c: c[2])
+
+    def to_dict(self) -> dict:
+        return {
+            "regime": self.regime.value,
+            "last_check": self.last_check,
+            "pending_regime": self._pending_regime.value if self._pending_regime else None,
+            "pending_since": self._pending_since,
+            "timeframes": {tf: r.value for tf, r in self._timeframes.items()},
+            "timeframe_since": dict(self._timeframe_since),
+        }
+
+    def load_from_dict(self, data: dict) -> None:
+        """Restore a regime verdict and its confirmation clocks across a restart --
+        AUDIT #155/#156. A restart used to reset self.regime to UNCERTAIN and both
+        confirmation clocks to blank unconditionally, so an already-settled regime
+        (or an already-building lone-trend duration) got re-earned from zero on every
+        stop/restart cycle, no matter how briefly the process was down.
+
+        Silently no-ops (stays at the fresh-constructed default) on missing, absurd,
+        or stale data -- see STALE_AFTER_SECONDS. Never raises on a corrupt state file.
+        """
+        if not data:
+            return
+
+        try:
+            last_check = float(data.get("last_check", 0.0))
+        except (TypeError, ValueError):
+            last_check = 0.0
+
+        now = time.time()
+        # Reject a stamp from the future (clock skew / a hand-edited file) or one
+        # older than STALE_AFTER_SECONDS -- an ordinary expired stamp is not absurd,
+        # it just means the gap was long enough that nothing here should be trusted
+        # as still current.
+        if not (0.0 < last_check <= now + 60.0) or (now - last_check) > self.STALE_AFTER_SECONDS:
+            logger.info(
+                "TREND FILTER | saved state is missing or too old to trust -- "
+                "starting fresh instead of carrying a possibly-outdated verdict "
+                "across the gap"
+            )
+            return
+
+        try:
+            self.regime = MarketRegime(data.get("regime", MarketRegime.UNCERTAIN.value))
+        except ValueError:
+            self.regime = MarketRegime.UNCERTAIN
+        self.last_check = last_check
+
+        pending = data.get("pending_regime")
+        try:
+            self._pending_regime = MarketRegime(pending) if pending else None
+        except ValueError:
+            self._pending_regime = None
+        try:
+            self._pending_since = float(data.get("pending_since", 0.0))
+        except (TypeError, ValueError):
+            self._pending_since = 0.0
+
+        restored_timeframes: dict[str, MarketRegime] = {}
+        for tf, val in (data.get("timeframes") or {}).items():
+            try:
+                restored_timeframes[tf] = MarketRegime(val)
+            except ValueError:
+                continue
+        self._timeframes = restored_timeframes
+
+        # Only carried over for a timeframe whose regime was itself restored above --
+        # a duration stamp for a timeframe with no matching regime is meaningless.
+        self._timeframe_since = {
+            tf: float(ts) for tf, ts in (data.get("timeframe_since") or {}).items()
+            if tf in restored_timeframes and isinstance(ts, (int, float))
+        }
+
+        logger.info(
+            "TREND FILTER RESTORED | regime={} ({}s old) | {} timeframe(s) carried over",
+            self.regime.value, int(now - last_check), len(restored_timeframes),
+        )
