@@ -229,20 +229,30 @@ class TelegramNotifier:
 
     def on_fill(
         self, side: str, price: float, pnl: float, fill_count: int, daily_pnl: float = 0.0,
-        total_pnl_verified: float | None = None,
         session_pnl: float | None = None,
-        pnl_window: str | None = None,
     ) -> None:
+        """A FILL message. Cycle/daily/session PnL only -- see AUDIT #153.
+
+        This used to also append _pnl_lines' account-wide "Account (Nd rolling, all
+        activity): X USDT" line, correctly labelled per AUDIT #59. But a fill fires on
+        every single trade -- 49 of them by early afternoon in one session -- and a
+        large negative account figure sitting right under "Cycle PnL: +0.85" that many
+        times a day reads as the account being negative no matter how precisely the
+        fine print underneath disagrees. #59's actual problem -- the account figure
+        needs to be visible somewhere, not hidden -- is still solved by
+        on_startup_summary, which shows it once per bot start instead of once per
+        trade.
+        """
         emoji = "&#x1f7e2;" if side == "sell" else "&#x1f534;"
         price_str = f"{price:.8f}".rstrip("0").rstrip(".")
-        verified_line = _pnl_lines(session_pnl, total_pnl_verified, pnl_window or _DEFAULT_WINDOW)
+        session_line = _pnl_lines(session_pnl, None)
         self.send(
             f"{emoji} <b>FILL #{fill_count}</b>\n"
             f"Side: {side.upper()}\n"
             f"Price: {price_str}\n"
             f"Cycle PnL: {pnl:.4f} USDT\n"
             f"Daily PnL: {daily_pnl:.4f} USDT"
-            f"{verified_line}"
+            f"{session_line}"
         )
 
     def on_trend_pause(self, regime: str, adx: float) -> None:
