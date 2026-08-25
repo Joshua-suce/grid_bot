@@ -373,18 +373,28 @@ class TelegramNotifier:
 
     def on_balance_update(
         self, free: float, used: float, total_equity: float, exposure_pct: float,
-        total_pnl_verified: float | None = None,
-        session_pnl: float | None = None,
-        pnl_window: str | None = None,
     ) -> None:
-        verified_line = _pnl_lines(session_pnl, total_pnl_verified, pnl_window or _DEFAULT_WINDOW)
+        """A BALANCE message. Only ever balance figures -- see AUDIT #147.
+
+        This used to end with _pnl_lines' "Account (Nd rolling, all activity): X USDT"
+        footer, exactly as labelled as AUDIT #59 made it. The label was never the
+        problem: a message titled BALANCE that ends in a large negative number reads as
+        the balance being negative, however precisely the fine print underneath
+        disagrees. Measured live, 2026-08-24/25: a real total_equity of ~4867 USDT sent
+        alongside "Account (89d rolling, all activity): -70.76 USDT" in the same
+        message, over and over, was read back as "the balance is still negative" three
+        separate times in one session despite the account figure never once describing
+        the balance.
+
+        The PnL footer stays on FILL and the startup summary, where the header itself
+        already says this is about PnL and there is nothing for it to be confused with.
+        """
         self.send(
             f"&#x1f4b0; <b>BALANCE</b>\n"
             f"Free: {free:.2f} USDT\n"
             f"Used: {used:.2f} USDT\n"
             f"Equity: {total_equity:.2f} USDT\n"
             f"Exposure: {exposure_pct:.1%}"
-            f"{verified_line}"
         )
 
     def on_risk_check(self, check_type: str, value: float, threshold: float, result: str) -> None:

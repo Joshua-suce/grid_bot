@@ -576,9 +576,15 @@ def _position_unrealized_pnl(pos: dict, current_price: float) -> float:
 
 def _notify_status(
     notifier: TelegramNotifier, exchange: Exchange, symbol: str, price: float,
-    pnl_reconciler: PnLReconciler | None = None,
 ) -> None:
-    """Send position + balance to Telegram. Call only on significant events."""
+    """Send position + balance to Telegram. Call only on significant events.
+
+    No pnl_reconciler here on purpose (AUDIT #147): this feeds on_balance_update,
+    and a BALANCE message carrying the account's cumulative PnL read as the balance
+    itself being negative -- see the docstring on on_balance_update. The fill and
+    startup-summary notifications still carry that figure, correctly labelled, under
+    headers that are already about PnL.
+    """
     pos_details = get_position_details(exchange, symbol) or []
     for pos in pos_details:
         unrealized = _position_unrealized_pnl(pos, price)
@@ -589,12 +595,7 @@ def _notify_status(
     if equity > 0:
         exposure_usdt = sum(p["qty"] * price for p in pos_details)
         exposure_pct = exposure_usdt / equity
-    total_pnl_verified = pnl_reconciler.net_realized_pnl if pnl_reconciler is not None else None
-    session_pnl = pnl_reconciler.session_pnl if pnl_reconciler is not None else None
-    notifier.on_balance_update(
-        balance_info["free"], balance_info["used"], equity, exposure_pct,
-        total_pnl_verified, session_pnl,
-    )
+    notifier.on_balance_update(balance_info["free"], balance_info["used"], equity, exposure_pct)
 
 
 def daily_reset_check(
@@ -1758,7 +1759,7 @@ def run_bot() -> None:
                         session_pnl=pnl_reconciler.session_pnl,
                         pnl_window=pnl_reconciler.window_label,
     )
-    _notify_status(notifier, exchange, settings.symbol, price_now, pnl_reconciler)
+    _notify_status(notifier, exchange, settings.symbol, price_now)
 
     loop_count = 0
     consecutive_errors = 0
@@ -1894,7 +1895,7 @@ def run_bot() -> None:
                                 dynamic_count, "recovery", current_atr,
                             )
                             events.recovery_event("resume", risk.state.recovery_count, sizing_pct=recovery_mult)
-                            _notify_status(notifier, exchange, settings.symbol, price, pnl_reconciler)
+                            _notify_status(notifier, exchange, settings.symbol, price)
                             logger.info("Grid recovered and activated with {}% sizing", int(recovery_mult * 100))
                         except Exception as e:
                             logger.error("Recovery failed: {} — will retry next cycle", e)
@@ -1951,7 +1952,7 @@ def run_bot() -> None:
                             grid.activate(exchange.get_balance())
                             notifier.on_grid_start(settings.symbol, grid.grid_lower, grid.grid_upper, grid.grid_count)
                             notifier.on_grid_resume()
-                            _notify_status(notifier, exchange, settings.symbol, price, pnl_reconciler)
+                            _notify_status(notifier, exchange, settings.symbol, price)
                     else:
                         logger.debug("Force trade mode active; grid remains enabled regardless of trend.")
 
@@ -1970,7 +1971,7 @@ def run_bot() -> None:
                             logger.info("Grid recentered around current price")
                             notifier.on_recenter(old_lower, old_upper, grid.grid_lower, grid.grid_upper)
                             events.grid_recentered(settings.symbol, old_lower, old_upper, grid.grid_lower, grid.grid_upper)
-                            _notify_status(notifier, exchange, settings.symbol, price, pnl_reconciler)
+                            _notify_status(notifier, exchange, settings.symbol, price)
 
                     if price < grid.grid_lower:
                         total_pos = get_total_position(exchange, settings.symbol)
@@ -1994,7 +1995,7 @@ def run_bot() -> None:
                                     )
                                     events.grid_recentered(settings.symbol, old_lower, old_upper, grid.grid_lower, grid.grid_upper)
                                     notifier.on_recenter(old_lower, old_upper, grid.grid_lower, grid.grid_upper)
-                                    _notify_status(notifier, exchange, settings.symbol, price, pnl_reconciler)
+                                    _notify_status(notifier, exchange, settings.symbol, price)
 
                     if price > grid.grid_upper:
                         total_pos = get_total_position(exchange, settings.symbol)
@@ -2254,7 +2255,7 @@ def run_bot() -> None:
                             unrealized_pnl=unrealized,
                         )
                     if fills:
-                        _notify_status(notifier, exchange, settings.symbol, price, pnl_reconciler)
+                        _notify_status(notifier, exchange, settings.symbol, price)
 
                     risk.update_unrealized(unrealized)
 
@@ -2422,7 +2423,7 @@ def run_bot() -> None:
                             events.recovery_event("start", risk.state.recovery_count)
                             logger.warning("Entering recovery mode — will wait {}s then recalculate grid", settings.cooldown_seconds)
                             notifier.on_recovery_start(settings.cooldown_seconds, risk.state.recovery_count)
-                            _notify_status(notifier, exchange, settings.symbol, price, pnl_reconciler)
+                            _notify_status(notifier, exchange, settings.symbol, price)
                         state_data = {
                             "grid": grid.to_dict(),
                             "risk": risk.to_dict(),
