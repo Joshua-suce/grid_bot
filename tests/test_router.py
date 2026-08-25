@@ -11,6 +11,7 @@ import pytest
 
 from router import DEFAULT_ROUTING, StrategyRouter
 from strategy import Strategy
+from trend_follower import TrendFollower
 
 
 class FakeStrategy:
@@ -542,7 +543,10 @@ def test_the_outgoing_strategy_is_offered_a_chance_to_accelerate():
 
 def test_a_strategy_without_a_ladder_is_left_alone():
     """FakeStrategy has no accelerate_handoff_exit -- getattr must no-op, not raise.
-    This is the trend follower's real shape: it has no rungs to reprice."""
+    The real trend follower has had one since AUDIT #148
+    (test_the_real_trend_follower_is_actually_reached below covers that); this pins
+    the getattr fallback itself, for whatever future strategy still has nothing to
+    accelerate."""
     r, grid, trend, ex = make(position=5000.0, handoff_grace_seconds=3600)
 
     r.update_regime("uptrend")   # must not raise AttributeError
@@ -568,3 +572,96 @@ def test_acceleration_is_not_offered_once_the_handoff_completes():
 
     assert r.active_name == "trend"
     assert len(grid.accel_calls) == calls_before, "accelerated an exit after going flat"
+
+
+def test_the_real_trend_follower_is_actually_reached():
+    """AUDIT #148. Every test above proves the WIRING with a fake that deliberately
+    has accelerate_handoff_exit -- the actual regression was that the real trend
+    follower never had one, so this reached for it via getattr and got nothing,
+    every single time. A trend position sat through a full 31-minute handoff wait
+    with zero "HANDOFF EXIT ACCELERATED" log lines, and the router forced a market
+    close at grace expiry -- exactly what deferring the close exists to avoid.
+
+    Wires a genuine TrendFollower in as the outgoing strategy, holding a real
+    position the exchange says is not flat, and checks ITS take-profit actually gets
+    repriced during the deferred tick -- not a stand-in that only proves the router
+    calls something.
+    """
+    class TrendExchange:
+        def __init__(self):
+            self.price = 0.2182
+            self.positions: list[dict] = []
+            self._orders: dict[str, dict] = {}
+            self._next = 0
+
+            class _inner:
+                @staticmethod
+                def price_to_precision(symbol, price):
+                    return f"{float(price):.5f}"
+
+                @staticmethod
+                def amount_to_precision(symbol, amount):
+                    return f"{float(amount):.0f}"
+
+            self.exchange = _inner()
+
+        def get_price(self, symbol):
+            return self.price
+
+        def get_positions(self, symbol):
+            return self.positions
+
+        def get_balance(self):
+            return 4866.53
+
+        def get_open_order_ids(self, symbol):
+            return {i for i, o in self._orders.items() if o["status"] == "open"}
+
+        def fetch_order(self, order_id, symbol):
+            return self._orders.get(order_id)
+
+        def cancel_order(self, order_id, symbol):
+            if order_id in self._orders:
+                self._orders[order_id]["status"] = "canceled"
+            return True
+
+        def place_limit_order(self, symbol, side, price, amount, max_attempts=3,
+                               params=None, post_only=True, allow_taker_fallback=False):
+            self._next += 1
+            oid = f"o{self._next}"
+            order = {"id": oid, "side": side, "price": price, "amount": amount,
+                     "filled": 0.0, "average": price, "status": "open"}
+            self._orders[oid] = order
+            return order
+
+        def close_position(self, symbol, side, amount, max_attempts=None):
+            self.positions = []
+            return True
+
+    ex = TrendExchange()
+    trend = TrendFollower(exchange=ex, symbol="ADAUSDT", min_hold_seconds=0)
+    trend.active = True
+    trend._side = "long"
+    trend._entry_price = 0.2179
+    trend._qty = 114.0
+
+    grid = FakeStrategy("grid")
+    r = StrategyRouter(
+        strategies={"grid": grid, "trend": trend},
+        min_regime_seconds=0, handoff_grace_seconds=3600, exchange=ex, symbol="ADAUSDT",
+    )
+    r.active_name = "trend"
+
+    # The position exists on the exchange too, not just in the strategy's own
+    # bookkeeping -- _flat_on_exchange reads the exchange, not the strategy.
+    ex.positions = [{"side": "long", "contracts": 114.0, "entryPrice": 0.2179}]
+
+    r.update_regime("ranging")   # targets "grid" -- trend must unwind first
+
+    assert r.handoff_in_progress, "sanity: the handoff must still be pending, not forced closed"
+    assert trend._take_profit_price is not None, (
+        "the real trend follower's accelerate_handoff_exit was never reached"
+    )
+    assert any(o["side"] == "sell" for o in ex._orders.values()), (
+        "no reduce-only exit was actually rested on the book"
+    )

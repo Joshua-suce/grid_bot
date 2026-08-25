@@ -469,3 +469,174 @@ def test_price_is_never_outside_a_strategy_that_has_no_range():
     for price in (0.00001, 0.0705, 1_000_000.0):
         assert not (price < tf.grid_lower)
         assert not (price > tf.grid_upper)
+
+
+# --- handoff acceleration (AUDIT #148) --------------------------------------
+#
+# GridEngine has had accelerate_handoff_exit since AUDIT #145 (tests/test_handoff_accel.py);
+# this strategy never did, so a trend-to-grid handoff had nothing to accelerate and just
+# waited out the full grace period. 2026-08-24/25: 31 minutes of "still waiting for flat"
+# with zero repricing, ending in a forced market close at grace expiry.
+
+def positioned(ex=None, side="long", entry=0.2179, qty=114.0, price_now=0.2182,
+               tp=None, tp_order_id=None, take_profit_r=3.0):
+    """A TrendFollower already holding a position, without driving the full
+    entry-fill pipeline -- mirrors tests/test_handoff_accel.py's engine() helper for
+    the same reason: this is a unit test of accelerate_handoff_exit's own decision,
+    not of order placement mechanics."""
+    ex = ex or FakeExchange(price=price_now)
+    ex.fill_immediately = False
+    tf = TrendFollower(exchange=ex, symbol="DOGEUSDT", min_hold_seconds=0, take_profit_r=take_profit_r)
+    tf.active = True
+    tf._side = side
+    tf._entry_price = entry
+    tf._qty = qty
+    tf._take_profit_price = tp
+    tf._tp_order_id = tp_order_id
+    return tf, ex
+
+
+# --------------------------------------------------------------- the live incident
+def test_a_target_far_from_market_is_repriced_toward_break_even():
+    tf, ex = positioned(tp=0.2450, tp_order_id="old-tp")
+
+    result = tf.accelerate_handoff_exit(0.2182, balance=4866.53)
+
+    assert result is True
+    assert tf._take_profit_price < 0.2450, "the target was left exactly where it started"
+    assert tf._take_profit_price >= tf._entry_price - 1e-9, (
+        "repricing must never quote below the position's own entry price"
+    )
+    assert "old-tp" in ex.cancelled, "the stale target was never cancelled"
+    assert ex.placed, "nothing was placed at the new target"
+    assert ex.placed[-1]["side"] == "sell"
+
+
+def test_price_below_entry_still_clamps_to_break_even_not_a_loss():
+    """The clamp only does real work when price has moved PAST entry -- the case
+    above (price still above entry for a long) would pass even with no clamp at all,
+    since max(entry, price) == price there regardless. This is the case that proves
+    it: price has moved against the position, and the target must still floor at
+    entry rather than follow price down into a loss."""
+    tf, ex = positioned(entry=0.2179, price_now=0.2150, tp=0.2450, tp_order_id="old-tp")
+
+    result = tf.accelerate_handoff_exit(0.2150, balance=4866.53)
+
+    assert result is True
+    assert tf._take_profit_price == tf._entry_price, (
+        f"target {tf._take_profit_price} followed price below entry {tf._entry_price}"
+    )
+
+
+def test_a_short_is_the_mirror():
+    """The exit for a short is a BUY, and 'stale' means too far BELOW market -- moving
+    it UP toward break-even is the improvement, not down."""
+    tf, ex = positioned(side="short", entry=0.2179, price_now=0.2176,
+                         tp=0.1900, tp_order_id="old-tp")
+
+    result = tf.accelerate_handoff_exit(0.2176, balance=4866.53)
+
+    assert result is True
+    assert tf._take_profit_price > 0.1900, "a short's stale target must move UP toward the market"
+    assert tf._take_profit_price <= tf._entry_price + 1e-9
+    assert ex.placed[-1]["side"] == "buy"
+
+
+def test_price_above_entry_still_clamps_a_short_to_break_even_not_a_loss():
+    """The mirror of the long clamp test: price has moved AGAINST the short (up, past
+    entry), and the buy-to-cover target must floor at entry rather than chase price
+    up into a loss."""
+    tf, ex = positioned(side="short", entry=0.2179, price_now=0.2210,
+                         tp=0.1900, tp_order_id="old-tp")
+
+    result = tf.accelerate_handoff_exit(0.2210, balance=4866.53)
+
+    assert result is True
+    assert tf._take_profit_price == tf._entry_price, (
+        f"target {tf._take_profit_price} followed price above entry {tf._entry_price}"
+    )
+
+
+def test_a_position_with_no_configured_target_gets_one():
+    """trend_take_profit_r defaults to 0.0 -- ride the trailing stop only, no resting
+    exit at all. This is very likely what the live incident actually held: nothing to
+    reprice because nothing was ever armed in the first place. The handoff still needs
+    a real order to close through, so acceleration must create one, not require one."""
+    tf, ex = positioned(tp=None, tp_order_id=None, take_profit_r=0.0)
+    assert tf._take_profit_price is None
+
+    result = tf.accelerate_handoff_exit(0.2182, balance=4866.53)
+
+    assert result is True
+    assert tf._take_profit_price is not None
+    assert tf._take_profit_price >= tf._entry_price - 1e-9
+    assert ex.placed and ex.placed[-1]["side"] == "sell"
+
+
+# ------------------------------------------------------------------------ inertness
+def test_flat_position_does_nothing():
+    tf, ex = positioned()
+    tf._side = None
+    tf._qty = 0.0
+
+    assert tf.accelerate_handoff_exit(0.2182, balance=1000) is False
+    assert ex.placed == []
+
+
+def test_the_stop_is_never_touched():
+    """Only the take-profit ever moves here -- accelerating the stop would mean
+    voluntarily taking a WORSE exit, the opposite of the point."""
+    tf, ex = positioned(tp=0.2450, tp_order_id="old-tp")
+    tf.update_trailing_sl(0.2182)
+    stop_before = tf.get_stop_loss_price()
+
+    tf.accelerate_handoff_exit(0.2182, balance=4866.53)
+
+    assert tf.get_stop_loss_price() == stop_before
+
+
+def test_a_target_already_at_break_even_or_better_is_left_alone():
+    tf, ex = positioned(tp=0.2180, tp_order_id="old-tp")   # already inside break-even
+
+    result = tf.accelerate_handoff_exit(0.2182, balance=1000)
+
+    assert result is False
+    assert ex.cancelled == []
+    assert tf._take_profit_price == 0.2180
+
+
+# ------------------------------------------------------------------------- cooldown
+def test_a_second_call_inside_the_cooldown_is_a_no_op():
+    tf, ex = positioned(tp=0.2450, tp_order_id="old-tp")
+    assert tf.accelerate_handoff_exit(0.2182, balance=1000) is True
+
+    # Put the target back exactly where it would be genuinely improvable again -- the
+    # cooldown, not "nothing left to improve", must be what blocks the second call.
+    reprised_id = tf._tp_order_id
+    tf._take_profit_price = 0.2450
+    tf._tp_order_id = "old-tp-2"
+    ex.cancelled = []
+
+    assert tf.accelerate_handoff_exit(0.2182, balance=1000) is False, (
+        "repriced again inside HANDOFF_ACCEL_COOLDOWN_SECONDS"
+    )
+    assert ex.cancelled == []
+    assert tf._tp_order_id == "old-tp-2"
+
+
+# ------------------------------------------------------------- unconfirmed cancels
+def test_an_unconfirmed_cancel_keeps_the_target_claimed():
+    """Same discipline as _disarm_take_profit's own contract: if the exchange cannot
+    confirm the cancel, the target must stay exactly as it was."""
+    tf, ex = positioned(tp=0.2450, tp_order_id="live-order")
+
+    def refuse_cancel(order_id, symbol):
+        return False
+    ex.cancel_order = refuse_cancel
+
+    result = tf.accelerate_handoff_exit(0.2182, balance=1000)
+
+    assert result is False
+    assert tf._tp_order_id == "live-order"
+    assert tf._take_profit_price == 0.2450
+    assert ex.placed == []

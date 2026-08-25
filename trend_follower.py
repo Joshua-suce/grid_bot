@@ -74,6 +74,8 @@ class TrendFollower:
     # regime has never been confirmed against anything live and reconcile_positions
     # relies on this to tell the two apart (AUDIT #146).
     _regime_confirmed = False
+    _last_handoff_accel_time = 0.0
+    HANDOFF_ACCEL_COOLDOWN_SECONDS = 60.0
     """Holds at most one position, in the direction of the prevailing regime.
 
     Implements the `Strategy` protocol, plus no-op equivalents of the grid-specific
@@ -159,6 +161,7 @@ class TrendFollower:
         # insufficient margin) retries at a civilized rate instead of once per poll.
         self._tp_retry_after = 0.0
         self._tp_band_deferred = False
+        self._last_handoff_accel_time = 0.0
 
         # --- stops (ratcheted, see update_trailing_sl) ---
         self._peak_price = 0.0
@@ -426,6 +429,67 @@ class TrendFollower:
                 self._tp_order_id, reason,
             )
         self._tp_order_id = None
+        return True
+
+    def accelerate_handoff_exit(self, current_price: float, balance: float) -> bool:
+        """During a router handoff, give the exit a resting order to actually trade
+        against instead of leaving it to the trailing stop and the grace clock.
+
+        GridEngine has had this since AUDIT #145; this strategy never did, so a
+        trend-to-grid handoff had nothing to accelerate. 2026-08-24/25: a trend
+        position sat through the full handoff grace with zero "HANDOFF EXIT
+        ACCELERATED" log lines and the router forced a market close at grace expiry --
+        exactly the outcome AUDIT #29 built this mechanism to avoid (AUDIT #148).
+
+        trend_take_profit_r defaults to 0.0 -- no target at all, ride the trailing
+        stop only -- so there is often no resting order here to reprice in the first
+        place, not merely one sitting too far from market. Either way the fix is the
+        same order: rest a reduce-only limit at the better of entry price and the
+        current market, so the position gets a real chance to close through the book
+        at break-even-or-better before the grace deadline forces a worse,
+        market-crossing exit instead. Only the take-profit ever moves -- the stop
+        stays exactly where the ratchet put it, since accelerating it would mean
+        voluntarily taking a WORSE exit, the opposite of the point.
+
+        Reuses _disarm_take_profit / _arm_take_profit rather than talking to the
+        exchange directly, so this gets their existing guarantees for free: post-only
+        (never crosses and takes a worse fill than intended), reduce-only (can never
+        add to the position), and the unconfirmed-cancel contract (a cancel that
+        cannot be confirmed keeps the old target claimed rather than risking two
+        resting at once).
+        """
+        if self._side is None or self._qty <= 0 or self._entry_price <= 0:
+            return False                          # already flat -- the handoff completes on its own
+        now = time.time()
+        if (now - self._last_handoff_accel_time) < self.HANDOFF_ACCEL_COOLDOWN_SECONDS:
+            return False
+
+        exit_side = "sell" if self._side == "long" else "buy"
+        if exit_side == "sell":
+            target = self._round_price(max(self._entry_price, current_price))
+            improves = self._take_profit_price is None or target < self._take_profit_price
+        else:
+            target = self._round_price(min(self._entry_price, current_price))
+            improves = self._take_profit_price is None or target > self._take_profit_price
+        if not improves:
+            return False
+
+        # Claim the cooldown before any I/O -- same discipline as _arm_take_profit's
+        # own backoff: a failed cancel below must not retry every single poll.
+        self._last_handoff_accel_time = now
+        old_price = self._take_profit_price
+        if not self._disarm_take_profit("handoff_accel"):
+            return False                          # unconfirmed cancel -- stays claimed, retried later
+
+        self._take_profit_price = target
+        self._tp_retry_after = 0.0
+        logger.warning(
+            "HANDOFF EXIT ACCELERATED | {} target {} -> {} | resting at "
+            "break-even-or-better so the handoff can close through the book instead "
+            "of waiting on the grace deadline (AUDIT #148)",
+            exit_side.upper(), old_price if old_price is not None else "none", target,
+        )
+        self._arm_take_profit(self._qty)
         return True
 
     # --- trading -----------------------------------------------------------
