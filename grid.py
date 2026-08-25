@@ -1506,10 +1506,18 @@ class GridEngine:
         Only the EXIT side is ever touched here -- the side that reduces the position
         -- and _nearest_legal_exit never returns worse than the position's own
         break-even, so this can only bring a still-profitable exit closer to market,
-        never manufacture the loss the force-close would take anyway. The actual
-        placement goes through _place_order_for_level, so every existing guard
-        (crossing checks, the fee floor, the loss guard) still applies exactly as it
-        does to any other level (AUDIT #145).
+        never manufacture the loss the force-close would take anyway (AUDIT #145).
+
+        The replacement is placed through _place_exit_reprice, NOT
+        _place_order_for_level: that path is the generic ladder-opening placement --
+        it recomputes quantity from capital sizing and never sets reduceOnly, because
+        an ordinary rung might be opening exposure, not closing it. This call is
+        ALWAYS closing a specific, already-known slice of the position (the rung's
+        own quantity), and the first version of this used the generic path anyway --
+        on a 10-unit position with a correctly-sized 10-unit exit rung it placed a
+        naked, non-reduceOnly SELL for 114.6 units, sized purely from capital and
+        totally unrelated to the position, with nothing stopping it from flipping the
+        position short if it filled (AUDIT #149).
         """
         if abs(self._pos_qty) <= 1e-9:
             return False                          # already flat -- the handoff completes on its own
@@ -1550,6 +1558,21 @@ class GridEngine:
                 return False
             if not confirmed:
                 return False                      # order_id kept; retried after the cooldown
+        else:
+            # Missing from the open-orders snapshot is ambiguous: filled, or
+            # cancelled by something else. check_fills disambiguates via fetch_order
+            # before deciding which; treating both the same here silently dropped a
+            # genuine fill's P&L/journal/position bookkeeping and reclaimed the
+            # level as if nothing had traded (AUDIT #150).
+            order = self.exchange.fetch_order(nearest.order_id, self.symbol)
+            if order is not None and order_was_filled(order):
+                logger.warning(
+                    "HANDOFF ACCEL | {} @ {} filled instead of waiting to be "
+                    "repriced -- processing as a fill, not a cancel (AUDIT #150)",
+                    nearest.side, nearest.price,
+                )
+                self._handle_fill(nearest, balance)
+                return True
 
         old_price, old_id = nearest.price, nearest.order_id
         if self._event_journal:
@@ -1566,7 +1589,51 @@ class GridEngine:
             exit_side.upper(), old_price, target,
             abs(old_price - current_price) / current_price * 100,
         )
-        return self._place_order_for_level(nearest, balance)
+        return self._place_exit_reprice(nearest, exit_side, balance)
+
+    def _place_exit_reprice(self, level: "GridLevel", side: str, balance: float) -> bool:
+        """Place the repriced exit accelerate_handoff_exit just cleared -- reduceOnly
+        and clamped to the real closable quantity, never the generic ladder-opening
+        path (AUDIT #149).
+
+        Refreshes the reduce-only mirror right before using it, the same discipline
+        _handle_fill's own replacement branch follows (AUDIT #98): the position may
+        have moved since this level was last sized, and a stale mirror here is
+        exactly how #98 sized a replacement against a position that no longer
+        existed.
+        """
+        self._refresh_net_counters()
+        params, adj_qty = self._exit_order_params(side, level.quantity)
+        if params is None or adj_qty <= 0:
+            logger.error(
+                "HANDOFF ACCEL | {} has no closable position on the exchange right "
+                "now despite pos_qty={} -- refusing to place an unprotected order",
+                side.upper(), self._pos_qty,
+            )
+            return False
+        quantity = self.exchange.exchange.amount_to_precision(self.symbol, adj_qty)
+        if float(quantity) <= 0 or float(quantity) * level.price < MIN_NOTIONAL_USDT:
+            return False
+        try:
+            order_params = dict(params)
+            order_params["purpose"] = "handoff_accel"
+            order = self.exchange.place_limit_order(
+                self.symbol, side, level.price, float(quantity), max_attempts=1,
+                params=order_params,
+            )
+            if "id" not in order:
+                raise ValueError("Order response missing 'id'")
+        except Exception as e:
+            logger.error("HANDOFF ACCEL | failed to place repriced exit @ {}: {}", level.price, e)
+            return False
+        level.order_id = order["id"]
+        level.status = "pending"
+        level.quantity = float(quantity)
+        if self._event_journal:
+            self._event_journal.order_placed(self.symbol, side, level.price, float(quantity), order["id"])
+        if self._notifier:
+            self._notifier.on_order_placed(self.symbol, side, level.price, float(quantity), order["id"])
+        return True
 
     def _existing_open_order(self, price: float, side: str) -> dict | None:
         """Return an open exchange order already resting at the same price+side, if any.

@@ -30,6 +30,18 @@ def engine(pos_qty=114.0, entry=0.2179, price_now=0.2182, spacing=0.0017):
     ex.get_price.return_value = price_now
     ex.cancel_order.return_value = True
     ex.place_limit_order.return_value = {"id": "accel", "amount": 114}
+    # _place_exit_reprice refreshes the reduce-only mirror from this before sizing
+    # the replacement (AUDIT #98/#149) -- without it every accelerated exit reads as
+    # having nothing to close and refuses to place, regardless of pos_qty below.
+    ex.get_positions.return_value = (
+        [{"side": "long", "contracts": pos_qty}] if pos_qty > 0
+        else [{"side": "short", "contracts": abs(pos_qty)}] if pos_qty < 0
+        else []
+    )
+    # No test in this file exercises "the order actually filled" -- an unconfigured
+    # fetch_order must read as "not filled" (order_was_filled's own allowlist
+    # already defaults a MagicMock to False), so the existing not-in-still_open
+    # tests keep reclaiming the level exactly as before AUDIT #150.
     g = GridEngine(ex, "ADAUSDT", grid_lower=0.21366559, grid_upper=0.22373441,
                    grid_count=6, capital_per_grid_pct=0.018, stop_loss_pct=0.02,
                    capital_per_grid_usdt=5.0, leverage=5)
@@ -167,3 +179,107 @@ def test_an_order_already_gone_is_repriced_without_a_cancel_call():
 
     assert result is True
     assert ex.cancel_order.called is False
+
+
+# ------------------------------------------------------ reduceOnly / real quantity
+def test_the_replacement_is_sized_to_the_position_not_capital():
+    """AUDIT #149. The first version of this reused _place_order_for_level -- the
+    generic ladder-opening path, which recomputes quantity from capital sizing and
+    never sets reduceOnly. A 30-unit position with a correctly-sized 30-unit exit
+    rung got a naked, non-reduceOnly replacement for ~114 units, wildly unrelated to
+    the position, with nothing stopping it from flipping the position short if it
+    filled. The replacement must stay sized to the rung's own (position-derived)
+    quantity, far below the ~114.6 the capital-sizing path would produce here, and
+    must always carry reduceOnly.
+    """
+    g, ex, _ = engine(pos_qty=30.0)
+    sell = resting("sell", 0.2195, qty=30.0)
+    g.levels = [sell]
+
+    result = g.accelerate_handoff_exit(0.2182, balance=4866.53)
+
+    assert result is True
+    args, kwargs = ex.place_limit_order.call_args
+    placed_qty = args[3] if len(args) > 3 else kwargs.get("amount")
+    assert placed_qty is not None and placed_qty <= 30.0, (
+        f"placed {placed_qty}, far past the real 30-unit position"
+    )
+    placed_params = kwargs.get("params") or {}
+    assert placed_params.get("reduceOnly") is True, (
+        "the replacement was placed WITHOUT reduceOnly -- it could add exposure or "
+        "flip the position if it filled"
+    )
+
+
+def test_the_replacement_never_exceeds_what_the_exchange_says_is_closable():
+    """The rung's own quantity is the ceiling, not a guarantee -- if the real
+    position (freshly read, not the stale mirror) is SMALLER than the rung believes,
+    the replacement must clamp down to what can actually be closed."""
+    g, ex, _ = engine(pos_qty=30.0)
+    ex.get_positions.return_value = [{"side": "long", "contracts": 25.0}]
+    sell = resting("sell", 0.2195, qty=30.0)
+    g.levels = [sell]
+
+    result = g.accelerate_handoff_exit(0.2182, balance=4866.53)
+
+    assert result is True
+    args, kwargs = ex.place_limit_order.call_args
+    placed_qty = args[3] if len(args) > 3 else kwargs.get("amount")
+    assert placed_qty <= 25.0, f"placed {placed_qty} against a real position of only 25"
+
+
+def test_refuses_to_place_when_the_exchange_shows_nothing_closable():
+    """If a fresh read says there is genuinely nothing left to close on the exit
+    side (despite pos_qty believing otherwise), placing anyway risks an unprotected
+    order -- refuse rather than guess."""
+    g, ex, _ = engine(pos_qty=30.0)
+    ex.get_positions.return_value = []   # exchange says flat on the exit side
+    sell = resting("sell", 0.2195, qty=30.0)
+    g.levels = [sell]
+
+    result = g.accelerate_handoff_exit(0.2182, balance=4866.53)
+
+    assert result is False
+    assert ex.place_limit_order.called is False
+
+
+# --------------------------------------------------------- fill vs. cancel (#150)
+def test_a_vanished_order_that_actually_filled_is_processed_as_a_fill():
+    """AUDIT #150. 'Not in still_open' is ambiguous -- filled, or cancelled by
+    something else. Silently treating a genuine fill as a cancel drops its P&L,
+    journal entry, and position bookkeeping, then places a brand-new, independently
+    sized order right on top of a position that already changed."""
+    g, ex, _ = engine(pos_qty=114.0)
+    sell = resting("sell", 0.2195, oid="ghost", qty=114.0)
+    g.levels = [sell]
+    ex.get_open_order_ids.return_value = set()          # gone from the book
+    ex.fetch_order.return_value = {
+        "id": "ghost", "status": "closed", "filled": 114.0,
+    }
+
+    fills_before = g.total_fills
+
+    result = g.accelerate_handoff_exit(0.2182, balance=1000)
+
+    assert result is True
+    assert ex.cancel_order.called is False, "a filled order must never be cancelled"
+    assert g.total_fills == fills_before + 1, "the fill was never booked"
+    # _handle_fill re-arms its own counter-order; accelerate_handoff_exit must not
+    # ALSO place a second, independently-sized order on top of it.
+    assert ex.place_limit_order.call_count <= 1
+
+
+def test_a_vanished_order_that_was_only_cancelled_still_reprices_normally():
+    """The mirror case: fetch_order confirms it was NOT a fill (e.g. expired,
+    rejected, cancelled by something else) -- must fall through to the ordinary
+    reclaim-and-reprice path exactly as before, not treat it as a fill."""
+    g, ex, _ = engine(pos_qty=114.0)
+    sell = resting("sell", 0.2195, oid="ghost", qty=114.0)
+    g.levels = [sell]
+    ex.get_open_order_ids.return_value = set()
+    ex.fetch_order.return_value = {"id": "ghost", "status": "canceled", "filled": 0.0}
+
+    result = g.accelerate_handoff_exit(0.2182, balance=1000)
+
+    assert result is True
+    assert ex.place_limit_order.called, "the level was never reclaimed and repriced"
