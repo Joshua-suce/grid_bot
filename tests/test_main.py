@@ -443,3 +443,51 @@ def test_orders_are_still_cancelled_unconditionally():
     assert not src[:cancel_at].rstrip().endswith(":"), (
         "the cancel is now inside a conditional block"
     )
+
+
+# --- AUDIT #155: a restart during an active kill-switch recovery cooldown must not
+# silently re-arm the ladder into the very conditions that tripped it --------------
+
+def test_recovery_state_is_restored_before_the_first_post_restart_ladder_placement():
+    """risk.load_from_dict used to run one line AFTER place_initial_orders -- so the
+    very first ladder placement of every restart always saw the freshly-constructed
+    in_recovery=False, never the real saved value, no matter how deep into an active
+    cooldown the bot actually was.
+    """
+    src = _main_source()
+    load_at = src.index('risk.load_from_dict(saved_state.get("risk", {}))')
+    place_at = src.index("grid.place_initial_orders(exchange.get_balance())")
+    assert load_at < place_at, (
+        "risk state is restored after the first ladder placement decision, not before"
+    )
+
+
+def test_the_post_cleanup_ladder_placement_is_gated_on_recovery():
+    """The ladder placed once the exchange is confirmed flat must not fire while a
+    kill-switch recovery cooldown is still active -- that flat state is exactly what
+    cleanup.py leaves behind, so it is the trigger condition for the old bug, not a
+    guard against it."""
+    src = _main_source()
+    guard_at = src.index("if not has_exchange_positions:")
+    place_at = src.index("grid.place_initial_orders(exchange.get_balance())")
+    between = src[guard_at:place_at]
+    assert "risk.is_in_recovery()" in between, (
+        "the post-cleanup ladder placement no longer checks recovery state at all"
+    )
+    assert "else:" in between, (
+        "place_initial_orders is not gated behind the recovery check's else branch"
+    )
+
+
+def test_the_startup_grid_activation_is_also_gated_on_recovery():
+    """The second activation point (the trend-gate block, reached ~20-25 minutes of
+    blind re-confirmation later) must independently refuse to switch the grid on
+    during an active recovery cooldown -- an inherited active grid would otherwise
+    resume trading there regardless of the ladder-placement gate above."""
+    src = _main_source()
+    activate_at = src.index("grid.activate(exchange.get_balance())")
+    recovery_check_at = src.rindex("if risk.is_in_recovery():", 0, activate_at)
+    between = src[recovery_check_at:activate_at]
+    assert "elif" in between, (
+        "grid.activate is not gated behind an elif of the startup recovery check"
+    )

@@ -1298,6 +1298,14 @@ def run_bot() -> None:
         logger.info("Restoring saved grid state")
         balance = exchange.get_balance()
         risk.initialize(balance)
+        # Restored here, before anything below decides whether to place an order. This
+        # used to run one step later, after place_initial_orders() -- a restart landing
+        # inside an active kill-switch recovery cooldown re-armed a full ladder into the
+        # very conditions that tripped the switch, silently, because in_recovery was
+        # still the freshly-constructed False at the moment that decision was made. The
+        # loop's own is_in_recovery() check (below) only ever sees state AFTER the first
+        # ladder was already resting on the exchange (AUDIT #155).
+        risk.load_from_dict(saved_state.get("risk", {}))
 
         # GRID_COUNT comes from CONFIG, not from the saved state. Taking it from state
         # meant a config change was silently inert for as long as a state file existed:
@@ -1369,12 +1377,18 @@ def run_bot() -> None:
         grid.reconcile_positions()
 
         if not has_exchange_positions:
-            logger.info("No exchange positions — resetting stale grid levels to pending")
-            grid.reset_levels_to_pending(exchange.get_price(settings.symbol))
-            logger.info("Placing fresh grid orders after cleanup")
-            grid.place_initial_orders(exchange.get_balance())
-
-        risk.load_from_dict(saved_state.get("risk", {}))
+            if risk.is_in_recovery():
+                logger.warning(
+                    "STARTUP DEFERRED | recovery cooldown {}s remaining -- leaving the "
+                    "grid flat instead of re-arming a ladder into what tripped the kill "
+                    "switch (AUDIT #155)",
+                    risk.recovery_cooldown_remaining(),
+                )
+            else:
+                logger.info("No exchange positions — resetting stale grid levels to pending")
+                grid.reset_levels_to_pending(exchange.get_price(settings.symbol))
+                logger.info("Placing fresh grid orders after cleanup")
+                grid.place_initial_orders(exchange.get_balance())
     else:
         logger.info("Calculating grid range from recent price action")
         ohlcv = exchange.get_ohlcv(settings.symbol, settings.grid_timeframe, limit=candles_for_lookback(settings.grid_timeframe, settings.range_lookback_days))
@@ -1728,7 +1742,18 @@ def run_bot() -> None:
     except Exception:
         pass
 
-    if settings.force_trade_now or trend.is_ranging():
+    if risk.is_in_recovery():
+        # Second, redundant check -- the branch above already refuses to place a fresh
+        # ladder during a recovery cooldown, but this is also where an inherited grid
+        # would otherwise get switched on regardless (AUDIT #155).
+        if grid.active:
+            grid.pause()
+            _reset_sl()
+        logger.warning(
+            "STARTUP DEFERRED | recovery cooldown {}s remaining -- grid stays inactive",
+            risk.recovery_cooldown_remaining(),
+        )
+    elif settings.force_trade_now or trend.is_ranging():
         grid.activate(exchange.get_balance())
         notifier.on_grid_start(settings.symbol, grid.grid_lower, grid.grid_upper, grid.grid_count)
         if settings.force_trade_now:
