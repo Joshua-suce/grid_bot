@@ -79,7 +79,17 @@ def _summarize(state: dict) -> None:
 def _fresh_reconciler_state() -> dict:
     """A reconciler baselined at now: zeroed totals, cursor parked at the current
     time, and bootstrapped=True so sync() does the incremental path instead of
-    re-pulling 89 days of history. Income logged from this moment on is counted."""
+    re-pulling 89 days of history. Income logged from this moment on is counted.
+
+    epoch_ms must match the CURRENT PNL_EPOCH setting, not be omitted. Omitting it
+    defaults to None on reload, and PnLReconciler.reset_for_epoch() compares that
+    against settings.pnl_epoch_ms on every startup -- with PNL_EPOCH set to a fixed
+    date, None never matches it, so it reads as "the epoch changed" and silently
+    re-bootstraps from that same historical date on the very next start, discarding
+    this reset and recomputing the exact total it was meant to clear (AUDIT #165).
+    With PNL_EPOCH unset (rolling window, pnl_epoch_ms is None), None already matches
+    it, so this was invisible in that configuration -- only a fixed PNL_EPOCH exposed it.
+    """
     now_ms = int(time.time() * 1000)
     return {
         "realized_pnl": 0.0,
@@ -90,6 +100,7 @@ def _fresh_reconciler_state() -> dict:
         "bootstrapped": True,
         "daily_net_pnl": 0.0,
         "daily_reset_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "epoch_ms": settings.pnl_epoch_ms,
     }
 
 
