@@ -90,8 +90,18 @@ def open_exposure(exchange: Exchange, symbol: str) -> tuple[float, int]:
 
 
 def state_path(symbol: str) -> Path:
-    suffix = "_demo" if settings.demo_mode else ""
-    return Path(settings.state_dir) / f"grid_{symbol.lower()}{suffix}.json"
+    """Must match StateManager's own naming exactly (state.py) -- AUDIT #166.
+
+    This used to compute no suffix at all for live ("grid_{symbol}.json"), while
+    StateManager has always named live state "grid_{symbol}_live.json" (AUDIT #67,
+    the fix that gave demo and live separate files in the first place, specifically
+    so one could never load against the other). A symbol switch run live with
+    --apply would check the wrong path, report "no saved state" even when real state
+    existed, and skip archiving it -- reintroducing the exact bug #67 fixed, just one
+    script away from where it was fixed.
+    """
+    mode = "demo" if settings.demo_mode else "live"
+    return Path(settings.state_dir) / f"grid_{symbol.lower()}_{mode}.json"
 
 
 def main(argv: list[str] | None = None) -> int:

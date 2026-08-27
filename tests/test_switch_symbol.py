@@ -117,6 +117,24 @@ def test_state_path_matches_what_main_writes():
     assert ("_demo" in p.name) == settings.demo_mode
 
 
+def test_state_path_matches_state_manager_for_both_modes(monkeypatch):
+    """AUDIT #166. state_path() used to compute no suffix at all for live, instead of
+    StateManager's own "_live" convention -- a switch run live with --apply would
+    check the wrong path, report "no saved state" even when real state existed, and
+    skip archiving it. Checked directly against StateManager's real filepath (not a
+    substring guess) for BOTH modes -- the test above only ever exercises whichever
+    mode this session's own settings.demo_mode happens to be, so a wrong live branch
+    was invisible to it as long as the session ran in demo.
+    """
+    from config import settings
+    from state import StateManager
+
+    for demo in (True, False):
+        monkeypatch.setattr(settings, "demo_mode", demo)
+        expected = StateManager(settings.state_dir, "ADAUSDT", demo=demo).filepath
+        assert state_path("ADAUSDT") == expected
+
+
 # --- and it must never trade -------------------------------------------------------------
 
 def test_the_script_places_no_orders():
