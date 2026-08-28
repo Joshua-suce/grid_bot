@@ -401,3 +401,74 @@ def test_place_limit_order_does_not_resync_on_an_unrelated_failure():
 
     assert order["id"] == "placed-ok"
     assert fake.synced == 0, "resynced the clock for a failure that had nothing to do with drift"
+
+
+def test_place_limit_order_earns_back_an_attempt_when_it_resyncs():
+    """A resync is a REPAIR, not a retry-and-hope -- it must earn its attempt back rather
+    than spend one, or the attempt that resyncs can be the LAST one, with the fix arriving
+    and nothing left to use it on. With max_attempts=1 there is normally no second try at
+    all; a genuine drift rejection on that one attempt must still get a real retry."""
+    class DriftBackend:
+        def __init__(self):
+            self.calls = 0
+            self.synced = 0
+
+        def create_limit_order(self, symbol, side, amount, price, params):
+            self.calls += 1
+            if self.calls == 1:
+                raise ccxt.InvalidNonce("-1021 Timestamp for this request is outside of the recvWindow")
+            return {"id": "placed-after-earned-attempt", "side": side}
+
+        def amount_to_precision(self, symbol, amount):
+            return str(amount)
+
+    fake = DriftBackend()
+    ex = make_exchange(fake)
+    ex._sync_time = lambda: setattr(fake, "synced", fake.synced + 1)
+
+    order = ex.place_limit_order("DOGEUSDT", "buy", 0.069, 100, max_attempts=1, post_only=True)
+
+    assert order["id"] == "placed-after-earned-attempt", (
+        "max_attempts=1 exhausted on the resync itself instead of earning back an attempt"
+    )
+    assert fake.calls == 2
+    assert fake.synced == 1
+
+
+class PostOnlyFallbackDriftBackend:
+    """postOnly is always rejected with -2019; the taker fallback drifts once, then works."""
+
+    def __init__(self):
+        self.postonly_calls = 0
+        self.fallback_calls = 0
+        self.synced = 0
+
+    def create_limit_order(self, symbol, side, amount, price, params):
+        if params.get("postOnly") is True:
+            self.postonly_calls += 1
+            raise ccxt.InvalidOrder("-2019 Post only order would be immediately matched")
+        self.fallback_calls += 1
+        if self.fallback_calls == 1:
+            raise ccxt.InvalidNonce("-1021 Timestamp for this request is outside of the recvWindow")
+        return {"id": "placed-after-fallback-resync", "side": side}
+
+    def amount_to_precision(self, symbol, amount):
+        return str(amount)
+
+
+def test_place_limit_order_fallback_resyncs_on_invalid_nonce():
+    """The post-only-cross fallback (allow_taker_fallback=True) makes its OWN separate
+    network call, so it can drift-fail independently of whatever the original postOnly
+    attempt failed with (-2019, unrelated to clock drift) -- it needs the same resync
+    treatment as the main retry loop, which it never had before this fix."""
+    fake = PostOnlyFallbackDriftBackend()
+    ex = make_exchange(fake)
+    ex._sync_time = lambda: setattr(fake, "synced", fake.synced + 1)
+
+    order = ex.place_limit_order(
+        "DOGEUSDT", "buy", 0.069, 100, max_attempts=2, post_only=True, allow_taker_fallback=True,
+    )
+
+    assert order["id"] == "placed-after-fallback-resync"
+    assert fake.fallback_calls == 2
+    assert fake.synced == 1, "the post-only fallback did not resync the clock on a timestamp-drift rejection"

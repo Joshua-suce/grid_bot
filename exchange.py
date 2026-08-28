@@ -741,7 +741,16 @@ class Exchange:
             params = dict(params)
             purpose = params.pop("purpose")
         client_order_id = f"{_purpose_tag(purpose)}{uuid.uuid4().hex[:29]}"
-        for attempt in range(1, max_attempts + 1):
+        # A timestamp-drift resync (below) is a REPAIR, not a retry-and-hope, so it earns
+        # its attempt back rather than spending one -- otherwise the attempt that resyncs
+        # could be the LAST one, and the fix arrives with nothing left to use it on. Same
+        # mechanism as _retry()'s own resync_budget, bounded so a backend that answers
+        # -1021 forever still terminates.
+        resync_budget = 2
+        attempts = max_attempts
+        attempt = 0
+        while attempt < attempts:
+            attempt += 1
             try:
                 # Merge and normalize params: allow callers to pass post-only via either the post_only
                 # kwarg or inside params as 'postOnly' (or 'post_only'). The params dict is what
@@ -805,16 +814,26 @@ class Exchange:
                         order = self.exchange.create_limit_order(symbol, side, amount, price, order_params)
                     except Exception as fallback_err:
                         last_err = fallback_err
+                        if self._is_timestamp_error(fallback_err):
+                            # The fallback is its own network call and can drift-fail
+                            # independently of whatever the postOnly attempt above failed
+                            # with -- same resync-budget mechanism as the generic branch
+                            # below, so it does not spend the one real attempt this
+                            # fallback exists to make.
+                            self._sync_time()
+                            if resync_budget > 0:
+                                resync_budget -= 1
+                                attempts += 1
                         logger.warning(
                             "Post-only fallback also failed @ {} (attempt {}/{}): {}",
-                            price, attempt, max_attempts, fallback_err,
+                            price, attempt, attempts, fallback_err,
                         )
-                        if attempt < max_attempts:
+                        if attempt < attempts:
                             time.sleep(self.retry_delay * attempt)
                             continue
                         logger.error(
                             "Order placement failed after {} attempts (post-only fallback): {}",
-                            max_attempts, fallback_err,
+                            attempts, fallback_err,
                         )
                         raise
                     order_id = order.get("id", "unknown")
@@ -838,16 +857,19 @@ class Exchange:
                     # It is also the most frequently called of all of them -- every grid
                     # rung placement and replacement goes through here.
                     self._sync_time()
-                if attempt < max_attempts:
+                    if resync_budget > 0:
+                        resync_budget -= 1
+                        attempts += 1
+                if attempt < attempts:
                     delay = self.retry_delay * attempt
                     if "-1008" in str(e):
                         delay = max(delay, 10.0)
                         logger.warning("Order placement throttled by exchange protection (-1008) — backing off {}s", delay)
                     else:
-                        logger.warning("Order placement failed (attempt {}/{}): {} — retrying in {}s", attempt, max_attempts, e, delay)
+                        logger.warning("Order placement failed (attempt {}/{}): {} — retrying in {}s", attempt, attempts, e, delay)
                     time.sleep(delay)
                 else:
-                    logger.error("Order placement failed after {} attempts: {}", max_attempts, e)
+                    logger.error("Order placement failed after {} attempts: {}", attempts, e)
         raise last_err
 
     def cancel_order(self, order_id: str, symbol: str) -> bool:
