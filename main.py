@@ -164,6 +164,36 @@ def _stop_qty_of(order: dict) -> float:
     return 0.0
 
 
+def _is_immediately_triggering_rejection(e: Exception) -> bool:
+    """True if the exchange refused a stop because its trigger was already crossed
+    by the current price (Binance -2021), not for any other reason.
+
+    Distinguishing this matters because it is the one placement failure retrying
+    the SAME request cannot fix -- the price that made it invalid does not change
+    between attempts, only between polls. Every other rejection (a bad quantity,
+    a connectivity blip) is at least plausibly retryable as-is; this one needs a
+    different price before a retry is worth making at all.
+    """
+    return "-2021" in str(e)
+
+
+def _reprice_past_current(exchange, symbol: str, close_side: str, current_price: float) -> float:
+    """A trigger on the correct side of `current_price`, close to it but not through
+    it -- for a stop the exchange just rejected as already crossed (AUDIT #167).
+
+    `close_side` is the CLOSE order's side, not the position's: "sell" closes a
+    long with a stop that fires as price falls, so the reprice must land strictly
+    BELOW current price; "buy" closes a short and must land strictly ABOVE. The
+    0.1% buffer is arbitrary but small relative to a 2%-class stop_loss_pct -- it
+    exists only to survive the round trip back to the exchange, not to change how
+    far the stop sits from the position.
+    """
+    nudge = current_price * 0.001
+    direction = -1 if close_side == "sell" else 1
+    raw = current_price + direction * nudge
+    return float(exchange.exchange.price_to_precision(symbol, raw))
+
+
 def reconcile_stop_orders(
     exchange,
     symbol: str,
@@ -252,7 +282,36 @@ def reconcile_stop_orders(
                 kind, close_side, oqty, oprice,
             )
         except Exception as e:
-            logger.error("Failed to place {} stop-loss: {}", kind, e)
+            if not _is_immediately_triggering_rejection(e):
+                logger.error("Failed to place {} stop-loss: {}", kind, e)
+                continue
+            # AUDIT #167. Observed live on 2026-08-19 16:30:26: a 6307-unit short
+            # went from a working stop to none at all because the desired trigger
+            # had gone stale (poll latency, a fast move) by the time it reached
+            # the exchange. That left it at 0% coverage for 77 seconds -- caught
+            # by #54's under-protected check and self-healed on the NEXT refresh,
+            # but only because nothing worse happened in that window. Retrying the
+            # identical request here would fail identically; repricing off a fresh
+            # read and retrying once, right now, is the difference between a real
+            # gap and no gap at all in the case where it does matter.
+            try:
+                current_price = exchange.get_price(symbol)
+                repriced = _reprice_past_current(exchange, symbol, close_side, current_price)
+                placed = exchange.place_stop_market(
+                    symbol, close_side, oqty, repriced,
+                    purpose="stop_trail" if kind == "trail" else "stop_hard",
+                )
+                kept[kind] = {"id": placed["id"], "side": close_side, "qty": oqty, "price": repriced}
+                logger.warning(
+                    "STOP-LOSS REPRICED AND PLACED | kind={} side={} qty={} @ {} "
+                    "(desired {} had already been crossed)",
+                    kind, close_side, oqty, repriced, oprice,
+                )
+            except Exception as e2:
+                logger.error(
+                    "Failed to place {} stop-loss even after repricing past current "
+                    "price: {}", kind, e2,
+                )
 
     # Coverage is a QUANTITY question, not a boolean one. The scale-out splits the
     # position across a trail leg and a hard leg, so the previous `bool(sl_orders)` test
