@@ -339,3 +339,65 @@ def test_place_limit_order_uses_fresh_client_order_id_per_invocation():
     ex.place_limit_order("DOGEUSDT", "sell", 0.071, 100, post_only=True)
     assert len(ids) == 2
     assert ids[0] != ids[1]
+
+
+def test_place_limit_order_resyncs_on_invalid_nonce():
+    """The one retry path in this class that never resynced. Every other order/data
+    call self-heals from a timestamp-drift rejection (-1021 / InvalidNonce) by calling
+    _sync_time() before retrying -- _retry() does it for ticker/balance/positions/
+    stop-market, cancel_order() does it explicitly. place_limit_order() had its own
+    separate retry loop that just retried against the SAME stale clock offset instead,
+    even though it is the most frequently called order-placing method of them all:
+    every grid rung placement and replacement goes through here.
+    """
+    class DriftBackend:
+        def __init__(self):
+            self.calls = 0
+            self.synced = 0
+
+        def create_limit_order(self, symbol, side, amount, price, params):
+            self.calls += 1
+            if self.calls == 1:
+                raise ccxt.InvalidNonce("-1021 Timestamp for this request is outside of the recvWindow")
+            return {"id": "placed-after-resync", "side": side}
+
+        def amount_to_precision(self, symbol, amount):
+            return str(amount)
+
+    fake = DriftBackend()
+    ex = make_exchange(fake)
+    ex._sync_time = lambda: setattr(fake, "synced", fake.synced + 1)
+
+    order = ex.place_limit_order("DOGEUSDT", "buy", 0.069, 100, max_attempts=2, post_only=True)
+
+    assert order["id"] == "placed-after-resync"
+    assert fake.calls == 2
+    assert fake.synced == 1, "place_limit_order did not resync the clock on a timestamp-drift rejection"
+
+
+def test_place_limit_order_does_not_resync_on_an_unrelated_failure():
+    """A non-drift rejection is not fixed by a clock resync -- calling _sync_time() for
+    every failure would just be a needless extra round trip and would misattribute an
+    ordinary transient error to clock drift in the logs."""
+    class TimeoutBackend:
+        def __init__(self):
+            self.calls = 0
+            self.synced = 0
+
+        def create_limit_order(self, symbol, side, amount, price, params):
+            self.calls += 1
+            if self.calls == 1:
+                raise ccxt.RequestTimeout("request timed out")
+            return {"id": "placed-ok", "side": side}
+
+        def amount_to_precision(self, symbol, amount):
+            return str(amount)
+
+    fake = TimeoutBackend()
+    ex = make_exchange(fake)
+    ex._sync_time = lambda: setattr(fake, "synced", fake.synced + 1)
+
+    order = ex.place_limit_order("DOGEUSDT", "buy", 0.069, 100, max_attempts=2, post_only=True)
+
+    assert order["id"] == "placed-ok"
+    assert fake.synced == 0, "resynced the clock for a failure that had nothing to do with drift"

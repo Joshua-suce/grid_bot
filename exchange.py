@@ -827,6 +827,17 @@ class Exchange:
                 raise
             except Exception as e:
                 last_err = e
+                if self._is_timestamp_error(e):
+                    # Every other retry path in this class resyncs the clock on a
+                    # timestamp-drift rejection (-1021 / InvalidNonce) before retrying --
+                    # _retry() does it for ticker/balance/position/stop-market calls,
+                    # cancel_order() does it explicitly for cancels. This loop was the one
+                    # exception: it would retry a placement with the SAME stale offset up
+                    # to max_attempts times and then just fail, even though every other
+                    # order-touching call already knows how to self-heal from exactly this.
+                    # It is also the most frequently called of all of them -- every grid
+                    # rung placement and replacement goes through here.
+                    self._sync_time()
                 if attempt < max_attempts:
                     delay = self.retry_delay * attempt
                     if "-1008" in str(e):
