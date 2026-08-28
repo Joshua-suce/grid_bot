@@ -51,6 +51,7 @@ class RestartPolicy:
     base_backoff: float = 10.0
     max_backoff: float = 300.0
     _crashes: list[float] = field(default_factory=list)
+    _consecutive_hangs: int = field(default=0, repr=False)
 
     def record_crash(self, when: float) -> None:
         self._crashes.append(when)
@@ -59,6 +60,28 @@ class RestartPolicy:
 
     def crashes_in_window(self) -> int:
         return len(self._crashes)
+
+    def record_hang(self, was_hang: bool) -> None:
+        """Track consecutive hang-kills, separately from the wall-clock crash window.
+
+        A hang-kill takes at least stale_after seconds to even happen, once per
+        attempt -- so a bot that hangs identically on every restart produces crashes
+        spaced FURTHER apart than window_seconds can hold (stale_after + the ~30s poll
+        + backoff, against the same 600s default as window_seconds), and each new one
+        evicts the previous from crashes_in_window() before a second can ever join it
+        there. That is not the fast crash loop the wall-clock window exists to catch;
+        it is a slow, silent one, and without tracking it independently the breaker
+        below never trips and no alert is ever sent for as long as the identical hang
+        keeps repeating -- supervise.py just restarts a permanently stuck bot forever,
+        roughly every ten minutes, unnoticed.
+        """
+        self._consecutive_hangs = self._consecutive_hangs + 1 if was_hang else 0
+
+    def consecutive_hangs(self) -> int:
+        return self._consecutive_hangs
+
+    def hang_tripped(self) -> bool:
+        return self._consecutive_hangs > self.max_restarts
 
     def should_restart(self, exit_code: int | None) -> bool:
         """A clean exit is a decision someone made; honour it.
@@ -83,12 +106,22 @@ class RestartPolicy:
         return min(self.base_backoff * (2 ** n), self.max_backoff)
 
 
-def log_is_stale(log_dir: Path, limit_seconds: float, now: float) -> bool:
+def log_is_stale(log_dir: Path, limit_seconds: float, now: float, since: float = 0.0) -> bool:
     """Has the newest bot log stopped advancing?
 
     The loop writes a PRICE= line every poll, so a log that has not been touched in
     many polls means the process is alive but not trading. With no log at all this
     says False: a bot that has not started yet is not a hung bot.
+
+    `since` floors the staleness clock at the CURRENT attempt's own start time.
+    Without it, a log left over from a previous run counts against the very next
+    attempt from the moment it starts: if the machine was off, or just slow to
+    restart, real downtime can already exceed `limit_seconds` before the new process
+    has written a single line, and the first 30s poll kills it as "hung" -- even
+    though nothing about THIS attempt has actually stalled. Measuring from
+    max(newest write, since) instead means a fresh process always gets its own full
+    `limit_seconds` window from when IT started, and a genuinely stuck one is still
+    caught in exactly that same window, not sooner and not later.
     """
     try:
         logs = list(Path(log_dir).glob("grid_*.log"))
@@ -97,7 +130,8 @@ def log_is_stale(log_dir: Path, limit_seconds: float, now: float) -> bool:
     if not logs:
         return False
     newest = max(l.stat().st_mtime for l in logs)
-    return (now - newest) > limit_seconds
+    baseline = max(newest, since)
+    return (now - baseline) > limit_seconds
 
 
 def run(cmd: list[str], policy: RestartPolicy, log_dir: Path,
@@ -118,13 +152,14 @@ def run(cmd: list[str], policy: RestartPolicy, log_dir: Path,
             return 1
 
         exit_code = None
+        hung = False
         try:
             while True:
                 try:
                     exit_code = proc.wait(timeout=30)
                     break
                 except subprocess.TimeoutExpired:
-                    if log_is_stale(log_dir, stale_after, time.time()):
+                    if log_is_stale(log_dir, stale_after, time.time(), since=started):
                         print(f"[supervise] log has not advanced in {stale_after:.0f}s "
                               f"— treating as hung, stopping it", flush=True)
                         proc.terminate()
@@ -133,6 +168,7 @@ def run(cmd: list[str], policy: RestartPolicy, log_dir: Path,
                         except subprocess.TimeoutExpired:
                             proc.kill()
                         exit_code = -1
+                        hung = True
                         break
         except KeyboardInterrupt:
             # Ctrl-C is the operator talking. Pass it down, wait, and stay down.
@@ -146,6 +182,16 @@ def run(cmd: list[str], policy: RestartPolicy, log_dir: Path,
 
         ran_for = time.time() - started
         print(f"[supervise] exited {exit_code} after {ran_for:.0f}s", flush=True)
+
+        policy.record_hang(hung)
+        if policy.hang_tripped():
+            print(f"[supervise] STOPPING — {policy.consecutive_hangs()} consecutive "
+                  f"hangs. Restarting is not fixing whatever is blocking it. Any "
+                  f"position and its stops are still on the exchange.", flush=True)
+            _alert(f"Bot supervisor STOPPED after {policy.consecutive_hangs()} "
+                   f"consecutive hangs. Position and stops remain on the exchange "
+                   f"and nothing is tending them.")
+            return 1
 
         if not policy.should_restart(exit_code):
             if policy.tripped():
@@ -170,11 +216,30 @@ def run(cmd: list[str], policy: RestartPolicy, log_dir: Path,
 
 
 def _alert(message: str) -> None:
-    """Best effort. A supervisor that dies trying to send a message is useless."""
+    """Best effort. A supervisor that dies trying to send a message is useless.
+
+    This is the one call the whole breaker exists to make -- the operator has to hear
+    about it the moment restarting stops being the answer, because that is exactly the
+    moment a position and its stops are on the exchange with nothing tending them. It
+    is also the one call almost never exercised, since it only fires when everything
+    else has already failed, which is exactly how TelegramNotifier(settings) sat here
+    passing the whole settings object as bot_token and never supplying chat_id at all
+    -- a guaranteed TypeError on the one occasion this needed to work.
+    """
     try:
         from config import settings
         from telegram_notifier import TelegramNotifier
-        TelegramNotifier(settings).send(f"<b>SUPERVISOR</b>\n{message}")
+        notifier = TelegramNotifier(
+            settings.telegram_bot_token, settings.telegram_chat_id, settings.telegram_enabled,
+        )
+        notifier.send(f"<b>SUPERVISOR</b>\n{message}")
+        # send() only queues it for a background worker thread; it does not send it.
+        # That thread is a daemon, and this function returns straight into run()
+        # returning straight into sys.exit() -- with nothing else keeping the process
+        # alive, the message would still be sitting in the queue when the process
+        # exits. close() blocks, bounded to a few seconds, until the worker has
+        # actually drained it.
+        notifier.close()
     except Exception as e:
         print(f"[supervise] alert failed: {e}", flush=True)
 

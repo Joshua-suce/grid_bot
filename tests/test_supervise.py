@@ -6,9 +6,12 @@ them. These cover the two judgements that can strand you at 3am: when to put the
 back, and when to stop trying.
 """
 
+import os
 import time
 
-from supervise import RestartPolicy, log_is_stale
+import config
+import telegram_notifier
+from supervise import RestartPolicy, _alert, log_is_stale
 
 
 def policy(**kw):
@@ -87,6 +90,67 @@ def test_the_window_is_measured_from_the_newest_crash():
     assert p.crashes_in_window() == 2
 
 
+# --- consecutive hangs: a slow, silent gap the wall-clock window cannot see -------
+#
+# A hang-kill costs at least stale_after seconds to even happen, once per attempt. A
+# bot that hangs identically every time therefore produces crashes spaced FURTHER
+# apart than window_seconds can hold with the module's own matching 600s defaults, and
+# each one evicts the last from crashes_in_window() before a second can ever join it.
+# That is invisible to the wall-clock breaker above no matter how many times it
+# repeats, so it is tracked as a simple consecutive count instead.
+
+def test_the_wall_clock_window_alone_cannot_see_a_hang_that_recurs_slower_than_it():
+    """Documents the actual gap: with default constants, a hang-detect cycle
+    (stale_after + the ~30s poll + backoff) already exceeds window_seconds, so
+    crashes_in_window() never accumulates past 1 no matter how many times the
+    identical hang repeats -- the ordinary breaker alone would never trip."""
+    p = policy(max_restarts=5, window_seconds=600.0, base_backoff=10.0)
+    t = 0.0
+    for _ in range(8):
+        t += 640.0                      # stale_after(600) + poll(~30) + backoff(10)
+        p.record_crash(t)
+    assert p.crashes_in_window() == 1, "this test's own premise is wrong if this fails"
+    assert p.tripped() is False, "the wall-clock breaker alone never sees this pattern"
+
+
+def test_repeated_hangs_trip_even_when_far_apart_in_time():
+    p = policy(max_restarts=3)
+    for _ in range(4):
+        p.record_hang(True)
+    assert p.hang_tripped() is True
+
+
+def test_hangs_at_or_below_the_limit_do_not_trip():
+    p = policy(max_restarts=3)
+    for _ in range(3):
+        p.record_hang(True)
+    assert p.hang_tripped() is False
+
+
+def test_a_non_hang_crash_resets_the_hang_streak():
+    """A genuinely different failure in between is not "the same hang repeating" --
+    the streak must not silently carry through it."""
+    p = policy(max_restarts=3)
+    for _ in range(3):
+        p.record_hang(True)
+    assert p.hang_tripped() is False
+
+    p.record_hang(False)                # an ordinary crash, not a hang
+    assert p.consecutive_hangs() == 0
+
+    for _ in range(3):
+        p.record_hang(True)
+    assert p.hang_tripped() is False, "the earlier streak leaked through the reset"
+
+
+def test_a_clean_or_successful_run_also_resets_the_hang_streak():
+    p = policy(max_restarts=3)
+    for _ in range(3):
+        p.record_hang(True)
+    p.record_hang(False)                # e.g. a clean exit
+    assert p.consecutive_hangs() == 0
+
+
 # --- backoff ----------------------------------------------------------------------
 
 def test_the_first_restart_is_quick():
@@ -160,3 +224,101 @@ def test_the_newest_log_is_the_one_that_counts(tmp_path):
 
 def test_an_unreadable_log_dir_is_not_a_hang(tmp_path):
     assert log_is_stale(tmp_path / "does-not-exist", limit_seconds=1, now=2000) is False
+
+
+def test_a_stale_log_from_before_this_attempt_does_not_condemn_a_fresh_start(tmp_path):
+    """The bug actually hit in production: the machine was off, so the log's last
+    write is long in the past, and the very next restart attempt inherited that stale
+    clock from the moment it started -- getting killed as "hung" on the first 30s
+    poll, before it had written a single line, let alone had a fair chance to. `since`
+    (this attempt's own start time) floors the staleness clock so real downtime from
+    BEFORE the attempt began cannot poison it."""
+    log = tmp_path / "grid_2026-08-28.log"
+    log.write_text("x", encoding="utf-8")
+    os.utime(log, (1000, 1000))          # last written long before this attempt began
+
+    # "now" is only 10s after this attempt's own start (`since`) -- nowhere near the
+    # 600s hang threshold from THIS attempt's perspective, even though the log file
+    # itself is ancient.
+    assert log_is_stale(tmp_path, limit_seconds=600, now=1910, since=1900) is False
+
+
+def test_a_genuinely_hung_fresh_attempt_is_still_caught(tmp_path):
+    """`since` must not become a free pass -- an attempt that never writes anything is
+    still hung once ITS OWN limit_seconds has elapsed, exactly as before."""
+    log = tmp_path / "grid_2026-08-28.log"
+    log.write_text("x", encoding="utf-8")
+    os.utime(log, (1000, 1000))
+
+    assert log_is_stale(tmp_path, limit_seconds=600, now=2600, since=1900) is True
+
+
+# --- the supervisor's own alert -----------------------------------------------------
+#
+# Exercised only when the breaker trips -- exactly the failure it exists to report,
+# and exactly why a bug here can sit unnoticed until the one time it matters.
+
+class _FakeNotifier:
+    """Records what it was built and asked to do, but sends nothing for real."""
+
+    instances: list["_FakeNotifier"] = []
+
+    def __init__(self, bot_token, chat_id, enabled=False):
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.enabled = enabled
+        self.sent: list[str] = []
+        self.closed = False
+        _FakeNotifier.instances.append(self)
+
+    def send(self, message):
+        self.sent.append(message)
+        return True
+
+    def close(self):
+        self.closed = True
+
+
+def test_alert_builds_the_notifier_with_token_and_chat_id(monkeypatch):
+    """TelegramNotifier(settings) used to pass the whole settings object as bot_token
+    and never supply chat_id at all -- a guaranteed TypeError, on the one call this
+    whole breaker exists to make."""
+    _FakeNotifier.instances.clear()
+    monkeypatch.setattr(telegram_notifier, "TelegramNotifier", _FakeNotifier)
+    monkeypatch.setattr(config.settings, "telegram_bot_token", "test-token")
+    monkeypatch.setattr(config.settings, "telegram_chat_id", "test-chat")
+    monkeypatch.setattr(config.settings, "telegram_enabled", True)
+
+    _alert("bot supervisor stopped")
+
+    assert len(_FakeNotifier.instances) == 1
+    n = _FakeNotifier.instances[0]
+    assert (n.bot_token, n.chat_id, n.enabled) == ("test-token", "test-chat", True)
+    assert n.sent == ["<b>SUPERVISOR</b>\nbot supervisor stopped"]
+
+
+def test_alert_closes_the_notifier_so_the_background_worker_gets_to_send(monkeypatch):
+    """send() only queues the message for a background daemon thread; it does not send
+    it. _alert() returns straight into a process exit, so without an explicit, bounded
+    close() the message is still sitting in the queue when the daemon thread is killed
+    with the process -- an alert that was "sent" successfully and never arrived."""
+    _FakeNotifier.instances.clear()
+    monkeypatch.setattr(telegram_notifier, "TelegramNotifier", _FakeNotifier)
+    monkeypatch.setattr(config.settings, "telegram_bot_token", "test-token")
+    monkeypatch.setattr(config.settings, "telegram_chat_id", "test-chat")
+    monkeypatch.setattr(config.settings, "telegram_enabled", True)
+
+    _alert("bot supervisor stopped")
+
+    assert _FakeNotifier.instances[0].closed is True
+
+
+def test_alert_is_best_effort_and_never_raises(monkeypatch):
+    """A supervisor that dies trying to report its own death is worse than useless."""
+    class ExplodingNotifier:
+        def __init__(self, *a, **k):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(telegram_notifier, "TelegramNotifier", ExplodingNotifier)
+
+    _alert("this must not raise")  # no exception == pass
