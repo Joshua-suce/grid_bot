@@ -2274,10 +2274,12 @@ class GridEngine:
             fees = self.round_trip_fee_pct
             if side == "long":
                 hedge_price = self._round_price(best_level.price + self.grid_spacing)
-                hedge_price = max(hedge_price, self._round_price_toward(entry * (1 + fees), +1))
+                breakeven_bound = self._round_price_toward(entry * (1 + fees), +1)
+                hedge_price = max(hedge_price, breakeven_bound)
             else:
                 hedge_price = self._round_price(best_level.price - self.grid_spacing)
-                hedge_price = min(hedge_price, self._round_price_toward(entry * (1 - fees), -1))
+                breakeven_bound = self._round_price_toward(entry * (1 - fees), -1)
+                hedge_price = min(hedge_price, breakeven_bound)
 
             if hedge_price < self.grid_lower or hedge_price > self.grid_upper:
                 logger.warning(
@@ -2285,6 +2287,50 @@ class GridEngine:
                     hedge_side, hedge_price,
                 )
                 continue
+
+            # A NEAR neighbour -- not an exact duplicate -- used to sail through
+            # unchecked. On 2026-08-29 a short's hedge computed at 0.2001 landed 0.0001
+            # from a live BUY @ 0.2, 0.05% apart and under the round-trip fee floor: a
+            # pair neither leg could ever clear a profit on. The position behind that
+            # hedge was real (-1984 ADA, not dust), so the one thing that could have
+            # fixed it -- a full ladder rebuild -- refuses to run while any real
+            # position is open (recenter's "flat" gate), and it sat deformed for the
+            # rest of that session.
+            #
+            # AUDIT #41 still holds: the cover must go out even beside a near
+            # neighbour, so this only tries to move WHERE it lands, never whether it
+            # does. Nudge away from the neighbour, capped at the same break-even bound
+            # already computed above -- moving further from loss is always safe;
+            # moving toward it never passes where the clamp already stopped. If no
+            # clear price remains inside that bound, hedge_price is left exactly as
+            # computed above and this is a no-op.
+            floor = abs(hedge_price) * fees * self._min_profit_multiplier
+            crowd = next(
+                (l for l in self.levels
+                 if l is not best_level and l.side == hedge_side
+                 and 1e-12 < abs(l.price - hedge_price) < floor),
+                None,
+            )
+            if crowd is not None:
+                nudged = hedge_price - floor if crowd.price > hedge_price else hedge_price + floor
+                nudged = self._round_price(nudged)
+                nudged = min(nudged, breakeven_bound) if hedge_side == "buy" else max(nudged, breakeven_bound)
+                clear = (
+                    self.grid_lower <= nudged <= self.grid_upper
+                    and abs(nudged - crowd.price) >= floor
+                    and not any(
+                        l is not best_level and l.side == hedge_side and abs(l.price - nudged) < floor
+                        for l in self.levels
+                    )
+                )
+                if clear:
+                    logger.info(
+                        "RECONCILE | {} hedge for the {} nudged {} -> {} — a {} level {} "
+                        "away sat under the fee floor and this cover still needs to "
+                        "clear its own",
+                        hedge_side, side, hedge_price, nudged, crowd.side, round(crowd.price, 8),
+                    )
+                    hedge_price = nudged
 
             # Do not re-site a level onto a line another level already holds. Every other
             # re-siting path in this file checks for that -- _nearest_legal_exit refuses a
@@ -3123,8 +3169,24 @@ class GridEngine:
         #
         # _pos_qty is the authoritative mirror and is already correct here: activate()
         # seeds it from the exchange before the loop runs at all.
-        flat = (self._net_long_qty <= 0 and self._net_short_qty <= 0
-                and abs(self._pos_qty) <= 1e-9)
+        #
+        # "Flat" also has to cover a position too small to protect, or dust becomes a
+        # permanent veto on the one repair this gate exists to allow. Below
+        # MIN_NOTIONAL_USDT there is no stop-loss to strand -- STOP-LOSS UNPROTECTABLE
+        # already refuses to place one at any size -- so a rebuild sacrifices nothing
+        # a real position would have lost. On 2026-08-29 a 6 ADA (~1.16 USDT) remainder
+        # left two exit rungs 0.05% apart, under the fee floor; "flat" stayed False for
+        # that alone, so DEFORMED LADDER (HOLDING) logged every 5 minutes for the bot's
+        # entire 5-hour run and not one order filled. min_notional_price falls back to
+        # +inf for a non-positive current_price, purely defensively -- ladder_defects
+        # already returns [] in that case, so `flat` cannot affect the outcome then,
+        # but a bad price still must not be read as "any quantity is free."
+        min_notional_price = current_price if current_price > 0 else float("inf")
+        flat = (
+            (self._net_long_qty <= 0 or self._net_long_qty * min_notional_price < MIN_NOTIONAL_USDT)
+            and (self._net_short_qty <= 0 or self._net_short_qty * min_notional_price < MIN_NOTIONAL_USDT)
+            and (abs(self._pos_qty) <= 1e-9 or abs(self._pos_qty) * min_notional_price < MIN_NOTIONAL_USDT)
+        )
         # Detect in every state; rebuild only when flat.
         #
         # This was `ladder_defects(current_price) if flat else []`, which made the check

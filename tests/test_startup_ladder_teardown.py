@@ -158,6 +158,76 @@ def test_a_near_neighbour_does_not_suppress_the_cover():
     assert e.exchange.placed[0]["side"] == "buy"
 
 
+def test_a_near_neighbour_is_nudged_clear_when_there_is_room():
+    """2026-08-29. The "near neighbour" guard above stops the cover from being
+    suppressed, but it left the cover sitting wherever the raw calculation put it --
+    0.00001 from a live grid buy, both under the fee floor. That pair, both real (a
+    -1984 ADA short, not dust), sat deformed for the rest of the session: the one
+    repair that could have fixed it -- a full rebuild -- refuses to run while any real
+    position is open. When there is room to move without crossing break-even, the
+    cover should land somewhere that actually clears its own fees instead."""
+    occupied = GridLevel(price=0.07012, side="buy", order_id="grid-buy")   # 1 tick off
+    nearest_sell = GridLevel(price=0.07036, side="sell", order_id="grid-sell")
+    e = engine([occupied, nearest_sell], SHORT)
+
+    e.reconcile_positions()
+
+    assert len(e.exchange.placed) == 1, "a near neighbour suppressed the position cover"
+    placed_price = e.exchange.placed[0]["price"]
+    floor = placed_price * e.round_trip_fee_pct * e._min_profit_multiplier
+    assert abs(placed_price - occupied.price) >= floor, "still crowds the neighbour"
+    assert placed_price <= 0.07011, "moved past the position's own break-even"
+    assert occupied.price == 0.07012, "disturbed the level it nudged away from"
+
+
+def test_the_nudge_never_crosses_break_even():
+    """A neighbour can sit close enough that the only way to clear it is through
+    break-even. AUDIT #41 still applies here: the cover must go out regardless, so
+    when no safe room exists this is a no-op and the cover lands exactly where the
+    unmodified calculation put it -- crowded, but not a loss, and not suppressed."""
+    buy_near = GridLevel(price=0.07018, side="buy", order_id="grid-buy2")
+    sell_far = GridLevel(price=0.07050, side="sell", order_id="grid-sell2")
+    e = engine([buy_near, sell_far], [{"side": "short", "contracts": 5342.0, "entryPrice": 0.07030}])
+
+    e.reconcile_positions()
+
+    assert len(e.exchange.placed) == 1, "no safe nudge existed, but the cover was suppressed anyway"
+    assert e.exchange.placed[0]["price"] == 0.07026, "moved the price despite no safe room to do so"
+    assert buy_near.price == 0.07018, "disturbed the crowding level"
+
+
+def test_a_neighbour_below_the_hedge_nudges_up_capped_at_break_even():
+    """The mirror of the first nudge case: the neighbour sits below the hedge, so
+    clearing it means moving toward break-even, not away from it. The nudge must
+    still stop at break-even rather than sail past it chasing clearance."""
+    buy_below = GridLevel(price=0.07033, side="buy", order_id="grid-buy3")
+    sell_near = GridLevel(price=0.07051, side="sell", order_id="grid-sell3")
+    e = engine([buy_below, sell_near], [{"side": "short", "contracts": 5342.0, "entryPrice": 0.07050}])
+
+    e.reconcile_positions()
+
+    assert len(e.exchange.placed) == 1
+    placed_price = e.exchange.placed[0]["price"]
+    breakeven_bound = e._round_price_toward(0.07050 * (1 - e.round_trip_fee_pct), -1)
+    assert placed_price <= breakeven_bound, "nudged past the position's own break-even"
+    assert buy_below.price == 0.07033, "disturbed the crowding level"
+
+
+def test_an_exact_duplicate_is_still_skipped_not_nudged():
+    """The exact-match guard above and the nudge added here must not overlap: an exact
+    duplicate is a different kind of problem (AUDIT #90's own words: "two orders where
+    the ladder believes there is one") and stays on the skip path, never the nudge
+    path."""
+    occupied = GridLevel(price=0.07011, side="buy", order_id="grid-buy")   # exact match
+    nearest_sell = GridLevel(price=0.07036, side="sell", order_id="grid-sell")
+    e = engine([occupied, nearest_sell], SHORT)
+
+    e.reconcile_positions()
+
+    assert e.exchange.placed == [], "an exact duplicate took the nudge path instead of skipping"
+    assert occupied.order_id == "grid-buy"
+
+
 def test_an_occupant_on_the_wrong_side_does_not_suppress_the_cover():
     """Only a level that can actually close the position may stand in for the hedge. A
     SELL resting on that line does not cover a short -- deferring to it would leave the
