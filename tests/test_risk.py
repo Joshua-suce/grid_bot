@@ -65,6 +65,64 @@ def test_daily_loss_override_does_not_mutate_state():
     assert rm.state.daily_realized_pnl == 0.0  # untouched -- still drives consecutive_losses separately
 
 
+def test_is_daily_profit_locked_below_budget():
+    rm = RiskManager(stop_loss_pct=0.03, daily_loss_limit_pct=0.05, max_drawdown_pct=0.10,
+                      daily_profit_lock_usdt=3.0)
+    rm.state.daily_realized_pnl = 2.99
+    assert rm.is_daily_profit_locked() is False
+
+
+def test_is_daily_profit_locked_at_budget():
+    rm = RiskManager(stop_loss_pct=0.03, daily_loss_limit_pct=0.05, max_drawdown_pct=0.10,
+                      daily_profit_lock_usdt=3.0)
+    rm.state.daily_realized_pnl = 3.0
+    assert rm.is_daily_profit_locked() is True
+
+
+def test_is_daily_profit_locked_override_uses_reconciled_figure_instead_of_state():
+    """Same resolution order as the daily-loss check: the exchange-reconciled figure
+    (PnLReconciler.daily_net_pnl) overrides state.daily_realized_pnl when given."""
+    rm = RiskManager(stop_loss_pct=0.03, daily_loss_limit_pct=0.05, max_drawdown_pct=0.10,
+                      daily_profit_lock_usdt=3.0)
+    rm.state.daily_realized_pnl = 0.0   # grid's own estimate says nothing earned yet...
+    assert rm.is_daily_profit_locked(daily_realized_pnl=6.08) is True  # ...reconciled says a real gain
+
+
+def test_is_daily_profit_locked_override_none_falls_back_to_state():
+    rm = RiskManager(stop_loss_pct=0.03, daily_loss_limit_pct=0.05, max_drawdown_pct=0.10,
+                      daily_profit_lock_usdt=3.0)
+    rm.state.daily_realized_pnl = 5.0
+    assert rm.is_daily_profit_locked(daily_realized_pnl=None) is True
+
+
+def test_is_daily_profit_locked_ignores_unrealized_pnl():
+    """Unlike the daily-loss check, unrealised marks must not count toward the budget --
+    profit has to be REALISED before it's locked in."""
+    rm = RiskManager(stop_loss_pct=0.03, daily_loss_limit_pct=0.05, max_drawdown_pct=0.10,
+                      daily_profit_lock_usdt=3.0)
+    rm.state.daily_realized_pnl = 1.0
+    rm.state.daily_unrealized_pnl = 50.0   # a big open mark that has not been booked
+    assert rm.is_daily_profit_locked() is False
+
+
+def test_is_daily_profit_locked_disabled_by_zero_budget():
+    rm = RiskManager(stop_loss_pct=0.03, daily_loss_limit_pct=0.05, max_drawdown_pct=0.10,
+                      daily_profit_lock_usdt=0.0)
+    rm.state.daily_realized_pnl = 1_000_000.0
+    assert rm.is_daily_profit_locked() is False
+
+
+def test_is_daily_profit_locked_is_not_fatal_or_part_of_check_all():
+    """Advisory only -- must never trip the kill switch, unlike every check in check_all."""
+    rm = RiskManager(stop_loss_pct=0.03, daily_loss_limit_pct=0.05, max_drawdown_pct=0.10,
+                      daily_profit_lock_usdt=3.0)
+    rm.initialize(1000)
+    is_safe, is_fatal = rm.check_all(1000, 0, 80000, daily_realized_pnl=100.0)  # comfortably past budget
+    assert rm.is_daily_profit_locked(daily_realized_pnl=100.0) is True
+    assert is_safe is True
+    assert is_fatal is False
+
+
 def test_grid_stop_loss_kills():
     rm = RiskManager(stop_loss_pct=0.03, daily_loss_limit_pct=0.05, max_drawdown_pct=0.10)
     rm.initialize(1000)

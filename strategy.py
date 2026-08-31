@@ -257,4 +257,9 @@ GRID_SPECIFIC_MEMBERS = (
     # nothing for the guard to gate; main.py calls it unconditionally, so the protocol
     # needs to know it is deliberately grid-only.
     "apply_open_loss_guard",
+    # The profit lock gates OPENING new ladder rungs once the day's profit budget is
+    # won. A trend follower has no rungs -- one entry, a stop, a target -- so there is
+    # nothing for it to gate either; main.py calls it unconditionally alongside
+    # apply_open_loss_guard, so it needs the same grid-only classification.
+    "apply_profit_lock_guard",
 )

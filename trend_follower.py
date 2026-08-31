@@ -1327,6 +1327,16 @@ class TrendFollower:
         a stop, and a target -- so the budget has no adverse side to block."""
         return None
 
+    def apply_profit_lock_guard(self, *args, **kwargs) -> None:
+        """Nothing to gate: a trend follower opens at most one position at a time.
+
+        The guard exists to stop a LADDER from opening fresh rungs after the day's
+        profit budget is won. This strategy has no rungs to arm -- one entry, a stop,
+        and a target -- so there is no new-exposure path for a day-won budget to
+        block; main.py calls it unconditionally, so it needs a no-op here the same
+        way apply_open_loss_guard does."""
+        return None
+
     def get_scale_out_trail_price(self, *args, **kwargs) -> float | None:
         """No scale-out: the position exits in one piece at the trailing stop."""
         return None

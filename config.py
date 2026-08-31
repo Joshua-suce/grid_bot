@@ -281,6 +281,34 @@ class Settings(BaseSettings):
             "worst-case stop-out of a MAX_POSITION_PCT=0.05 cap."
         ),
     )
+    daily_profit_lock_usdt: float = Field(
+        default=0.0, ge=0,
+        description=(
+            "Profit budget for the DAY, in USDT. Once the day's REALISED P&L reaches "
+            "this, the grid stops OPENING new exposure on either side for the rest of "
+            "the day -- exits stay legal, so any position already open can still be "
+            "managed and closed normally.\n"
+            "\n"
+            "Every other risk knob here bounds LOSSES -- the hard stop-loss, "
+            "MAX_OPEN_LOSS_USDT, DAILY_LOSS_LIMIT_PCT, MAX_DRAWDOWN_PCT -- and none of "
+            "them touch the profit side: a good day's gains just ride as continued "
+            "exposure, with nothing to lock them in. That is the mirror image of the "
+            "shape MAX_OPEN_LOSS_USDT exists for (see its docstring) -- hours of small "
+            "grid profit erased in under a minute by one bad move -- except the fix "
+            "here is to stop ADDING risk once the day is already won, rather than "
+            "bounding the damage after it turns.\n"
+            "\n"
+            "0 disables the guard. Size it as an absolute USDT figure, like "
+            "MAX_OPEN_LOSS_USDT, not as a percent of equity like DAILY_LOSS_LIMIT_PCT: "
+            "this strategy's daily gains are a tiny fraction of equity, so a "
+            "percent-of-equity threshold at DAILY_LOSS_LIMIT_PCT's scale (3%) would "
+            "never fire. This bot's own 16-day daily net P&L (logs/trades_demo.csv, "
+            "cycle_pnl minus fee, grouped by day) ranged -3.26 to +6.08 USDT, averaging "
+            "+0.80/day, and the best day was only ~0.12% of equity. A few USDT sits "
+            "meaningfully above routine daily variance while staying reachable on a "
+            "genuinely good day."
+        ),
+    )
     sl_scale_out_pct: float = Field(
         default=0.50, ge=0, le=0.95,
         description=(
