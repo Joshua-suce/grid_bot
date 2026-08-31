@@ -110,6 +110,97 @@ def test_default_stop_getter_uses_the_ratcheted_hard_level():
     assert grid.get_stop_loss_price() >= before - 1e-12
 
 
+# --- #168: the hard stop must also track the position's own entry ----------
+#
+# grid_lower is frozen while a position is open (AUDIT #116 blocks recenter()), so a
+# stop anchored to it alone cannot track a position built up through a long drawdown
+# of grid dip-buys. Observed live 2026-08-30: hours of grid profit erased in under a
+# minute when the stop finally hit, still sitting at the pre-drawdown grid_lower level
+# instead of near the position's real (falling) average cost.
+
+def test_hard_stop_tightens_to_the_average_entry_when_it_is_above_grid_lower():
+    """A position whose average entry sits above grid_lower must pull the hard stop up
+    with it, above the old grid_lower-anchored level."""
+    grid = make_engine()
+    grid.set_position_limit(long_position=7108.0, short_position=0.0, max_position_qty=8400.0)
+    grid.seed_position(7108.0, 0.07200000)
+
+    old_style = grid.grid_lower * (1 - grid.stop_loss_pct)
+    stop = grid.get_hard_stop_loss_price()
+
+    assert stop > old_style, "average-entry anchor did not tighten the stop"
+    assert stop == pytest.approx(0.07200000 * 0.97)
+
+
+def test_hard_stop_does_not_loosen_when_more_dip_buying_drags_the_average_down():
+    """The ratchet still only tightens: once armed against the average entry, a later
+    fill that pulls the average lower (more dip-buying in a drawdown -- the exact
+    2026-08-30 scenario) must not loosen the hard stop already in force."""
+    grid = make_engine()
+    grid.set_position_limit(long_position=7108.0, short_position=0.0, max_position_qty=8400.0)
+    grid.seed_position(7108.0, 0.07200000)
+    before = grid.get_hard_stop_loss_price()
+
+    # Pin down that `before` is actually the entry-anchored figure and not just
+    # whatever the grid_lower-only formula would have produced anyway -- without
+    # this, a regression that dropped the AUDIT #168 anchor entirely would still
+    # pass this test, since both `before` and `after` collapse to the same
+    # grid_lower constant regardless of seed_position.
+    assert before == pytest.approx(0.07200000 * 0.97)
+
+    grid.seed_position(9000.0, 0.07100000)
+    after = grid.get_hard_stop_loss_price()
+
+    assert after >= before - 1e-12, f"hard stop loosened from {before} to {after}"
+    assert after == pytest.approx(before)
+
+
+def test_hard_stop_falls_back_to_grid_lower_when_the_ledger_has_no_entry():
+    """With _pos_entry unset (0.0, the constructor default -- the state every test
+    above this section leaves the ledger in) the average-entry comparison must not
+    participate, so behaviour is byte-identical to before AUDIT #168."""
+    grid = make_engine()
+    grid.set_position_limit(long_position=7108.0, short_position=0.0, max_position_qty=8400.0)
+
+    assert (grid._pos_qty, grid._pos_entry) == (0.0, 0.0), "precondition: ledger unset"
+    assert grid.get_hard_stop_loss_price() == pytest.approx(
+        grid.grid_lower * (1 - grid.stop_loss_pct)
+    )
+
+
+def test_short_hard_stop_tightens_to_the_average_entry_when_it_is_below_grid_upper():
+    """Mirror of the long case: a short's average entry below grid_upper must pull the
+    hard stop down with it, below the old grid_upper-anchored level."""
+    grid = make_engine()
+    grid.set_position_limit(long_position=0.0, short_position=5000.0, max_position_qty=8400.0)
+    grid.seed_position(-5000.0, 0.07150000)
+
+    old_style = grid.grid_upper * (1 + grid.stop_loss_pct)
+    stop = grid.get_short_hard_stop_loss_price()
+
+    assert stop < old_style, "average-entry anchor did not tighten the short stop"
+    assert stop == pytest.approx(0.07150000 * 1.03)
+
+
+def test_short_hard_stop_does_not_loosen_when_more_dip_selling_drags_the_average_up():
+    """Ratchet mirror: a later fill that drags the short's average entry up must not
+    loosen the hard stop already armed against the earlier, lower average."""
+    grid = make_engine()
+    grid.set_position_limit(long_position=0.0, short_position=5000.0, max_position_qty=8400.0)
+    grid.seed_position(-5000.0, 0.07150000)
+    before = grid.get_short_hard_stop_loss_price()
+
+    # See the long-side twin above: pin `before` down so a regression that dropped
+    # the AUDIT #168 anchor couldn't pass this test by coincidence.
+    assert before == pytest.approx(0.07150000 * 1.03)
+
+    grid.seed_position(-7000.0, 0.07250000)
+    after = grid.get_short_hard_stop_loss_price()
+
+    assert after <= before + 1e-12, f"short hard stop loosened from {before} to {after}"
+    assert after == pytest.approx(before)
+
+
 # --- #26: a cancelled stop is not a fired stop -----------------------------
 
 @pytest.mark.parametrize("status", ["closed", "filled"])
