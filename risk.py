@@ -196,7 +196,14 @@ class RiskManager:
         self.state.in_recovery = True
         self.state.recovery_start_time = time.time()
         self.state.recovery_count += 1
-        logger.error("KILL SWITCH TRIGGERED | cooldown={}s | recovery_count={}", self.cooldown_seconds, self.state.recovery_count)
+        # Log the actual wait, not the unscaled base: recovery_cooldown_remaining()
+        # backs off up to 4x cooldown_seconds by recovery_count, and this line used to
+        # report the base figure regardless -- e.g. "cooldown=3600s" while the bot was
+        # really about to sit out 7200s, matching a live mismatch against the Telegram
+        # "RECOVERY MODE" notice (main.py), which took the same unscaled value.
+        backoff_multiplier = min(self.state.recovery_count, 4)
+        effective_cooldown = self.cooldown_seconds * max(1, backoff_multiplier)
+        logger.error("KILL SWITCH TRIGGERED | cooldown={}s | recovery_count={}", effective_cooldown, self.state.recovery_count)
 
     def is_in_recovery(self) -> bool:
         return self.state.in_recovery
