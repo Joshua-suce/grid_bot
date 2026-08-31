@@ -606,8 +606,25 @@ class GridEngine:
             # skips levels with order_id is not None). Without cancelling here, any entry
             # already resting on either side at the moment the lock trips stays live and can
             # still fill, adding new exposure -- exactly what this guard exists to prevent.
-            self._cancel_resting_orders("buy", "profit_lock")
-            self._cancel_resting_orders("sell", "profit_lock")
+            #
+            # AUDIT #168-adjacent fix, 2026-08-31: cancelling BOTH sides unconditionally was
+            # wrong. In one-way mode a side is only ever an entry OR the position's own exit
+            # -- never both at once -- and which one flips with which way the position is
+            # held (see _reduce_only_qty's docstring). Tearing down both sides while SHORT
+            # cancelled the resting BUY legs that were the position's only exit path, leaving
+            # it un-closeable by anything but a full restart: 13:45 profit lock trips, ladder
+            # goes to zero orders, DORMANT WITH EXPOSURE fires three times over 45 minutes
+            # before the watchdog force-restarts the bot to re-lay it. Only cancel the side
+            # that is actually adding to the CURRENT position; the opposite side, if a
+            # position is held, is that position's exit and must stay live. Flat has no
+            # exit to protect, so both sides are fair game there.
+            if self._pos_qty > 0:
+                self._cancel_resting_orders("buy", "profit_lock")
+            elif self._pos_qty < 0:
+                self._cancel_resting_orders("sell", "profit_lock")
+            else:
+                self._cancel_resting_orders("buy", "profit_lock")
+                self._cancel_resting_orders("sell", "profit_lock")
         elif not trip and was:
             logger.info(
                 "PROFIT LOCK | released — day's profit {:.2f} USDT back under {:.2f} "

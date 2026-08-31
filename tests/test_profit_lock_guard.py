@@ -183,6 +183,46 @@ def test_tripping_the_budget_cancels_resting_orders_on_both_sides():
     assert "o2" in ex.cancelled
 
 
+def test_tripping_while_short_leaves_the_positions_own_exit_resting():
+    """The 2026-08-31 incident, reproduced: a held SHORT's resting BUY orders are its
+    exit, not new exposure (see _reduce_only_qty's docstring -- a side is only ever an
+    entry OR the position's exit, never both, and which one flips with which way the
+    position is held). Cancelling both sides on trip (the original, wrong
+    implementation) tore down the short's only exit path -- the ladder went to zero
+    orders, DORMANT WITH EXPOSURE fired three times over 45 minutes, and the bot had
+    to force-restart itself to re-lay it. Only the SELL side (adding to the short) may
+    be cancelled; the resting BUY (the exit) must stay live."""
+    g, ex = _engine(daily_profit_lock_usdt=3.0)
+    g._pos_qty = -1331.0
+    g.levels = [
+        type("L", (), {"price": 0.0695, "side": "buy", "order_id": "exit_leg", "status": "placed"})(),
+        type("L", (), {"price": 0.0705, "side": "sell", "order_id": "adding_leg", "status": "placed"})(),
+    ]
+    ex.open_ids = {"exit_leg", "adding_leg"}
+
+    g.apply_profit_lock_guard(3.0)
+
+    assert "adding_leg" in ex.cancelled, "the side adding to the short should be cancelled"
+    assert "exit_leg" not in ex.cancelled, "the short's own exit was cancelled -- it can no longer close"
+
+
+def test_tripping_while_long_leaves_the_positions_own_exit_resting():
+    """Mirror of the short case: a held LONG's resting SELL orders are its exit, so
+    only the BUY side (adding to the long) may be cancelled on trip."""
+    g, ex = _engine(daily_profit_lock_usdt=3.0)
+    g._pos_qty = 1331.0
+    g.levels = [
+        type("L", (), {"price": 0.0695, "side": "buy", "order_id": "adding_leg", "status": "placed"})(),
+        type("L", (), {"price": 0.0705, "side": "sell", "order_id": "exit_leg", "status": "placed"})(),
+    ]
+    ex.open_ids = {"adding_leg", "exit_leg"}
+
+    g.apply_profit_lock_guard(3.0)
+
+    assert "adding_leg" in ex.cancelled, "the side adding to the long should be cancelled"
+    assert "exit_leg" not in ex.cancelled, "the long's own exit was cancelled -- it can no longer close"
+
+
 def test_a_blocked_side_cannot_place_through_place_initial_orders():
     """The guard must hold at the same choke point place_initial_orders flows through,
     the same contract test_open_loss_guard.py asserts for its own guard."""
