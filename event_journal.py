@@ -43,6 +43,7 @@ class EventJournal:
         exposure_pct: float,
         daily_pnl: float,
         regime: str,
+        fills_today: int = 0,
     ) -> None:
         self._emit(
             "fill",
@@ -50,6 +51,7 @@ class EventJournal:
             cycle_pnl=cycle_pnl, completed_cycle=completed_cycle,
             fill_number=fill_number, balance=balance, equity=equity,
             exposure_pct=exposure_pct, daily_pnl=daily_pnl, regime=regime,
+            fills_today=fills_today,
         )
 
     def order_placed(self, symbol: str, side: str, price: float, qty: float, order_id: str) -> None:
@@ -115,8 +117,8 @@ class EventJournal:
     def exposure_update(self, exposure_pct: float, equity: float) -> None:
         self._emit("exposure_update", exposure_pct=exposure_pct, equity=equity)
 
-    def daily_reset(self, yesterday_pnl: float, trades_today: int, balance: float) -> None:
-        self._emit("daily_reset", yesterday_pnl=yesterday_pnl, trades_today=trades_today, balance=balance)
+    def daily_reset(self, yesterday_pnl: float, trades_today: int, balance: float, fills_today: int = 0) -> None:
+        self._emit("daily_reset", yesterday_pnl=yesterday_pnl, trades_today=trades_today, balance=balance, fills_today=fills_today)
 
     def grid_paused(self, symbol: str, reason: str, orders_cancelled: int) -> None:
         self._emit("grid_paused", symbol=symbol, reason=reason, orders_cancelled=orders_cancelled)

@@ -219,8 +219,20 @@ def test_reset_daily():
     rm.initialize(1000)
     rm.record_cycles(1, -10.0, -10.0)
     rm.record_cycles(1, 5.0, 5.0)
+    rm.record_fill()
+    rm.record_fill()
     rm.reset_daily()
     assert rm.state.daily_realized_pnl == 0.0
+    assert rm.state.trades_today == 0
+    assert rm.state.fills_today == 0
+
+
+def test_record_fill_increments_fills_today_only():
+    rm = RiskManager()
+    rm.initialize(1000)
+    rm.record_fill()
+    rm.record_fill()
+    assert rm.state.fills_today == 2
     assert rm.state.trades_today == 0
 
 
@@ -228,11 +240,15 @@ def test_to_dict_and_load():
     rm = RiskManager()
     rm.initialize(1000)
     rm.record_cycles(1, 10.0, 10.0)
+    rm.record_fill()
+    rm.record_fill()
+    rm.record_fill()
     d = rm.to_dict()
     rm2 = RiskManager()
     rm2.load_from_dict(d)
     assert rm2.state.daily_realized_pnl == 10.0
     assert rm2.state.trades_today == 1
+    assert rm2.state.fills_today == 3
 
 
 def test_recovery_size_multiplier_aggressive():

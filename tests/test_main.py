@@ -751,3 +751,40 @@ def test_the_startup_grid_activation_is_also_gated_on_recovery():
     assert "elif" in between, (
         "grid.activate is not gated behind an elif of the startup recovery check"
     )
+
+
+def test_fills_today_is_recorded_once_per_fill_before_it_is_reported():
+    """`risk.record_fill()` must run inside the `for fill in fills:` loop, once per
+    iteration, and before the notifier/events/journal calls in that same iteration --
+    otherwise those calls would report yesterday's (or the previous fill's) count
+    instead of the tally that already includes the fill just processed."""
+    src = _main_source()
+    loop_at = src.index("for fill in fills:")
+    notify_at = src.index("notifier.on_fill(", loop_at)
+    events_at = src.index("events.fill(", loop_at)
+    journal_at = src.index("journal.record(", loop_at)
+    record_fill_at = src.index("risk.record_fill()", loop_at)
+
+    assert loop_at < record_fill_at < notify_at < events_at < journal_at, (
+        "risk.record_fill() is not called inside the fills loop before the calls "
+        "that report risk.state.fills_today"
+    )
+    # Only one call site -- record_fill() must not also be invoked elsewhere (e.g.
+    # once per batch instead of once per fill).
+    assert src.count("risk.record_fill()") == 1
+
+
+def test_fills_today_is_threaded_into_the_reporting_calls():
+    src = _main_source()
+    loop_at = src.index("for fill in fills:")
+    notify_at = src.index("notifier.on_fill(", loop_at)
+    events_at = src.index("events.fill(", loop_at)
+    journal_at = src.index("journal.record(", loop_at)
+
+    notify_block = src[notify_at:events_at]
+    events_block = src[events_at:journal_at]
+    journal_block = src[journal_at:journal_at + 800]
+
+    assert "daily_fill_count=risk.state.fills_today" in notify_block
+    assert "fills_today=risk.state.fills_today" in events_block
+    assert "fills_today=risk.state.fills_today" in journal_block

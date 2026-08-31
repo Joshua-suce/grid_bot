@@ -107,6 +107,16 @@ def test_fill_carries_the_account_wide_pnl_figure_again():
     assert "Account (89d rolling, all activity): -69.4800 USDT" in message
 
 
+def test_fill_carries_the_daily_fill_count():
+    n = RecordingNotifier()
+    n.on_fill(side="buy", price=0.2198, pnl=0.8532, fill_count=46, daily_pnl=1.2726,
+              total_pnl_verified=-69.48, session_pnl=0.8532, pnl_window="89d rolling",
+              daily_fill_count=7)
+    message = n.messages[0]
+    assert "FILL #46" in message
+    assert "(today: 7)" in message
+
+
 def test_fill_falls_back_to_the_default_window_label_when_none_is_given():
     n = RecordingNotifier()
     n.on_fill(side="buy", price=0.2198, pnl=0.8532, fill_count=46, daily_pnl=1.2726,

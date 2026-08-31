@@ -232,6 +232,7 @@ class TelegramNotifier:
         total_pnl_verified: float | None = None,
         session_pnl: float | None = None,
         pnl_window: str | None = None,
+        daily_fill_count: int = 0,
     ) -> None:
         """A FILL message. Carries the account-wide rolling figure again -- AUDIT #154.
 
@@ -243,12 +244,16 @@ class TelegramNotifier:
         worse outcome than the one #153 was fixing. #59's original point -- the account
         figure has to be labelled as the account's, not the bot's -- still holds; it's
         just back on every fill instead of only on startup.
+
+        `daily_fill_count` is the day's raw-fill tally (risk.state.fills_today), which
+        resets every UTC day -- shown alongside `fill_count`, the cumulative, never-
+        resetting total (grid.total_fills), so the message carries both readings.
         """
         emoji = "&#x1f7e2;" if side == "sell" else "&#x1f534;"
         price_str = f"{price:.8f}".rstrip("0").rstrip(".")
         verified_line = _pnl_lines(session_pnl, total_pnl_verified, pnl_window or _DEFAULT_WINDOW)
         self.send(
-            f"{emoji} <b>FILL #{fill_count}</b>\n"
+            f"{emoji} <b>FILL #{fill_count}</b> (today: {daily_fill_count})\n"
             f"Side: {side.upper()}\n"
             f"Price: {price_str}\n"
             f"Cycle PnL: {pnl:.4f} USDT\n"

@@ -15,6 +15,7 @@ class RiskState:
     starting_balance: float = 0.0
     last_kill_switch: float = 0.0
     trades_today: int = 0
+    fills_today: int = 0
     consecutive_losses: int = 0
     last_reset_date: str = ""
     in_recovery: bool = False
@@ -272,15 +273,25 @@ class RiskManager:
 
     def reset_daily(self) -> None:
         logger.info(
-            "DAILY RESET | yesterday pnl={:.2f} | trades={} | consec_losses={}",
-            self.state.daily_realized_pnl, self.state.trades_today, self.state.consecutive_losses,
+            "DAILY RESET | yesterday pnl={:.2f} | trades={} | fills={} | consec_losses={}",
+            self.state.daily_realized_pnl, self.state.trades_today, self.state.fills_today, self.state.consecutive_losses,
         )
         self.state.daily_realized_pnl = 0.0
         self.state.daily_unrealized_pnl = 0.0
         self.state.trades_today = 0
+        self.state.fills_today = 0
         if not self.state.in_recovery:
             self.state.consecutive_losses = 0
         self.state.last_reset_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def record_fill(self) -> None:
+        """Count one raw fill toward today's tally.
+
+        Mirrors `trades_today`'s lifecycle -- `reset_daily()` zeroes it every UTC day
+        -- but counts every individual fill, not just ones that complete a cycle.
+        `grid.total_fills` is the cumulative, never-resetting equivalent of this figure.
+        """
+        self.state.fills_today += 1
 
     def record_cycles(
         self, completed: int, verified_pnl: float | None, estimated_pnl: float,
@@ -344,6 +355,7 @@ class RiskManager:
             "starting_balance": self.state.starting_balance,
             "last_kill_switch": self.state.last_kill_switch,
             "trades_today": self.state.trades_today,
+            "fills_today": self.state.fills_today,
             "consecutive_losses": self.state.consecutive_losses,
             "last_reset_date": self.state.last_reset_date,
             "in_recovery": self.state.in_recovery,
