@@ -676,7 +676,7 @@ def daily_reset_check(
                 balance,
             )
             if events:
-                events.daily_reset(completed_daily_pnl, risk.state.trades_today, balance)
+                events.daily_reset(completed_daily_pnl, risk.state.trades_today, balance, risk.state.fills_today)
         risk.reset_daily()
 
 
@@ -2426,11 +2426,13 @@ def run_bot() -> None:
                     for fill in fills:
                         profit = fill["profit"]
                         fee = fill["fee"]
+                        risk.record_fill()
                         notifier.on_fill(
                             fill["side"], fill["price"], profit, grid.total_fills, pnl_reconciler.daily_net_pnl,
                             total_pnl_verified=pnl_reconciler.net_realized_pnl,
                             session_pnl=pnl_reconciler.session_pnl,
                             pnl_window=pnl_reconciler.window_label,
+                            daily_fill_count=risk.state.fills_today,
                         )
                         events.fill(
                             symbol=settings.symbol,
@@ -2446,6 +2448,7 @@ def run_bot() -> None:
                             exposure_pct=exposure,
                             daily_pnl=pnl_reconciler.daily_net_pnl,
                             regime=trend.regime.value,
+                            fills_today=risk.state.fills_today,
                         )
                         journal.record(
                             symbol=settings.symbol,
@@ -2457,6 +2460,7 @@ def run_bot() -> None:
                             cumulative_pnl=pnl_reconciler.net_realized_pnl,
                             daily_pnl=pnl_reconciler.daily_net_pnl,
                             trades_today=risk.state.trades_today,
+                            fills_today=risk.state.fills_today,
                             regime=trend.regime.value,
                             fee=fee,
                             completed_cycle=fill["completed_cycle"],

@@ -22,7 +22,7 @@ def _record(journal, **over):
         symbol="DOGEUSDT", side="buy", price=0.0697, quantity=1792.0,
         grid_spacing=0.000287, fill_number=1, completed_cycle=False,
         cycle_pnl=0.0, cumulative_pnl=0.0, daily_pnl=0.0, trades_today=1,
-        regime="uncertain", regime_adx=18.4, fee=0.025, balance=4931.09,
+        fills_today=1, regime="uncertain", regime_adx=18.4, fee=0.025, balance=4931.09,
         equity=4931.09, exposure_pct=0.025, unrealized_pnl=0.0,
     )
     args.update(over)
