@@ -119,6 +119,29 @@ def test_cooldown():
     assert is_fatal is True
 
 
+def test_recovery_cooldown_remaining_backs_off_with_recovery_count():
+    # A second kill-switch trip within the same recovery streak should make the
+    # bot wait 2x the base cooldown, not the raw config value -- callers (the
+    # "KILL SWITCH TRIGGERED" log and the Telegram "RECOVERY MODE" notice) read
+    # this via trigger_kill_switch()/recovery_cooldown_remaining() rather than
+    # settings.cooldown_seconds directly, which used to under-report the real
+    # wait on any recovery past the first.
+    rm = RiskManager(cooldown_seconds=60)
+    rm.initialize(1000)
+    rm.trigger_kill_switch()
+    assert rm.state.recovery_count == 1
+    assert rm.recovery_cooldown_remaining() == pytest.approx(60, abs=1)
+
+    rm.state.recovery_count = 2
+    rm.state.recovery_start_time = time.time()
+    assert rm.recovery_cooldown_remaining() == pytest.approx(120, abs=1)
+
+    # Backoff caps at 4x base, however high recovery_count climbs.
+    rm.state.recovery_count = 9
+    rm.state.recovery_start_time = time.time()
+    assert rm.recovery_cooldown_remaining() == pytest.approx(240, abs=1)
+
+
 # test_record_trade is gone with the method it tested. record_trade was superseded by
 # record_cycles in AUDIT #43 -- it was fed the grid engine's per-level cycle profit,
 # which is ~20x the account's realised change and can differ in SIGN -- and had no

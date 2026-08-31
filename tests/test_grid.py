@@ -447,6 +447,89 @@ def test_grid_engine_scale_out_trail_price_reset_returns_to_hard():
     assert grid.get_scale_out_trail_price("short") == 82000 * 1.03
 
 
+def test_trailing_sl_and_scale_out_trail_inherit_the_average_entry_anchor():
+    """AUDIT #168: the trailing leg's static floor (update_trailing_sl's static_sl,
+    and get_scale_out_trail_price's `hard`) must come from get_hard_stop_loss_price(),
+    not a second grid_lower*(1-stop_loss_pct) computed inline -- otherwise the trail
+    leg (which get_stop_loss_price returns almost as soon as a position opens) would
+    keep quoting the old, un-anchored level forever, even after the hard leg itself
+    tightened to the position's average entry."""
+    class FakeExchange:
+        class exchange:
+            @staticmethod
+            def amount_to_precision(symbol, amount):
+                return f"{amount:.6f}"
+            @staticmethod
+            def price_to_precision(symbol, price):
+                return f"{price:.2f}"
+
+    grid = GridEngine(
+        exchange=FakeExchange(),
+        symbol="BTCUSDT",
+        grid_lower=78000,
+        grid_upper=82000,
+        grid_count=10,
+        capital_per_grid_pct=0.05,
+        stop_loss_pct=0.03,
+    )
+    grid.set_position_limit(long_position=1.0, short_position=0.0, max_position_qty=10.0)
+    grid.seed_position(1.0, 80500)
+
+    # Price dipped after entry -- peak never rose above entry, so if the trail leg's
+    # floor still came from the old grid_lower-only formula it would settle at
+    # 79000*0.97 = 76630, below the entry-anchored hard level of 80500*0.97 = 78085.
+    grid.update_trailing_sl(79000)
+
+    entry_anchored_hard = 80500 * 0.97
+    old_style_hard = 78000 * 0.97
+    assert entry_anchored_hard > old_style_hard, "test setup sanity check"
+
+    assert grid.get_hard_stop_loss_price() == pytest.approx(entry_anchored_hard)
+    assert grid.get_stop_loss_price() == pytest.approx(entry_anchored_hard), (
+        "trailing leg fell back to the un-anchored grid_lower level"
+    )
+    assert grid.get_scale_out_trail_price("long") == pytest.approx(entry_anchored_hard)
+
+
+def test_trailing_sl_short_and_scale_out_trail_inherit_the_average_entry_anchor():
+    """Mirror of the long case above."""
+    class FakeExchange:
+        class exchange:
+            @staticmethod
+            def amount_to_precision(symbol, amount):
+                return f"{amount:.6f}"
+            @staticmethod
+            def price_to_precision(symbol, price):
+                return f"{price:.2f}"
+
+    grid = GridEngine(
+        exchange=FakeExchange(),
+        symbol="BTCUSDT",
+        grid_lower=78000,
+        grid_upper=82000,
+        grid_count=10,
+        capital_per_grid_pct=0.05,
+        stop_loss_pct=0.03,
+    )
+    grid.set_position_limit(long_position=0.0, short_position=1.0, max_position_qty=10.0)
+    grid.seed_position(-1.0, 81000)
+
+    # Price rose after entry -- trough never fell below entry, so if the trail leg's
+    # floor still came from the old grid_upper-only formula it would settle at
+    # 82000*1.03 = 84460, above the entry-anchored hard level of 81000*1.03 = 83430.
+    grid.update_trailing_sl_short(83000)
+
+    entry_anchored_hard = 81000 * 1.03
+    old_style_hard = 82000 * 1.03
+    assert entry_anchored_hard < old_style_hard, "test setup sanity check"
+
+    assert grid.get_short_hard_stop_loss_price() == pytest.approx(entry_anchored_hard)
+    assert grid.get_short_stop_loss_price() == pytest.approx(entry_anchored_hard), (
+        "trailing leg fell back to the un-anchored grid_upper level"
+    )
+    assert grid.get_scale_out_trail_price("short") == pytest.approx(entry_anchored_hard)
+
+
 def test_get_exposure_pct_counts_short_positions():
     """Exposure must include short positions so risk gating does not see 0% exposure
     while the grid holds a short."""

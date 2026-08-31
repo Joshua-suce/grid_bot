@@ -3300,10 +3300,17 @@ class GridEngine:
         continuously-open long) and could never be hit -- precisely when it was the
         only thing protecting the position. reset_trailing() on a side flip is the
         one place the ratchet is deliberately released.
+
+        AUDIT #168: the floor comes from get_hard_stop_loss_price() rather than a
+        second grid_lower*(1-stop_loss_pct) computed inline here. get_stop_loss_price()
+        returns _trailing_sl_price (set below) once armed, which is almost immediately
+        after a position opens -- so a duplicated, un-anchored formula here would have
+        left the scale-out trail leg quoting the old grid_lower-only level forever,
+        even after the hard leg tightened to the position's average entry.
         """
         if current_price > self._peak_price:
             self._peak_price = current_price
-        static_sl = self.grid_lower * (1 - self.stop_loss_pct)
+        static_sl = self.get_hard_stop_loss_price()
         if self._peak_price > 0:
             candidate = max(static_sl, self._peak_price * (1 - self._trailing_sl_trigger))
         else:
@@ -3314,10 +3321,14 @@ class GridEngine:
             self._trailing_sl_price = max(self._trailing_sl_price, candidate)
 
     def update_trailing_sl_short(self, current_price: float) -> None:
-        """Lower the short trailing stop toward price. Never raises it (see above)."""
+        """Lower the short trailing stop toward price. Never raises it (see above).
+
+        AUDIT #168: mirrors update_trailing_sl -- static_sl comes from
+        get_short_hard_stop_loss_price(), not a duplicated inline formula.
+        """
         if self._trough_price == 0.0 or current_price < self._trough_price:
             self._trough_price = current_price
-        static_sl = self.grid_upper * (1 + self.stop_loss_pct)
+        static_sl = self.get_short_hard_stop_loss_price()
         if self._trough_price > 0:
             candidate = min(static_sl, self._trough_price * (1 + self._trailing_sl_trigger))
         else:
@@ -3338,8 +3349,24 @@ class GridEngine:
         This is AUDIT #15 one layer down. #15 stopped recenter resetting the *trailing*
         anchor; the hard leg still tracked grid_lower freely. A stop may tighten while a
         position is open, never loosen. Released by reset_trailing() once flat.
+
+        AUDIT #168: candidate now also considers the position's own average entry
+        price (self._pos_entry, maintained by _apply_to_position/seed_position),
+        not just grid_lower. grid_lower is frozen while a position is open (AUDIT
+        #116 blocks recenter()), so a stop anchored to it alone could not track a
+        position built up through a long drawdown of grid dip-buys -- observed
+        2026-08-30, hours of grid profit erased in under a minute when the stop
+        finally hit, because it was still sitting at the pre-drawdown grid_lower
+        level instead of near the position's real (falling) average cost. Using
+        max(...) here can only ever tighten the floor relative to the old
+        grid_lower-only figure -- a long only fills at prices >= grid_lower, so
+        _pos_entry is never below it in the normal case -- and the _pos_qty > 0 /
+        _pos_entry > 0 guard falls back to the exact old behaviour whenever the
+        ledger has no usable entry price yet, so this cannot make the stop worse.
         """
         candidate = self.grid_lower * (1 - self.stop_loss_pct)
+        if self._pos_qty > 0 and self._pos_entry > 0:
+            candidate = max(candidate, self._pos_entry * (1 - self.stop_loss_pct))
         if self._net_long_qty <= 0:
             self._hard_sl_price = candidate
             return candidate
@@ -3365,8 +3392,13 @@ class GridEngine:
             logger.warning("SIDE BLOCKED | sell — {} (AUDIT #50)", reason)
 
     def get_short_hard_stop_loss_price(self) -> float:
-        """Mirror of get_hard_stop_loss_price for a short: may fall, never rise."""
+        """Mirror of get_hard_stop_loss_price for a short: may fall, never rise.
+
+        AUDIT #168: mirrors the long-side change -- see get_hard_stop_loss_price.
+        """
         candidate = self.grid_upper * (1 + self.stop_loss_pct)
+        if self._pos_qty < 0 and self._pos_entry > 0:
+            candidate = min(candidate, self._pos_entry * (1 + self.stop_loss_pct))
         if self._net_short_qty <= 0:
             self._hard_sl_price_short = candidate
             return candidate
@@ -3395,13 +3427,17 @@ class GridEngine:
         TRAILING_SL_TRIGGER_PCT > STOP_LOSS_PCT, which collapses the split to a
         single hard stop until price rises ~2%+ above the grid. Falls back to the
         static hard level when no anchor has been observed yet.
+
+        AUDIT #168: `hard` comes from get_hard_stop_loss_price()/
+        get_short_hard_stop_loss_price() rather than a third inline copy of
+        grid_lower*(1-stop_loss_pct) -- see update_trailing_sl.
         """
         if side == "short":
-            hard = self.grid_upper * (1 + self.stop_loss_pct)
+            hard = self.get_short_hard_stop_loss_price()
             if self._trough_price <= 0:
                 return hard
             return min(hard, self._trough_price * (1 + self.stop_loss_pct))
-        hard = self.grid_lower * (1 - self.stop_loss_pct)
+        hard = self.get_hard_stop_loss_price()
         if self._peak_price <= 0:
             return hard
         return max(hard, self._peak_price * (1 - self.stop_loss_pct))

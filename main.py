@@ -2632,8 +2632,14 @@ def run_bot() -> None:
                             _reset_sl()
                             notifier.on_kill_switch("Risk limit breached")
                             events.recovery_event("start", risk.state.recovery_count)
-                            logger.warning("Entering recovery mode — will wait {}s then recalculate grid", settings.cooldown_seconds)
-                            notifier.on_recovery_start(settings.cooldown_seconds, risk.state.recovery_count)
+                            # Use the actual backoff-scaled wait, not the raw config value --
+                            # recovery_cooldown_remaining() already applies the same up-to-4x
+                            # multiplier risk.py logs internally, and reading it here (right
+                            # after trigger_kill_switch() set recovery_start_time) reflects the
+                            # real wait instead of understating it on repeat recoveries.
+                            effective_cooldown = risk.recovery_cooldown_remaining()
+                            logger.warning("Entering recovery mode — will wait {}s then recalculate grid", effective_cooldown)
+                            notifier.on_recovery_start(effective_cooldown, risk.state.recovery_count)
                             _notify_status(notifier, exchange, settings.symbol, price)
                         state_data = {
                             "grid": grid.to_dict(),
