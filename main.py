@@ -1021,7 +1021,7 @@ def ladder_cap_room(one_side_notional: float, cap: float, held_notional: float
     return one_side_notional <= room, room
 
 
-def seed_position_limit(exchange, grid, symbol: str, cfg) -> None:
+def seed_position_limit(exchange, grid, symbol: str, cfg, daily_realized_pnl: float = 0.0) -> None:
     """Teach the grid its position cap BEFORE it places anything. AUDIT #125.
 
     set_position_limit is what computes _block_buys/_block_sells and the size taper, and
@@ -1070,6 +1070,11 @@ def seed_position_limit(exchange, grid, symbol: str, cfg) -> None:
         max_pos_qty = equity * cfg.max_position_pct / price if price > 0 else 0.0
         grid.set_position_limit(long_pos, short_pos, max_pos_qty)
         grid.apply_open_loss_guard(price)
+        # Sibling guard, same seed-before-placing discipline: re-arms the profit lock
+        # before the initial ladder gets laid, so a restart mid-lockout can't re-open
+        # exposure into a day that already hit its profit budget (see
+        # apply_profit_lock_guard's persistence note).
+        grid.apply_profit_lock_guard(daily_realized_pnl)
         if long_pos or short_pos:
             logger.info(
                 "POSITION CAP SEEDED | long={:.0f} short={:.0f} against a cap of {:.0f} "
@@ -1326,6 +1331,7 @@ def run_bot() -> None:
             max_exposure_pct=settings.max_exposure_pct,
             max_consecutive_losses=settings.max_consecutive_losses,
             max_recovery_count=settings.max_recovery_count,
+            daily_profit_lock_usdt=settings.daily_profit_lock_usdt,
             event_journal=events,
         )
 
@@ -1413,6 +1419,7 @@ def run_bot() -> None:
                 min_profit_multiplier=settings.min_profit_multiplier,
                 rung_loss_cap_pct=settings.rung_loss_cap_pct,
                 max_open_loss_usdt=settings.max_open_loss_usdt,
+                daily_profit_lock_usdt=settings.daily_profit_lock_usdt,
                 event_journal=events,
                 notifier=notifier,
             )
@@ -1428,7 +1435,7 @@ def run_bot() -> None:
                 for p in exchange.get_positions(settings.symbol)
             )
 
-            seed_position_limit(exchange, grid, settings.symbol, settings)
+            seed_position_limit(exchange, grid, settings.symbol, settings, pnl_reconciler.daily_net_pnl)
 
             # Reconcile BEFORE deciding what to place, and whether the exchange holds a
             # position or not. Gating this on has_exchange_positions left one wedge: a
@@ -1521,6 +1528,7 @@ def run_bot() -> None:
                 min_profit_multiplier=settings.min_profit_multiplier,
                 rung_loss_cap_pct=settings.rung_loss_cap_pct,
                 max_open_loss_usdt=settings.max_open_loss_usdt,
+                daily_profit_lock_usdt=settings.daily_profit_lock_usdt,
                 event_journal=events,
                 notifier=notifier,
             )
@@ -1542,7 +1550,7 @@ def run_bot() -> None:
         # A warning, not an abort. The cap and the size taper keep this SAFE, only degraded,
         # and equity moves -- a restart after a drawdown should not refuse to start
         # (AUDIT #66).
-        seed_position_limit(exchange, grid, settings.symbol, settings)
+        seed_position_limit(exchange, grid, settings.symbol, settings, pnl_reconciler.daily_net_pnl)
 
         try:
             _one_side = grid.one_side_notional(balance)
@@ -2001,6 +2009,7 @@ def run_bot() -> None:
                                 min_profit_multiplier=settings.min_profit_multiplier,
                                 rung_loss_cap_pct=settings.rung_loss_cap_pct,
                                 max_open_loss_usdt=settings.max_open_loss_usdt,
+                                daily_profit_lock_usdt=settings.daily_profit_lock_usdt,
                                 event_journal=events,
                                 notifier=notifier,
                             )
@@ -2013,7 +2022,7 @@ def run_bot() -> None:
                             # short to 6,307 on 2026-08-19. The ordering test asserted
                             # ">= 2 call sites" and passed while this one had none
                             # (AUDIT #130).
-                            seed_position_limit(exchange, new_grid, settings.symbol, settings)
+                            seed_position_limit(exchange, new_grid, settings.symbol, settings, pnl_reconciler.daily_net_pnl)
                             new_grid.initialize(price, exchange.get_balance())
                             new_grid.total_fills = old_fills
                             new_grid.total_pnl = old_pnl
@@ -2491,6 +2500,11 @@ def run_bot() -> None:
                     # The loss budget rides the same per-tick position refresh as the
                     # cap: both are recomputed from live data, neither is persisted.
                     grid.apply_open_loss_guard(price)
+                    # Sibling guard: same cadence, called after daily_reset_check (above,
+                    # this same iteration) has already rolled pnl_reconciler's daily
+                    # bucket over, so a day that just rolled reads today's fresh pnl
+                    # (~0), not yesterday's stale total that already tripped the lock.
+                    grid.apply_profit_lock_guard(pnl_reconciler.daily_net_pnl)
 
                     if position_side != _last_side:
                         commit_flip = True

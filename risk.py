@@ -32,6 +32,7 @@ class RiskManager:
         max_exposure_pct: float = 0.50,
         max_consecutive_losses: int = 10,
         max_recovery_count: int = 5,
+        daily_profit_lock_usdt: float = 0.0,
         event_journal: object | None = None,
     ):
         self.stop_loss_pct = stop_loss_pct
@@ -41,6 +42,8 @@ class RiskManager:
         self.max_exposure_pct = max_exposure_pct
         self.max_consecutive_losses = max_consecutive_losses
         self.max_recovery_count = max_recovery_count
+        # Profit budget for the day, in USDT. See is_daily_profit_locked -- 0 disables.
+        self.daily_profit_lock_usdt = daily_profit_lock_usdt
         self.state = RiskState()
         self._event_journal = event_journal
 
@@ -133,6 +136,30 @@ class RiskManager:
         if self._event_journal:
             self._event_journal.risk_check("daily_loss", daily_loss_pct, self.daily_loss_limit_pct, "OK")
         return True
+
+    def is_daily_profit_locked(self, daily_realized_pnl: float | None = None) -> bool:
+        """True once the day's REALISED P&L has reached daily_profit_lock_usdt.
+
+        Resolves the effective daily P&L the same way `_check_daily_loss` does: the
+        caller may pass the exchange-reconciled figure (see
+        pnl_reconciler.PnLReconciler.daily_net_pnl) to override `state.daily_realized_pnl`,
+        so this evaluates against the account's real daily P&L rather than the grid's
+        per-level estimate. Unlike the loss check, unrealised P&L is deliberately left
+        out -- profit should be locked in (realised), not just marked-to-market, before
+        it counts toward the budget.
+
+        Advisory only: this is NOT part of check_all's kill-switch chain and never
+        calls trigger_kill_switch. It exists so anywhere in risk.py that needs the
+        answer (logging, notifications) has one source of truth for the same threshold
+        grid.py's apply_profit_lock_guard enforces at order placement -- grid.py owns
+        the actual gate, recomputing its own trip from the raw figure every call, the
+        same way apply_open_loss_guard owns max_open_loss_usdt rather than deferring to
+        risk.py for it.
+        """
+        if self.daily_profit_lock_usdt <= 0:
+            return False
+        realized = self.state.daily_realized_pnl if daily_realized_pnl is None else daily_realized_pnl
+        return realized >= self.daily_profit_lock_usdt
 
     def _check_grid_stop_loss(self, stop_loss_price: float, current_price: float, side: str = "long") -> bool:
         """Checks the grid-level stop-loss backstop against the current position.

@@ -232,6 +232,7 @@ class GridEngine:
         min_profit_multiplier: float = 3.0,
         rung_loss_cap_pct: float = 0.01,
         max_open_loss_usdt: float = 0.0,
+        daily_profit_lock_usdt: float = 0.0,
         event_journal: object | None = None,
         notifier: object | None = None,
     ):
@@ -292,6 +293,13 @@ class GridEngine:
         self.max_open_loss_usdt = max_open_loss_usdt
         self._loss_block_buys = False
         self._loss_block_sells = False
+        # Profit budget for the DAY: once daily_realized_pnl reaches
+        # daily_profit_lock_usdt, BOTH sides stop opening/adding new exposure (0
+        # disables). One shared flag, not a buy/sell pair like the loss guard above --
+        # this isn't defending a specific position, it blocks either direction alike.
+        # See apply_profit_lock_guard.
+        self.daily_profit_lock_usdt = daily_profit_lock_usdt
+        self._profit_lock_active = False
         # Last net position seen by set_position_limit(), used to decide whether an
         # order actually *reduces* a position (reduceOnly is only legal then -- see
         # _reduce_only_qty). Refreshed from the exchange every main-loop iteration.
@@ -551,6 +559,60 @@ class GridEngine:
                 "OPEN LOSS BUDGET | {} back inside budget ({:.2f} USDT) — {} orders "
                 "unblocked",
                 "long" if adverse == "buy" else "short", loss, adverse.upper(),
+            )
+
+    def apply_profit_lock_guard(self, daily_realized_pnl: float) -> None:
+        """Stop OPENING new exposure once the day's realised profit hits the budget.
+
+        Every guard above bounds LOSSES; nothing bounded the profit side, so a good
+        day's gains just rode as continued exposure with no mechanism to lock them in
+        -- the same shape apply_open_loss_guard exists for, mirrored: hours of small
+        grid profit erased in under a minute by one bad move. Once the day's REALISED
+        P&L reaches daily_profit_lock_usdt, both sides stop adding new exposure. Unlike
+        apply_open_loss_guard, which only blocks the one side adverse to whichever
+        position currently exists, this is symmetric -- it isn't defending a specific
+        position, it's refusing to risk a day already won, regardless of which
+        direction the next trade would open. Reducing stays legal: exits are how any
+        open position resolves, and blocking them would weld it in place.
+
+        Realised only, deliberately -- unrealised marks are not yet locked in, so
+        (unlike the loss guard, which counts unrealised loss) they do not count toward
+        this budget.
+
+        Stateless by design: recomputed from daily_realized_pnl every call, so it needs
+        no persistence and self-clears the moment the figure drops back under budget --
+        including at the next UTC daily reset, once daily_reset_check has rolled the
+        day's realised P&L back to zero.
+        """
+        if self.daily_profit_lock_usdt <= 0:
+            self._profit_lock_active = False
+            return
+
+        trip = daily_realized_pnl >= self.daily_profit_lock_usdt
+        was = self._profit_lock_active
+        self._profit_lock_active = trip
+
+        if trip and not was:
+            logger.warning(
+                "PROFIT LOCK | day's profit {:.2f} USDT >= {:.2f} budget — BUY and SELL "
+                "entries blocked for the rest of the day (today's gain is protected); "
+                "exits stay open",
+                daily_realized_pnl, self.daily_profit_lock_usdt,
+            )
+            if self._notifier:
+                self._notifier.on_profit_lock(daily_realized_pnl, self.daily_profit_lock_usdt)
+            # Mirror apply_open_loss_guard: blocking new entries in _place_order_for_level
+            # only stops rungs that don't already have a resting order (place_initial_orders
+            # skips levels with order_id is not None). Without cancelling here, any entry
+            # already resting on either side at the moment the lock trips stays live and can
+            # still fill, adding new exposure -- exactly what this guard exists to prevent.
+            self._cancel_resting_orders("buy", "profit_lock")
+            self._cancel_resting_orders("sell", "profit_lock")
+        elif not trip and was:
+            logger.info(
+                "PROFIT LOCK | released — day's profit {:.2f} USDT back under {:.2f} "
+                "budget — entries unblocked",
+                daily_realized_pnl, self.daily_profit_lock_usdt,
             )
 
     def _reduce_only_qty(self, side: str) -> float:
@@ -1924,6 +1986,12 @@ class GridEngine:
             return False
         if level.side == "sell" and self._loss_block_sells:
             logger.debug("SKIP SELL ORDER | open loss budget exhausted")
+            return False
+        if level.side == "buy" and self._profit_lock_active:
+            logger.debug("SKIP BUY ORDER | daily profit lock active")
+            return False
+        if level.side == "sell" and self._profit_lock_active:
+            logger.debug("SKIP SELL ORDER | daily profit lock active")
             return False
         if self._would_realise_a_loss(level.side, level.price):
             be = self._position_break_even()

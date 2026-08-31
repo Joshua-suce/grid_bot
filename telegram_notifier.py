@@ -302,6 +302,19 @@ class TelegramNotifier:
             f"Grid recalculated around current price."
         )
 
+    def on_profit_lock(self, daily_pnl: float, budget: float) -> None:
+        """One-shot: fires on the false-to-true transition only (see
+        GridEngine.apply_profit_lock_guard) — released back below budget is log-only,
+        the same asymmetry on_kill_switch/on_recovery_start have against a plain
+        RECOVERY COMPLETE log line.
+        """
+        self.send(
+            f"&#x1f512; <b>PROFIT LOCK ENGAGED</b>\n"
+            f"Day's profit: {daily_pnl:+.4f} USDT (budget {budget:.2f})\n"
+            f"New buy/sell entries blocked for the rest of the day.\n"
+            f"Exits stay open — today's gain is protected."
+        )
+
     def on_order_placed(self, symbol: str, side: str, price: float, qty: float, order_id: str) -> None:
         emoji = "&#x1f7e2;" if side == "sell" else "&#x1f534;"
         price_str = f"{price:.8f}".rstrip("0").rstrip(".")
