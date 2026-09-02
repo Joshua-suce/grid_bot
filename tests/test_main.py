@@ -788,3 +788,69 @@ def test_fills_today_is_threaded_into_the_reporting_calls():
     assert "daily_fill_count=risk.state.fills_today" in notify_block
     assert "fills_today=risk.state.fills_today" in events_block
     assert "fills_today=risk.state.fills_today" in journal_block
+
+
+# --- AUDIT #143 (paused branch): an exchange-side close while the grid is paused
+# must still be detected, booked, and reported -- not silently adopted as flat on
+# the next activate() with zero P&L. ---------------------------------------------
+
+def test_the_paused_branch_also_detects_an_external_close():
+    """detect_external_close is only useful here if it runs BEFORE the
+    get_net_position() read that decides whether there is anything left to do --
+    otherwise a close this same iteration is invisible to both."""
+    src = _main_source()
+    paused_at = src.index("if not grid.active:")
+    detect_at = src.index("grid.detect_external_close(price)", paused_at)
+    net_position_at = src.index(
+        "held_side, held_qty = get_net_position(exchange, settings.symbol)", paused_at,
+    )
+    assert paused_at < detect_at < net_position_at, (
+        "the paused branch does not check for an external close before deciding "
+        "there is nothing held to act on"
+    )
+
+
+def test_the_paused_branch_external_close_has_its_own_call_site():
+    """Distinct from the active branch's detect_external_close (AUDIT #143 original) --
+    exactly two call sites total, one per branch."""
+    src = _main_source()
+    assert src.count("grid.detect_external_close(price)") == 2
+
+
+def test_a_paused_external_close_is_booked_into_risk_with_the_verified_figure():
+    """Mirrors the active branch's own pattern (AUDIT #43): sync the reconciler
+    first, then hand risk.record_cycles the account's own realized delta, not the
+    engine's estimate -- so consecutive_losses and the daily/profit-lock figures
+    see this close exactly as they would have seen any other."""
+    src = _main_source()
+    paused_at = src.index("if not grid.active:")
+    detect_at = src.index("grid.detect_external_close(price)", paused_at)
+    net_position_at = src.index(
+        "held_side, held_qty = get_net_position(exchange, settings.symbol)", paused_at,
+    )
+    block = src[detect_at:net_position_at]
+    sync_at = block.index("pnl_reconciler.sync(exchange, settings.symbol)")
+    record_at = block.index("risk.record_cycles(")
+    assert sync_at < record_at, (
+        "the paused-branch close books risk.record_cycles before syncing the "
+        "reconciler, so it would use a stale/pre-close verified figure"
+    )
+
+
+def test_a_paused_external_close_notifies():
+    src = _main_source()
+    paused_at = src.index("if not grid.active:")
+    detect_at = src.index("grid.detect_external_close(price)", paused_at)
+    net_position_at = src.index(
+        "held_side, held_qty = get_net_position(exchange, settings.symbol)", paused_at,
+    )
+    block = src[detect_at:net_position_at]
+    assert "notifier.send(" in block and "while paused" in block
+
+
+def test_a_paused_external_close_does_not_add_a_second_record_fill_call_site():
+    """risk.record_fill() has exactly one call site by design (see
+    test_fills_today_is_recorded_once_per_fill_before_it_is_reported) -- the paused
+    branch's own close must not add a second one."""
+    src = _main_source()
+    assert src.count("risk.record_fill()") == 1

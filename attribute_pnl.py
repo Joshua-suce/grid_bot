@@ -36,12 +36,22 @@ DAY_MS = 24 * 3600 * 1000
 
 
 def _paged(fetch, raw_symbol: str, start: int, end: int, window_ms: int) -> list[dict]:
-    """Binance caps several of these endpoints at a 7-day span per query."""
+    """Binance caps several of these endpoints at a 7-day span per query.
+
+    Resumes each inner page AT the last row's timestamp (inclusive), not
+    last+1, and dedupes by the row's own unique id. pnl_audit.py's docstring
+    documents why the obvious "+1" cursor is wrong: a full page ending
+    mid-millisecond silently drops any sibling record stamped identically that
+    did not fit -- there it cost 128 rows and the wrong SIGN on the headline.
+    userTrades rows carry a unique `id`; allOrders rows don't have one but
+    `orderId` is unique for them, so prefer `id` and fall back to `orderId`.
+    """
     out: list[dict] = []
     window_start = start
     while window_start < end:
         window_end = min(window_start + window_ms - 1, end)
         cursor = window_start
+        seen: set = set()
         while True:
             page = fetch({
                 "symbol": raw_symbol, "startTime": cursor,
@@ -49,11 +59,20 @@ def _paged(fetch, raw_symbol: str, start: int, end: int, window_ms: int) -> list
             })
             if not page:
                 break
-            out.extend(page)
+            added = 0
+            for r in page:
+                key = r.get("id") if r.get("id") is not None else r.get("orderId")
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(r)
+                added += 1
             last = int(page[-1]["time"])
-            if len(page) < 1000 or last <= cursor:
-                break
-            cursor = last + 1
+            if len(page) < 1000:
+                break                       # short page: this window is exhausted
+            if added == 0:
+                break                       # a full page we have already read: no progress
+            cursor = last
         window_start = window_end + 1
     return out
 

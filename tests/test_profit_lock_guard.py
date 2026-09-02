@@ -96,6 +96,49 @@ def test_above_budget_also_blocks():
     assert g._profit_lock_active is True
 
 
+def test_a_held_longs_exit_side_can_still_place_while_locked():
+    """The 2026-09-01 incident, reproduced at the placement gate rather than the
+    cancellation one: apply_profit_lock_guard's own cancellation already spares a
+    held position's exit (test_tripping_while_long_leaves_the_positions_own_exit_
+    resting), but _place_order_for_level used to block BOTH sides unconditionally
+    regardless of position, with no exemption for the side that only reduces it.
+    A recenter rebuilds every level from scratch -- order_id=None on all of them,
+    so even a held position's own exit reaches this gate as a "new" order. With
+    the lock engaged and the exit side ALSO refused here, a small long recentered
+    while locked ended up with 12/12 fresh levels failing to place -- no exit
+    anywhere on the ladder, just the raw exchange stop-loss as a backstop, which
+    fired and left the bot only able to ESTIMATE the resulting P&L rather than
+    book it cleanly through a grid fill. sell is the long's exit and must still be
+    allowed; buy would add to the long and must stay blocked."""
+    g, ex = _engine(daily_profit_lock_usdt=3.0)
+    g._pos_qty = 49.0
+    g.apply_profit_lock_guard(3.0)
+    assert g._profit_lock_active is True
+
+    buy = next(l for l in g.levels if l.side == "buy")
+    sell = next(l for l in g.levels if l.side == "sell")
+    assert g._place_order_for_level(sell, balance=5000.0) is True, \
+        "the long's own exit was blocked -- it can no longer close"
+    assert g._place_order_for_level(buy, balance=5000.0) is False, \
+        "the side adding to the long should still be blocked"
+
+
+def test_a_held_shorts_exit_side_can_still_place_while_locked():
+    """Mirror of the long case: a held SHORT's exit is BUY, so buy must still be
+    allowed while sell (adding to the short) stays blocked."""
+    g, ex = _engine(daily_profit_lock_usdt=3.0)
+    g._pos_qty = -1331.0
+    g.apply_profit_lock_guard(3.0)
+    assert g._profit_lock_active is True
+
+    buy = next(l for l in g.levels if l.side == "buy")
+    sell = next(l for l in g.levels if l.side == "sell")
+    assert g._place_order_for_level(buy, balance=5000.0) is True, \
+        "the short's own exit was blocked -- it can no longer close"
+    assert g._place_order_for_level(sell, balance=5000.0) is False, \
+        "the side adding to the short should still be blocked"
+
+
 def test_zero_budget_disables_the_guard_entirely():
     g, ex = _engine(daily_profit_lock_usdt=0.0)
     g.apply_profit_lock_guard(1_000_000.0)   # an absurd day's profit

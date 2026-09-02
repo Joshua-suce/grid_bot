@@ -88,7 +88,14 @@ def fetch_income(exchange, symbol: str, days: int = 90,
             break
         added = 0
         for r in batch:
-            key = r.get("tranId") or (r.get("time"), r.get("incomeType"), r.get("income"))
+            # tranId is only unique *within* a given incomeType (Binance's docs, and
+            # exactly why pnl_tracker.py's own dedup key is (incomeType, tranId), not
+            # tranId alone) -- a REALIZED_PNL and a COMMISSION entry for the same fill
+            # can legitimately share a raw tranId. Keying on tranId by itself treats
+            # the second one seen as a duplicate of the first and silently drops it.
+            tran_id = r.get("tranId")
+            key = (r.get("incomeType"), tran_id) if tran_id is not None \
+                else (r.get("time"), r.get("incomeType"), r.get("income"))
             if key not in seen:
                 seen.add(key)
                 rows.append(r)

@@ -104,6 +104,24 @@ def test_a_row_returned_twice_is_counted_once():
     assert summarize(got)["totals"]["COMMISSION"] == pytest.approx(-10.01)
 
 
+def test_a_realized_pnl_and_commission_sharing_a_tranid_are_both_kept():
+    """tranId is only unique *within* one incomeType (Binance's docs, and the reason
+    pnl_tracker.py's own dedup key is (incomeType, tranId), not tranId alone) -- a
+    REALIZED_PNL and a COMMISSION entry for the same fill can legitimately share a
+    raw tranId. Keying dedup on tranId alone treats the second one seen as a
+    duplicate of the first and silently drops it, understating whichever total lost
+    its row."""
+    ledger = _Ledger([
+        recent(0, "REALIZED_PNL", 5.0, tran="42"),
+        recent(0, "COMMISSION", -0.02, tran="42"),
+    ])
+    got = fetch_income(ledger, "DOGEUSDT", days=30)
+    assert len(got) == 2, "one of the two entries was dropped as a false duplicate"
+    totals = summarize(got)["totals"]
+    assert totals["REALIZED_PNL"] == pytest.approx(5.0)
+    assert totals["COMMISSION"] == pytest.approx(-0.02)
+
+
 def test_paging_stops_instead_of_spinning_when_a_full_page_repeats():
     """Resuming AT newest means a page of identically-stamped rows returns itself
     forever unless no-new-rows ends the walk."""

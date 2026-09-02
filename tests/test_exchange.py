@@ -200,6 +200,185 @@ def test_place_limit_order_raises_real_error_when_fallback_exhausts_retries():
         )
 
 
+class PostOnlyInsufficientFundsBackend:
+    """Reproduces ccxt's REAL exception mapping for Binance's -2019 rejection:
+    ccxt.InsufficientFunds, not ccxt.InvalidOrder (verified against the installed
+    ccxt 4.5.65 -- handle_errors() on a real -2019 body raises InsufficientFunds).
+    PostOnlyBackend above mocks the WRONG exception type and gave false confidence
+    that PostOnlyWouldCross detection worked when it was actually unreachable."""
+
+    def __init__(self):
+        self._placed_without_postonly = 0
+        self._tried_postonly = 0
+
+    def create_limit_order(self, symbol, side, amount, price, params):
+        if params.get("postOnly") is True:
+            self._tried_postonly += 1
+            raise ccxt.InsufficientFunds("-2019 Post only order will be rejected")
+        self._placed_without_postonly += 1
+        return {"id": "placed-ok", "side": side}
+
+    def fetch_open_orders(self, symbol):
+        return []
+
+    def fetch_positions(self, symbols):
+        return []
+
+    def amount_to_precision(self, symbol, amount):
+        return str(amount)
+
+
+def test_postonly_reject_raised_as_insufficient_funds_is_still_recognized():
+    fake = PostOnlyInsufficientFundsBackend()
+    ex = make_exchange(fake)
+    with pytest.raises(PostOnlyWouldCross):
+        ex.place_limit_order("DOGEUSDT", "buy", 0.069, 100, max_attempts=1, post_only=True)
+    assert fake._tried_postonly == 1
+    assert fake._placed_without_postonly == 0, "crossed the spread as a taker anyway"
+
+
+def test_postonly_reject_as_insufficient_funds_still_falls_back_to_taker_when_allowed():
+    fake = PostOnlyInsufficientFundsBackend()
+    ex = make_exchange(fake)
+    order = ex.place_limit_order(
+        "DOGEUSDT", "buy", 0.069, 100, max_attempts=1, post_only=True, allow_taker_fallback=True,
+    )
+    assert order["id"] == "placed-ok"
+    assert fake._tried_postonly == 1
+    assert fake._placed_without_postonly == 1
+
+
+def test_genuine_insufficient_funds_still_raises_and_is_not_mistaken_for_postonly():
+    """A REAL margin shortage (no -2019 in the message) must still raise
+    InsufficientFunds and log as such, not get swallowed into the post-only path."""
+    class OutOfMarginBackend:
+        def create_limit_order(self, symbol, side, amount, price, params):
+            raise ccxt.InsufficientFunds("Account has insufficient margin balance")
+
+        def amount_to_precision(self, symbol, amount):
+            return str(amount)
+
+    ex = make_exchange(OutOfMarginBackend())
+    with pytest.raises(ccxt.InsufficientFunds):
+        ex.place_limit_order("DOGEUSDT", "buy", 0.069, 100, max_attempts=1, post_only=True)
+
+
+class DuplicateClientOrderIdBackend:
+    """Reproduces the real ambiguous-timeout race: attempt 1's HTTP response is lost
+    (RequestTimeout) even though the order was actually accepted exchange-side.
+    place_limit_order's retry loop reuses the same newClientOrderId across attempts
+    (see its own comment, "so an ambiguous timeout retry is idempotent"), so attempt
+    2 gets Binance's real -2010 duplicate-order rejection -- verified against the
+    installed ccxt 4.5.65: a `{"code":-2010,"msg":"Duplicate order sent."}` body
+    raises ccxt.InvalidOrder, not some other type.
+    """
+
+    def __init__(self):
+        self._orders_by_client_id = {}
+        self.create_calls = 0
+        self.fetch_calls = 0
+
+    def create_limit_order(self, symbol, side, amount, price, params):
+        self.create_calls += 1
+        cid = params.get("newClientOrderId")
+        if self.create_calls == 1:
+            # The order actually reaches the exchange and rests there...
+            self._orders_by_client_id[cid] = {
+                "id": "real-order-id-1", "side": side, "clientOrderId": cid, "status": "open",
+            }
+            # ...but the response never makes it back, so the caller sees a timeout.
+            raise ccxt.RequestTimeout("timed out waiting for response")
+        # Attempt 2 reuses that same clientOrderId and gets the real rejection.
+        raise ccxt.InvalidOrder("-2010 Duplicate order sent.")
+
+    def fetch_order(self, order_id, symbol, params=None):
+        self.fetch_calls += 1
+        cid = (params or {}).get("origClientOrderId") or (params or {}).get("clientOrderId")
+        order = self._orders_by_client_id.get(cid)
+        if order is None:
+            raise ccxt.OrderNotFound("no such order")
+        return order
+
+    def fetch_open_orders(self, symbol):
+        return []
+
+    def amount_to_precision(self, symbol, amount):
+        return str(amount)
+
+
+def test_duplicate_client_order_id_after_ambiguous_timeout_recovers_the_real_order():
+    """AUDIT (rejected-finding re-examination, order-placement round). The retry
+    loop reuses one clientOrderId across attempts "so an ambiguous timeout retry is
+    idempotent" -- but until now nothing ever collected on that promise: a genuine
+    -2010 duplicate rejection on a retry was logged as an ERROR and re-raised
+    exactly like any other invalid order, even though a -2010 against THIS call's
+    own freshly-minted clientOrderId can only mean the prior attempt's own order
+    already reached the exchange. Must look it up and return it instead of raising
+    a false failure.
+    """
+    fake = DuplicateClientOrderIdBackend()
+    ex = make_exchange(fake)
+
+    order = ex.place_limit_order("ADAUSDT", "buy", 0.20, 100, max_attempts=3, post_only=False)
+
+    assert order["id"] == "real-order-id-1"
+    assert fake.create_calls == 2, "must not have tried a third create after recovering the order"
+    assert fake.fetch_calls == 1
+
+
+def test_retry_retries_on_bare_operation_failed():
+    """ccxt.OperationFailed is NOT a subclass of NetworkError or ExchangeError (its
+    own __mro__ is (OperationFailed, BaseError, Exception) -- NetworkError derives
+    FROM it, not the other way around). Binance codes like -1008 land here and used
+    to abort _retry on the very first attempt with zero retries, despite _retry
+    existing specifically to retry transient failures."""
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ccxt.OperationFailed("-1008 An unknown error occurred while processing the request")
+        return "ok"
+
+    ex = make_exchange(object())
+    ex.max_retries = 3
+    ex.retry_delay = 0.0
+    assert ex._retry(flaky, label="test call") == "ok"
+    assert calls["n"] == 2
+
+
+def test_retry_gives_bare_operation_failed_the_minus_1008_longer_backoff(monkeypatch):
+    slept = []
+    monkeypatch.setattr("exchange.time.sleep", lambda s: slept.append(s))
+    ex = make_exchange(object())
+    ex.max_retries = 2
+    ex.retry_delay = 0.1
+
+    def always_1008():
+        raise ccxt.OperationFailed("-1008 server overloaded, please try again later")
+
+    with pytest.raises(ccxt.OperationFailed):
+        ex._retry(always_1008, label="test call")
+    assert slept and slept[0] >= 10.0
+
+
+def test_cancel_order_returns_false_on_bare_operation_failed_instead_of_raising():
+    """ccxt.OperationFailed is not a subclass of NetworkError or ExchangeError -- it
+    used to propagate straight out of cancel_order uncaught, breaking the "always
+    returns bool, never raises" contract every caller relies on (e.g.
+    cancel_everything's own verify+retry loop, called with no surrounding try/except
+    at main.py startup)."""
+    class OperationFailedBackend(FakeBackend):
+        def cancel_order(self, order_id, symbol):
+            raise ccxt.OperationFailed("-1008 server overloaded")
+
+        def fapiPrivateDeleteAlgoOrder(self, params):
+            raise ccxt.OperationFailed("-1008 server overloaded")
+
+    ex = make_exchange(OperationFailedBackend([{"id": "1"}]))
+    assert ex.cancel_order("1", "DOGEUSDT") is False
+
+
 class DriftBackend:
     def __init__(self, value):
         self.calls = 0

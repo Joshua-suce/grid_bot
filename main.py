@@ -2676,6 +2676,37 @@ def run_bot() -> None:
                     equity = exchange.get_total_equity()
                     balance = exchange.get_balance()
 
+                    # A stop leg (or any other exchange-side reduce) can fire while the
+                    # grid is paused exactly as it can while active -- pause() keeps the
+                    # position, it does not protect it from ever closing. But unlike the
+                    # active branch (AUDIT #143, detect_external_close call above), nothing
+                    # here watched for that: get_net_position() below just reads whatever
+                    # the exchange reports THIS iteration, so once the account goes flat
+                    # the held_side/held_qty check finds nothing to do, and the eventual
+                    # grid.activate() -> _seed_position_from_exchange() call adopts "flat"
+                    # with no P&L computed at all. The trade vanished from grid.total_pnl,
+                    # from risk.state.consecutive_losses, and from every notification --
+                    # permanently, for whichever ~60% of runtime (AUDIT #52) the grid spends
+                    # paused (AUDIT #143, paused branch).
+                    _paused_closed = grid.detect_external_close(price)
+                    if _paused_closed:
+                        _verified_before = pnl_reconciler.net_realized_pnl
+                        pnl_reconciler.sync(exchange, settings.symbol)
+                        risk.record_cycles(
+                            1, pnl_reconciler.net_realized_pnl - _verified_before,
+                            _paused_closed["profit"],
+                        )
+                        try:
+                            notifier.send(
+                                "&#x26a0; <b>POSITION CLOSED BY THE EXCHANGE (while paused)</b>\n"
+                                f"{_paused_closed['quantity']:.1f} {settings.symbol} "
+                                f"@ ~{_paused_closed['price']}\n"
+                                f"Estimated {_paused_closed['profit']:+.2f} USDT. A stop "
+                                "leg firing is the usual cause."
+                            )
+                        except Exception:
+                            pass
+
                     # A paused strategy is not a flat one. pause() deliberately keeps the
                     # position -- "the position stays under stop protection", per the
                     # Strategy protocol -- and the trend filter pauses on a confirmed

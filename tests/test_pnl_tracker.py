@@ -246,3 +246,87 @@ def test_sync_with_no_new_entries_still_rolls_the_daily_bucket():
     r.sync(fake, "DOGE/USDT")
     assert r.daily_reset_date == _today()
     assert r.daily_net_pnl == 0.0
+
+
+# --- rollover_daily vs. sync()'s defensive reset race ------------------------
+#
+# main.py calls daily_reset_check() -> rollover_daily() once at the very top of
+# each loop iteration, and pnl_reconciler.sync() later in that same iteration
+# (fill-triggered, or the 60-loop periodic fallback). If UTC midnight falls
+# between those two calls, daily_reset_check() still sees "yesterday" and
+# no-ops, while sync()'s _apply_entries -> _ensure_daily_bucket sees "today"
+# and resets the bucket FIRST. Without recovery, the next rollover_daily() call
+# would find daily_reset_date already at today's date, treat it as an ordinary
+# no-op, and hand back whatever sliver has accumulated since the premature
+# reset instead of the real completed-day total.
+
+def test_rollover_daily_recovers_the_true_total_after_a_defensive_reset_races_ahead_of_it():
+    r = PnLReconciler(bootstrapped=True, daily_net_pnl=25.0, daily_reset_date="2020-01-01")
+    fake = _FakeExchange([_entry("REALIZED_PNL", 3.0, _now_ms(), 1)])
+
+    # sync() races ahead: its defensive _ensure_daily_bucket sees "today" and
+    # resets before rollover_daily() has been explicitly called for today at all.
+    r.sync(fake, "DOGE/USDT")
+    assert r.daily_reset_date == _today()
+    assert r.daily_net_pnl == 3.0          # the bucket now holds only today's fresh entry
+
+    # daily_reset_check()'s rollover_daily() now runs for the first time today --
+    # it must recover 2020-01-01's real total (25.0), not misreport today's 3.0.
+    completed = r.rollover_daily(_today())
+    assert completed == 25.0
+    # The recovery reads the snapshot; it must not itself disturb the live bucket.
+    assert r.daily_net_pnl == 3.0
+    assert r.daily_reset_date == _today()
+
+
+def test_rollover_daily_after_recovering_the_race_behaves_as_an_ordinary_noop():
+    r = PnLReconciler(bootstrapped=True, daily_net_pnl=25.0, daily_reset_date="2020-01-01")
+    fake = _FakeExchange([_entry("REALIZED_PNL", 3.0, _now_ms(), 1)])
+    r.sync(fake, "DOGE/USDT")
+    r.rollover_daily(_today())             # first call for today: recovers 25.0
+
+    # A second call the same day is the documented ordinary no-op again: the
+    # live running total, not the stale recovered snapshot.
+    assert r.rollover_daily(_today()) == 3.0
+    assert r.daily_net_pnl == 3.0           # still not reset
+
+
+def test_rollover_daily_with_no_race_is_unaffected_by_the_recovery_path():
+    """The ordinary (non-racing) path -- rollover_daily() itself performs the
+    first flip for the day -- must produce identical results to before this fix."""
+    r = PnLReconciler(daily_net_pnl=25.0, daily_reset_date="2020-01-01")
+    completed = r.rollover_daily("2020-01-02")
+    assert completed == 25.0
+    assert r.daily_net_pnl == 0.0
+    assert r.daily_reset_date == "2020-01-02"
+    # Ordinary same-day no-op still returns the live running total.
+    r.daily_net_pnl = 7.0
+    assert r.rollover_daily("2020-01-02") == 7.0
+
+
+def test_last_completed_daily_pnl_round_trips_through_to_dict():
+    r = PnLReconciler(bootstrapped=True, daily_net_pnl=25.0, daily_reset_date="2020-01-01")
+    fake = _FakeExchange([_entry("REALIZED_PNL", 3.0, _now_ms(), 1)])
+    r.sync(fake, "DOGE/USDT")               # races the defensive reset, sets the pending flag
+    d = r.to_dict()
+    assert d["last_completed_daily_pnl"] == 25.0
+    assert d["_daily_bucket_reset_pending"] is True
+
+    r2 = PnLReconciler.from_dict(d)
+    assert r2.last_completed_daily_pnl == 25.0
+    assert r2._daily_bucket_reset_pending is True
+    # And the restored object still recovers the race exactly like the original would.
+    assert r2.rollover_daily(_today()) == 25.0
+
+
+def test_a_freshly_restored_object_with_no_pending_flag_is_an_ordinary_noop():
+    """Loading state where daily_reset_date already equals today (e.g. a restart
+    shortly after a previous session's own rollover_daily() already ran, or state
+    persisted mid-day with no race involved) must behave as the documented
+    ordinary no-op -- NOT be mistaken for a recoverable race just because the
+    date happens to already match."""
+    r = PnLReconciler.from_dict({
+        "daily_net_pnl": 25.0, "daily_reset_date": "2020-01-02",
+        "last_completed_daily_pnl": 999.0,  # stale/irrelevant -- must not be returned
+    })
+    assert r.rollover_daily("2020-01-02") == 25.0

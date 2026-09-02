@@ -428,14 +428,31 @@ class Exchange:
                     )
                     time.sleep(delay)
                     continue
-                if isinstance(e, (ccxt.RequestTimeout, ccxt.NetworkError)):
+                if isinstance(e, (ccxt.RequestTimeout, ccxt.NetworkError, ccxt.OperationFailed)):
+                    # ccxt.OperationFailed is the base class NetworkError itself derives
+                    # from (verified against the installed ccxt: OperationFailed.__mro__
+                    # is (OperationFailed, BaseError, Exception) -- it is NOT a subclass
+                    # of ExchangeError). Binance codes ccxt maps to a BARE OperationFailed
+                    # rather than any more specific class -- -1008 "server overloaded, try
+                    # again" (which place_limit_order's own separate retry loop already
+                    # treats as a real, must-back-off condition a few hundred lines below),
+                    # plus -1000/-2012/-2020 -- used to fall through every isinstance()
+                    # check here and abort on the FIRST attempt with zero retries, despite
+                    # this method existing specifically to retry transient failures.
                     if not isinstance(e, ccxt.RateLimitExceeded):
                         self._circuit_breaker.record_failure()
                     delay = self.retry_delay * attempt
-                    logger.warning(
-                        "{} failed (attempt {}/{}): {} — retrying in {}s",
-                        label, attempt, attempts, e, delay,
-                    )
+                    if "-1008" in str(e):
+                        delay = max(delay, 10.0)
+                        logger.warning(
+                            "{} throttled by exchange protection (-1008) — backing off {}s",
+                            label, delay,
+                        )
+                    else:
+                        logger.warning(
+                            "{} failed (attempt {}/{}): {} — retrying in {}s",
+                            label, attempt, attempts, e, delay,
+                        )
                     time.sleep(delay)
                 elif isinstance(e, (ccxt.OrderNotFound, ccxt.InvalidOrder)):
                     # "That order does not exist" is a legitimate ANSWER to a probe, not
@@ -780,10 +797,20 @@ class Exchange:
                     side.upper(), amount, symbol, price, order_id, attempt, post_only,
                 )
                 return order
-            except ccxt.InsufficientFunds as e:
-                logger.error("Insufficient funds for {} {} @ {}: {}", side, amount, price, e)
-                raise
-            except ccxt.InvalidOrder as e:
+            except (ccxt.InsufficientFunds, ccxt.InvalidOrder) as e:
+                # Binance's -2019 ("post only order would be immediately matched") is
+                # NOT reliably raised as ccxt.InvalidOrder -- verified against the
+                # installed ccxt (4.5.65, matching requirements.txt's pin): ccxt maps
+                # -2019's real response body to ccxt.InsufficientFunds instead. Catching
+                # only InvalidOrder meant every real post-only-crosses-the-spread event
+                # was caught by the OLD `except ccxt.InsufficientFunds` handler above
+                # (now merged into this one) before it ever reached the -2019 string
+                # check below -- so PostOnlyWouldCross could never fire, every routine
+                # spread-cross logged a false ERROR + Telegram alert, and reduce-only
+                # exits placed with allow_taker_fallback=True never got their taker
+                # fallback at all. Checking the message text on BOTH exception types
+                # (rather than branching on which one ccxt happened to raise) is robust
+                # to that mapping differing across ccxt versions or order types.
                 err_str = str(e)
                 if post_only and ("-2019" in err_str or "would trigger immediate match" in err_str.lower() or "post only" in err_str.lower()):
                     if not allow_taker_fallback:
@@ -842,7 +869,48 @@ class Exchange:
                         side.upper(), amount, symbol, price, order_id, attempt,
                     )
                     return order
-                logger.error("Invalid order: {} {} {} @ {}: {}", side, amount, symbol, price, e)
+                # -2010 "Duplicate order sent": Binance rejects a REUSED newClientOrderId
+                # outright and says nothing about whether the attempt that first used it
+                # actually went through. The retry loop above deliberately reuses
+                # client_order_id "so an ambiguous timeout retry is idempotent" -- but
+                # nothing ever collected on that promise: this exact rejection used to be
+                # treated identically to a genuine invalid order, logged as an ERROR and
+                # re-raised, on the one attempt that should instead recognize the order as
+                # already live. The caller (_place_order_for_level / _handle_fill's
+                # replacement / reconcile_positions, none of which pass max_attempts=1)
+                # then journalled a false order_failed and fired a notifier alert for an
+                # order that was in fact resting or filled on the exchange -- eventually
+                # adopted by the next poll's _existing_open_order scan, but only after the
+                # false alarm.
+                #
+                # client_order_id is a fresh uuid4 minted once above, so a -2010 against
+                # it can only mean a PRIOR ATTEMPT of this exact call already reached the
+                # exchange -- never some unrelated order. Look it up by that id and hand
+                # back the real order instead of raising.
+                if isinstance(e, ccxt.InvalidOrder) and ("-2010" in err_str or "duplicate order" in err_str.lower()):
+                    logger.warning(
+                        "DUPLICATE CLIENT ORDER ID | {} {} @ {} rejected -2010 on attempt "
+                        "{} — a prior attempt likely already placed it; looking it up",
+                        side.upper(), amount, price, attempt,
+                    )
+                    existing = self.fetch_order(client_order_id, symbol, params={"origClientOrderId": client_order_id})
+                    if existing is not None and existing.get("id"):
+                        logger.info(
+                            "ORDER RECOVERED | {} {} {} @ {} (id={}) — a prior attempt's "
+                            "order was found live, not raising a false failure",
+                            side.upper(), amount, symbol, price, existing["id"],
+                        )
+                        return existing
+                    logger.error(
+                        "DUPLICATE CLIENT ORDER ID | {} {} @ {} — could not recover the "
+                        "prior attempt's order, treating -2010 as a genuine failure",
+                        side.upper(), amount, price,
+                    )
+                    raise
+                if isinstance(e, ccxt.InsufficientFunds):
+                    logger.error("Insufficient funds for {} {} @ {}: {}", side, amount, price, e)
+                else:
+                    logger.error("Invalid order: {} {} {} @ {}: {}", side, amount, symbol, price, e)
                 raise
             except Exception as e:
                 last_err = e
@@ -880,7 +948,14 @@ class Exchange:
         except ccxt.OrderNotFound:
             logger.debug("Cancel order {} — already gone", order_id)
             return True
-        except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+        except (ccxt.NetworkError, ccxt.ExchangeError, ccxt.OperationFailed) as e:
+            # ccxt.OperationFailed is the base class NetworkError derives from and is
+            # NOT itself a subclass of NetworkError or ExchangeError (verified against
+            # the installed ccxt) -- codes like -1008 land here as a bare OperationFailed
+            # and used to propagate straight out of this method uncaught, which breaks
+            # the "always returns bool, never raises" contract every caller (including
+            # cancel_everything's own verify+retry loop, called with no surrounding
+            # try/except at main.py startup) relies on.
             if self._is_timestamp_error(e):
                 self._sync_time()
                 try:
@@ -917,10 +992,15 @@ class Exchange:
     def get_positions(self, symbol: str) -> list[dict]:
         return self._retry(self.exchange.fetch_positions, [symbol], label="fetch_positions")
 
-    def fetch_order(self, order_id: str, symbol: str, max_attempts: int = 3, delay: float = 1.0) -> dict | None:
+    def fetch_order(self, order_id: str, symbol: str, max_attempts: int = 3, delay: float = 1.0,
+                     params: dict | None = None) -> dict | None:
+        # `params` lets a caller look an order up by origClientOrderId instead of the
+        # exchange-assigned id -- ccxt's binance fetch_order honours params['origClientOrderId']/
+        # ['clientOrderId'] over the positional id when present (see place_limit_order's
+        # -2010 recovery, the one caller that needs this).
         for attempt in range(1, max_attempts + 1):
             try:
-                return self._retry(self.exchange.fetch_order, order_id, symbol, label="fetch_order")
+                return self._retry(self.exchange.fetch_order, order_id, symbol, params or {}, label="fetch_order")
             except (ccxt.OrderNotFound, ccxt.InvalidOrder) as e:
                 if attempt < max_attempts:
                     logger.debug(

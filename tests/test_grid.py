@@ -256,6 +256,108 @@ def test_handle_fill_fills_buy_level_replaces_at_next_sell_level():
     assert filled_level.order_id == "ORDER-SELL-11500"
 
 
+def test_handle_fill_replacement_respects_open_loss_budget_when_it_would_add_exposure():
+    """AUDIT (order-placement round). _handle_fill's replacement placement -- the
+    ordinary, every-fill path, not an emergency one -- has checked the position cap
+    since AUDIT #49, but never asked apply_open_loss_guard's own flags:
+    _loss_block_buys/_loss_block_sells, the guard _place_order_for_level checks
+    before it will ever open exposure. Skipping it here let a fill's own
+    replacement re-open exposure on the exact side the open-loss budget had just
+    told every OTHER placement path to stop averaging into.
+    """
+    class FakeExchange:
+        class exchange:
+            @staticmethod
+            def amount_to_precision(symbol, amount):
+                return f"{amount:.6f}"
+            @staticmethod
+            def price_to_precision(symbol, price):
+                return f"{price:.2f}"
+
+        def __init__(self):
+            self.placed = []
+
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
+            self.placed.append((side, price, amount, params))
+            return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
+
+    ex = FakeExchange()
+    grid = GridEngine(
+        exchange=ex,
+        symbol="TEST",
+        grid_lower=100.0,
+        grid_upper=120.0,
+        grid_count=5,
+        capital_per_grid_pct=0.1,
+        stop_loss_pct=0.03,
+    )
+    grid.levels = [
+        GridLevel(price=105.0, side="buy", quantity=1.0, entry_price=105.0, order_id="BUY-105"),
+        GridLevel(price=110.0, side="sell", quantity=1.0, entry_price=105.0),
+    ]
+    # No net long is known to the reduce-only mirror in this fixture, so the sell
+    # replacement reads as OPENING exposure -- exactly the case the new guard covers.
+    grid._loss_block_sells = True
+
+    level = grid.levels[0]
+    grid._handle_fill(level, balance=1000.0)
+
+    assert ex.placed == [], "must not attempt a replacement blocked by the open loss budget"
+    assert level.order_id is None
+    assert level.status == "pending"
+
+
+def test_handle_fill_replacement_respects_profit_lock_when_it_would_add_exposure():
+    """Same fix, the other new guard: a fill's own replacement must not re-open
+    exposure on the side that would ADD to the position the instant after
+    apply_profit_lock_guard told every other placement path to stop, mirroring
+    _place_order_for_level's own adding_side check (a side is only ever this
+    position's entry OR its exit, never both).
+    """
+    class FakeExchange:
+        class exchange:
+            @staticmethod
+            def amount_to_precision(symbol, amount):
+                return f"{amount:.6f}"
+            @staticmethod
+            def price_to_precision(symbol, price):
+                return f"{price:.2f}"
+
+        def __init__(self):
+            self.placed = []
+
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
+            self.placed.append((side, price, amount, params))
+            return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
+
+    ex = FakeExchange()
+    grid = GridEngine(
+        exchange=ex,
+        symbol="TEST",
+        grid_lower=90.0,
+        grid_upper=110.0,
+        grid_count=5,
+        capital_per_grid_pct=0.1,
+        stop_loss_pct=0.03,
+    )
+    grid.levels = [
+        GridLevel(price=100.0, side="sell", quantity=1.0, entry_price=95.0, fill_count=1, order_id="SELL-100"),
+        GridLevel(price=95.0, side="buy", quantity=1.0, entry_price=95.0),
+    ]
+    # A pre-existing long from other levels; this sell only partly closes it, so buy
+    # is still the adding side (and the replacement's side) after this fill.
+    grid._pos_qty = 10.0
+    grid._pos_entry = 100.0
+    grid._profit_lock_active = True
+
+    level = grid.levels[0]
+    grid._handle_fill(level, balance=1000.0)
+
+    assert ex.placed == [], "must not attempt a replacement blocked by profit lock"
+    assert level.order_id is None
+    assert level.status == "pending"
+
+
 def test_grid_engine_stop_loss_price():
     class FakeExchange:
         class exchange:
@@ -914,6 +1016,121 @@ def test_place_order_skips_when_scaled_below_min_notional():
     assert ex.placed == [], "must not attempt a placement that's guaranteed to be rejected"
 
 
+def test_place_order_for_a_released_rung_is_clamped_and_tagged_reduce_only():
+    """_release_awaiting_levels resets a rung's side/price/status back to 'pending'
+    but never touches level.quantity, and this generic path re-sizes off fresh
+    capital with no reduceOnly tag at all -- the one placement path in the file that
+    never asked _exit_order_params whether the level it's about to place is actually
+    this position's own exit (every other path that closes known inventory --
+    _handle_fill's replacement, _place_exit_reprice, reconcile_positions,
+    _unwind_position_through_grid -- already does). A released sell rung while a
+    small long is open must go out reduceOnly and clamped to what's actually
+    closable, not full-capital-sized and able to flip the position into a fresh
+    short no position-limit/loss/profit-lock gate ever evaluated as an entry.
+    """
+    class FakeExchange:
+        def __init__(self):
+            class _ex:
+                @staticmethod
+                def amount_to_precision(symbol, amount):
+                    return f"{float(amount):.6f}"
+                @staticmethod
+                def price_to_precision(symbol, price):
+                    return f"{price:.2f}"
+            self.exchange = _ex()
+            self.placed = []
+
+        def get_open_orders(self, symbol):
+            return []
+
+        def can_place_order(self, symbol):
+            return True
+
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
+            self.placed.append((side, price, amount, params))
+            return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
+
+    ex = FakeExchange()
+    grid = GridEngine(
+        exchange=ex,
+        symbol="TEST",
+        grid_lower=100.0,
+        grid_upper=120.0,
+        grid_count=5,
+        capital_per_grid_pct=0.1,
+        stop_loss_pct=0.03,
+    )
+    # 100 USDT/grid at price 115 freshly sizes to ~0.869 -- far more than the 0.5 the
+    # open long can actually absorb as an exit.
+    grid._net_long_qty = 0.5
+    grid._net_short_qty = 0.0
+    level = GridLevel(price=115.0, side="sell", quantity=999.0)  # stale pre-release qty
+
+    result = grid._place_order_for_level(level, balance=1000.0)
+
+    assert result is True
+    side, price, amount, params = ex.placed[-1]
+    assert side == "sell"
+    assert float(amount) == pytest.approx(0.5, rel=1e-6), (
+        "must clamp to the closable 0.5, not the fresh-capital-sized 0.869"
+    )
+    assert params["reduceOnly"] is True
+    assert params["postOnly"] is False
+    assert params["purpose"] == "grid_exit"
+    assert level.quantity == pytest.approx(0.5, rel=1e-6)
+
+
+def test_place_order_for_a_genuine_new_entry_stays_untagged():
+    """The other half of the same fix: a level with nothing to close (flat, or the
+    position is on the other side) must still go out as a plain grid_entry, not
+    reduceOnly -- _exit_order_params returning None must not get lost on the way to
+    place_limit_order's params.
+    """
+    class FakeExchange:
+        def __init__(self):
+            class _ex:
+                @staticmethod
+                def amount_to_precision(symbol, amount):
+                    return f"{float(amount):.6f}"
+                @staticmethod
+                def price_to_precision(symbol, price):
+                    return f"{price:.2f}"
+            self.exchange = _ex()
+            self.placed = []
+
+        def get_open_orders(self, symbol):
+            return []
+
+        def can_place_order(self, symbol):
+            return True
+
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
+            self.placed.append((side, price, amount, params))
+            return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
+
+    ex = FakeExchange()
+    grid = GridEngine(
+        exchange=ex,
+        symbol="TEST",
+        grid_lower=100.0,
+        grid_upper=120.0,
+        grid_count=5,
+        capital_per_grid_pct=0.1,
+        stop_loss_pct=0.03,
+    )
+    grid._net_long_qty = 0.0
+    grid._net_short_qty = 0.0
+    level = GridLevel(price=115.0, side="sell", quantity=1.0)
+
+    result = grid._place_order_for_level(level, balance=1000.0)
+
+    assert result is True
+    side, price, amount, params = ex.placed[-1]
+    assert params.get("reduceOnly") is not True
+    assert params["purpose"] == "grid_entry"
+    assert float(amount) == pytest.approx(100.0 / 115.0, rel=1e-3)
+
+
 def test_grid_engine_to_dict():
     class FakeExchange:
         class exchange:
@@ -1264,6 +1481,78 @@ def test_check_fills_marks_vanished_sell_dead_when_only_long_position():
     assert grid.levels[0].status == "pending"
 
 
+def test_check_fills_does_not_skip_a_level_when_a_fill_reorders_self_levels():
+    """AUDIT (order-placement round). check_fills iterates `for level in self.levels`
+    directly, and _handle_fill's own replacement placement ends with
+    `self.levels.sort(key=lambda l: l.price)` -- an in-place reorder of the exact list
+    the for-loop's iterator is walking, mid-iteration. CPython's list iterator tracks
+    a plain integer index into the list object; sorting the list underneath it can
+    move an unvisited level to an index already passed (silently skipping it this
+    cycle) while moving the just-processed level into a not-yet-visited slot
+    (revisiting it, this time under its brand-new order_id).
+
+    Three buy levels A(10)/B(20)/C(30), all "gone" from the open-orders snapshot. A
+    fills and its sell replacement reprices far up the ladder (past both B and C), so
+    the post-fill sort reorders to [B, C, A]. The for-loop's cursor, now at index 1,
+    reads C there instead of B -- B is never checked this cycle at all.
+    """
+    class FakeExchange:
+        class exchange:
+            @staticmethod
+            def amount_to_precision(symbol, amount):
+                return f"{amount:.6f}"
+            @staticmethod
+            def price_to_precision(symbol, price):
+                return f"{price:.2f}"
+
+        def __init__(self):
+            self.fetch_calls = []
+            self._known = {
+                "OID-A": {"status": "closed", "filled": 1.0, "id": "OID-A"},
+                "OID-C": {"status": "open"},
+            }
+
+        def get_open_orders(self, symbol):
+            return []
+
+        def fetch_order(self, order_id, symbol):
+            self.fetch_calls.append(order_id)
+            return self._known.get(order_id)
+
+        def get_positions(self, symbol):
+            return []
+
+        def can_place_order(self, symbol):
+            return True
+
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
+            return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
+
+    ex = FakeExchange()
+    grid = GridEngine(
+        exchange=ex,
+        symbol="TEST",
+        grid_lower=0.0,
+        grid_upper=1000.0,
+        grid_count=10,
+        capital_per_grid_pct=0.1,
+        stop_loss_pct=0.03,
+    )
+    grid.levels = [
+        GridLevel(price=10.0, side="buy", quantity=1.0, order_id="OID-A"),
+        GridLevel(price=20.0, side="buy", quantity=1.0, order_id="OID-B"),
+        GridLevel(price=30.0, side="buy", quantity=1.0, order_id="OID-C"),
+    ]
+
+    grid.check_fills(balance=1000.0)
+
+    assert "OID-B" in ex.fetch_calls, (
+        "level B's order was never checked this cycle — the sort triggered by A's "
+        "fill reordered self.levels out from under the for-loop's index cursor and "
+        "B's turn was skipped entirely"
+    )
+
+
 def test_check_fills_retries_unfilled_levels():
     """A pending level that failed to place (quantity=0, no order_id) must be
     retried on the next check_fills cycle so a flaky backend does not kill the grid.
@@ -1526,6 +1815,73 @@ def test_recenter_unwinds_position_through_reduceonly_sells():
         assert level.entry_price == 0.070
 
 
+def test_unwind_shrinks_level_count_so_a_small_position_still_gets_an_exit():
+    """AUDIT #144, 2026-09-01: _unwind_position_through_grid used to divide the
+    remaining position EVENLY across every qualifying exit level up front, then check
+    each slice against MIN_NOTIONAL_USDT one at a time -- so a small position split
+    many ways could put EVERY slice under the exchange's $5 floor even though the
+    undivided amount (or a split across fewer levels) would clear it easily. Every
+    slice then failed the per-level check and got silently skipped (DEBUG-only log),
+    leaving the position with NO exit resting on the ladder at all -- just the raw
+    stop-loss as a backstop -- until it fired and closed the position externally with
+    only an ESTIMATED P&L to show for it. The fix shrinks the level count until each
+    slice clears the floor instead of dividing thinner across levels the position
+    can't support: a 49-unit long split six ways here comes to ~$1.63/slice (under
+    $5), so it must fall back to fewer levels rather than placing zero orders.
+    """
+    class FakeExchange:
+        def __init__(self):
+            class _ex:
+                @staticmethod
+                def amount_to_precision(symbol, amount):
+                    return f"{amount:.6f}"
+                @staticmethod
+                def price_to_precision(symbol, price):
+                    return f"{price:.6f}"
+            self.exchange = _ex()
+            self.sell_params = []
+            self._order_id = 0
+
+        def get_positions(self, symbol):
+            return [{"side": "long", "contracts": 49.0, "entryPrice": 0.1970}]
+
+        def place_limit_order(self, symbol, side, price, amount, params=None,
+                               max_attempts=1, post_only=True, allow_taker_fallback=False):
+            self._order_id += 1
+            self.sell_params.append({"side": side, "price": price, "amount": amount})
+            return {"id": f"ORDER-{self._order_id}"}
+
+    ex = FakeExchange()
+    grid = GridEngine(
+        exchange=ex,
+        symbol="ADAUSDT",
+        grid_lower=0.19,
+        grid_upper=0.21,
+        grid_count=12,
+        capital_per_grid_pct=0.1,
+        stop_loss_pct=0.03,
+    )
+    grid.active = True
+    # Six free sell levels above break-even (entry 0.1970), all priced close enough
+    # together that dividing the 49-unit position six ways puts every slice's notional
+    # (49/6 * ~0.20 =~ $1.63) well under the $5 floor.
+    grid.levels = [
+        GridLevel(price=round(0.1999 + i * 0.001, 6), side="sell", order_id=None)
+        for i in range(6)
+    ]
+
+    grid._unwind_position_through_grid(balance=1000.0)
+
+    assert len(ex.sell_params) >= 1, \
+        "a small position must still get at least one reduce-only exit placed, not zero"
+    total_qty = sum(o["amount"] for o in ex.sell_params)
+    assert total_qty == pytest.approx(49.0, abs=0.01), \
+        "the full position should ride through the level(s) actually used"
+    for o in ex.sell_params:
+        assert o["amount"] * o["price"] >= 5.0, \
+            "every placed slice must clear MIN_NOTIONAL_USDT, not just the undivided total"
+
+
 def test_recenter_forced_when_grid_goes_one_sided_above():
     """A grid with zero active sell orders sitting under a price above the grid is
     dead even when price is inside the margin band — recenter must force through
@@ -1587,6 +1943,67 @@ def test_recenter_forced_when_grid_goes_one_sided_above():
 
     assert result is True, "one-sided grid above price must recenter inside margin band"
     assert any(l.side == "sell" for l in grid.levels), "rebuilt grid must have sell levels"
+
+
+def test_recenter_leaves_grid_inactive_when_rebuild_places_no_orders():
+    """AUDIT (order-placement round). recenter() set self.active = True
+    unconditionally after rebuilding the ladder, unlike activate() (which only does
+    so when get_tracked_order_ids() is actually non-empty). A rebuild where every
+    level fails to place -- exchange down, every order rejected -- left the grid
+    reporting itself active with a completely empty book: healthy-looking to
+    everything downstream while nothing on it could ever fill.
+    """
+    class FakeExchange:
+        class exchange:
+            @staticmethod
+            def amount_to_precision(symbol, amount):
+                return f"{amount:.6f}"
+            @staticmethod
+            def price_to_precision(symbol, price):
+                return f"{price:.6f}"
+
+        def cancel_everything(self, symbol, timeout_seconds=300.0, keep_stops=False):
+            return 0
+
+        def get_open_order_ids(self, symbol):
+            return {}
+
+        def get_positions(self, symbol):
+            return []
+
+        def get_open_orders(self, symbol):
+            return []
+
+        def can_place_order(self, symbol):
+            return False  # every placement attempt refuses, as if the exchange were down
+
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
+            raise AssertionError("can_place_order already refused — should never be reached")
+
+    ex = FakeExchange()
+    grid = GridEngine(
+        exchange=ex,
+        symbol="TEST",
+        grid_lower=90.0,
+        grid_upper=110.0,
+        grid_count=5,
+        capital_per_grid_pct=0.1,
+        stop_loss_pct=0.03,
+    )
+    grid.active = True
+    grid.levels = [
+        GridLevel(price=100.0, side="buy", order_id="B1"),
+        GridLevel(price=102.0, side="buy", order_id="B2"),
+        GridLevel(price=104.0, side="buy", order_id="B3"),
+        GridLevel(price=106.0, side="buy", order_id="B4"),
+        GridLevel(price=108.0, side="buy", order_id="B5"),
+    ]
+
+    result = grid.recenter(current_price=110.8, balance=1000.0, margin_pct=0.008)
+
+    assert result is True, "recenter still rebuilds — it just must not claim to be active with nothing on the book"
+    assert grid.active is False
+    assert grid.get_tracked_order_ids() == set()
 
 
 def test_recenter_forced_when_grid_goes_one_sided_below():
@@ -1949,6 +2366,105 @@ def test_reduceonly_sell_params_and_market_close():
     assert ex.closed is not None
     # ensure when market close used, no new limit params recorded
     assert ex.last_place_params is None
+
+
+def test_reconcile_hedge_skips_when_below_min_notional():
+    """reconcile_positions re-runs on every poll that still sees the position, so a
+    hedge whose notional rounds under the exchange's minimum (dust left behind by a
+    partial fill, or a small position on a low-price symbol) must be skipped, not
+    attempted -- _place_order_for_level has checked this since AUDIT #164's
+    neighbour fix, but this placement path never did, so it would spend one
+    guaranteed-rejection API call and one ERROR log every single reconcile cycle
+    instead of skipping cleanly.
+    """
+    class FakeExchange:
+        def __init__(self):
+            self.placed = []
+            class _ex:
+                @staticmethod
+                def amount_to_precision(symbol, amount):
+                    return f"{amount:.6f}"
+                @staticmethod
+                def price_to_precision(symbol, price):
+                    return f"{price:.2f}"
+            self.exchange = _ex()
+
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
+            self.placed.append((side, price, amount, params))
+            return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
+
+        def get_positions(self, symbol):
+            # 0.01 @ ~104 hedge price is ~1.04 USDT notional, under the 5 USDT floor.
+            return [{"side": "long", "contracts": 0.01, "entryPrice": 100.0}]
+
+    ex = FakeExchange()
+    grid = GridEngine(
+        exchange=ex,
+        symbol="TEST",
+        grid_lower=90.0,
+        grid_upper=110.0,
+        grid_count=5,
+        capital_per_grid_pct=0.1,
+        stop_loss_pct=0.03,
+        use_market_close_on_replace=False,
+    )
+    # No other sell level in the ladder: the orphaned-sell sweep at the end of
+    # reconcile_positions would otherwise independently place one and mask what
+    # this test is isolating (the hedge placement itself).
+    grid.levels = [
+        GridLevel(price=95.0, side="buy", quantity=2.0, entry_price=95.0),
+        GridLevel(price=100.0, side="buy", quantity=2.0, entry_price=100.0),
+    ]
+
+    grid.reconcile_positions()
+
+    assert ex.placed == [], "must not attempt a hedge that's guaranteed to be rejected"
+
+
+def test_reconcile_orphaned_sell_skips_when_below_min_notional():
+    """Same fix, the second placement site: an orphaned reduce-only sell level whose
+    quantity rounds to dust notional must be skipped rather than attempted every
+    reconcile cycle.
+    """
+    class FakeExchange:
+        def __init__(self):
+            self.placed = []
+            class _ex:
+                @staticmethod
+                def amount_to_precision(symbol, amount):
+                    return f"{amount:.6f}"
+                @staticmethod
+                def price_to_precision(symbol, price):
+                    return f"{price:.2f}"
+            self.exchange = _ex()
+
+        def place_limit_order(self, symbol, side, price, amount, params=None, max_attempts=1, post_only=True, allow_taker_fallback=False):
+            self.placed.append((side, price, amount, params))
+            return {"id": f"ORDER-{side.upper()}-{int(price*100)}"}
+
+        def get_positions(self, symbol):
+            return [{"side": "long", "contracts": 5.0, "entryPrice": 100.0}]
+
+    ex = FakeExchange()
+    grid = GridEngine(
+        exchange=ex,
+        symbol="TEST",
+        grid_lower=90.0,
+        grid_upper=110.0,
+        grid_count=5,
+        capital_per_grid_pct=0.1,
+        stop_loss_pct=0.03,
+        use_market_close_on_replace=False,
+    )
+    # No buy level, so the hedge-matching loop finds nothing for the long position and
+    # falls straight through to the orphaned-sell sweep at the end of the function.
+    grid.levels = [
+        GridLevel(price=106.0, side="sell", quantity=0.01, order_id=None, status="pending"),
+    ]
+
+    grid.reconcile_positions()
+
+    assert ex.placed == [], "must not attempt an orphaned sell that's guaranteed to be rejected"
 
 
 def test_burst_of_fills_distributes_replacements_across_slots():

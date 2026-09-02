@@ -58,6 +58,16 @@ class PnLReconciler:
     # safety net in case a UTC day rolls over without that call landing first.
     daily_net_pnl: float = 0.0
     daily_reset_date: str = ""
+    # Snapshot of whichever day's total most recently got closed out, taken by
+    # whichever of rollover_daily() / _ensure_daily_bucket()'s defensive reset
+    # performed that transition. _daily_bucket_reset_pending is True only in the
+    # narrow window where _ensure_daily_bucket did it and rollover_daily has not
+    # yet been told -- NOT simply whenever daily_reset_date already equals
+    # "today" (that's also true of an ordinary freshly-restored/constructed
+    # object, which must keep behaving as an ordinary no-op). See both methods'
+    # own docstrings for the race this closes.
+    last_completed_daily_pnl: float = 0.0
+    _daily_bucket_reset_pending: bool = field(default=False, repr=False)
     # UTC millisecond epoch the cumulative totals are measured FROM, or None for the
     # rolling BOOTSTRAP_LOOKBACK_DAYS window. Persisted so a change to PNL_EPOCH is
     # detectable on the next start -- see reset_for_epoch (AUDIT #60).
@@ -128,6 +138,8 @@ class PnLReconciler:
             "daily_net_pnl": self.daily_net_pnl,
             "daily_reset_date": self.daily_reset_date,
             "epoch_ms": self.epoch_ms,
+            "last_completed_daily_pnl": self.last_completed_daily_pnl,
+            "_daily_bucket_reset_pending": self._daily_bucket_reset_pending,
         }
 
     @classmethod
@@ -144,6 +156,8 @@ class PnLReconciler:
             daily_net_pnl=float(d.get("daily_net_pnl", 0.0)),
             daily_reset_date=str(d.get("daily_reset_date", "")),
             epoch_ms=(int(d["epoch_ms"]) if d.get("epoch_ms") is not None else None),
+            last_completed_daily_pnl=float(d.get("last_completed_daily_pnl", 0.0)),
+            _daily_bucket_reset_pending=bool(d.get("_daily_bucket_reset_pending", False)),
         )
 
     @staticmethod
@@ -152,10 +166,27 @@ class PnLReconciler:
 
     def _ensure_daily_bucket(self, today: str) -> None:
         """Zero the daily bucket the first time `today` differs from the stored
-        `daily_reset_date`. Defensive/idempotent — safe to call every sync."""
+        `daily_reset_date`. Defensive/idempotent — safe to call every sync.
+
+        Snapshots the day being closed out into `last_completed_daily_pnl` first,
+        exactly like rollover_daily() does. Without this, if THIS defensive reset
+        is the one that ends up flipping daily_reset_date to the new day —
+        racing ahead of main.py's own daily_reset_check() -> rollover_daily()
+        call within the same loop iteration (daily_reset_check() runs once at
+        the top of the iteration; sync() can run later in that same iteration —
+        a UTC midnight landing between them makes rollover_daily() see
+        "yesterday" and no-op, then sync()'s _apply_entries -> here sees "today"
+        and resets first) — the completed day's real total would otherwise be
+        discarded with nothing left to recover it from, and rollover_daily()'s
+        very next call would find the bucket already at today's date and hand
+        back whatever has accumulated since the premature reset instead of the
+        true total.
+        """
         if self.daily_reset_date != today:
+            self.last_completed_daily_pnl = self.daily_net_pnl
             self.daily_reset_date = today
             self.daily_net_pnl = 0.0
+            self._daily_bucket_reset_pending = True
 
     def rollover_daily(self, today: str | None = None) -> float:
         """Snapshot the just-completed day's net PnL and reset the bucket for `today`.
@@ -165,15 +196,34 @@ class PnLReconciler:
         in the daily summary is captured before it's zeroed. A no-op (returns
         the current running total without resetting) if `today` is already the
         active bucket's date -- callers can invoke this every loop iteration
-        without worrying about double-resetting.
+        without worrying about double-resetting. This also covers a fresh or
+        restored object that simply already has `daily_reset_date` set to
+        `today` with no race involved at all -- the ordinary no-op is correct
+        there too.
+
+        Exception to that no-op: if `_ensure_daily_bucket()`'s defensive reset
+        is what most recently flipped `daily_reset_date` to `today` (flagged by
+        `_daily_bucket_reset_pending` -- a same-iteration sync() racing ahead of
+        THIS call, see its docstring) and this method has not yet been told,
+        the live running bucket no longer holds the completed day's total -- it
+        holds only whatever has accumulated since that premature reset. The
+        first call for `today` in that case returns the snapshot
+        _ensure_daily_bucket() took instead of the live (near-zero) bucket and
+        clears the flag; every call after that behaves exactly as documented
+        above.
         """
         if today is None:
             today = self._utc_today()
         if self.daily_reset_date == today:
+            if self._daily_bucket_reset_pending:
+                self._daily_bucket_reset_pending = False
+                return self.last_completed_daily_pnl
             return self.daily_net_pnl
         completed = self.daily_net_pnl
+        self.last_completed_daily_pnl = completed
         self.daily_reset_date = today
         self.daily_net_pnl = 0.0
+        self._daily_bucket_reset_pending = False
         return completed
 
     def _apply_entries(self, entries: list[dict]) -> int:

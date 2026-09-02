@@ -309,6 +309,39 @@ def test_recenter_preserves_trailing_stop_while_long_is_open():
     assert grid.get_stop_loss_price() >= protected - 1e-12
 
 
+def test_recenter_preserves_trailing_stop_when_pos_qty_shows_a_position_but_net_mirror_is_stale():
+    """AUDIT (rejected-finding re-examination, order-placement round). recenter()'s
+    trailing-stop reanchor block checked ONLY _net_long_qty/_net_short_qty -- the
+    exchange-position mirror, refreshed by set_position_limit/_refresh_net_counters
+    and left at its LAST value on a failed read rather than raising -- while the
+    'flat' gate a few dozen lines above it in the same function was already
+    hardened to also check _pos_qty, this ladder's own locally-updated tracker,
+    current the instant a fill is applied. The trailing-stop block never got the
+    same fix.
+
+    test_recenter_preserves_trailing_stop_while_long_is_open (above) only ever
+    exercises the case where set_position_limit has already run and the mirror
+    agrees with _pos_qty -- it cannot catch this gap. This pins the case the
+    mirror hasn't caught up yet: _pos_qty shows a real long (set the way a fill
+    actually sets it) while _net_long_qty/_net_short_qty are still their default
+    0.0, exactly the state a failed exchange-position read leaves them in.
+    """
+    ex = FakeExchange()
+    grid = make_engine(ex)
+    grid.initialize(0.0720, balance=5000)
+    grid._pos_qty = 5000.0
+    grid._pos_entry = 0.0720
+
+    grid.update_trailing_sl(0.0760)
+    protected = grid.get_stop_loss_price()
+
+    grid._last_recenter_time = 0.0
+    grid.recenter(0.0700, balance=5000, margin_pct=0.001)
+
+    assert grid._peak_price == pytest.approx(0.0760), "recenter wiped the high-water mark"
+    assert grid.get_stop_loss_price() >= protected - 1e-12
+
+
 def test_recenter_reanchors_trailing_stop_when_flat():
     ex = FakeExchange()
     grid = make_engine(ex)

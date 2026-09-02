@@ -2004,12 +2004,36 @@ class GridEngine:
         if level.side == "sell" and self._loss_block_sells:
             logger.debug("SKIP SELL ORDER | open loss budget exhausted")
             return False
-        if level.side == "buy" and self._profit_lock_active:
-            logger.debug("SKIP BUY ORDER | daily profit lock active")
-            return False
-        if level.side == "sell" and self._profit_lock_active:
-            logger.debug("SKIP SELL ORDER | daily profit lock active")
-            return False
+        if self._profit_lock_active:
+            # Mirror apply_profit_lock_guard's own trip-time cancellation (fixed
+            # earlier this session for the 2026-08-31 incident): in one-way netted
+            # mode a side is only ever an entry OR the current position's own exit,
+            # never both, and which one flips with which way the position is held.
+            # Blocking BOTH sides unconditionally here -- even the side that only
+            # ever REDUCES the current position -- starves that exit right when a
+            # recenter also wipes the whole ladder to rebuild it: every level in the
+            # fresh grid, including the ones that would have been the position's
+            # only remaining exit, reaches this gate as a "new" order and gets
+            # refused right alongside genuine new entries.
+            #
+            # 2026-09-01 incident: profit lock tripped at 16:39, then a recenter at
+            # 18:29 rebuilt the ladder around a 49 ADA long with this gate still
+            # blocking both sides -- all 12 fresh levels failed to place (0 placed),
+            # leaving the position with no working exit at all. DORMANT WITH
+            # EXPOSURE fired 15 minutes later; the raw exchange stop-loss eventually
+            # closed the position with nothing on the ladder watching, so the bot
+            # could only book an ESTIMATED P&L (-0.13) that turned out to differ
+            # from the exchange-verified figure (-0.16) once reconciliation caught
+            # up -- exactly the "P&L not adding up" symptom this fix closes.
+            if self._pos_qty > 0:
+                adding_side = "buy"
+            elif self._pos_qty < 0:
+                adding_side = "sell"
+            else:
+                adding_side = None  # flat: both sides would open new exposure
+            if adding_side is None or level.side == adding_side:
+                logger.debug("SKIP {} ORDER | daily profit lock active", level.side.upper())
+                return False
         if self._would_realise_a_loss(level.side, level.price):
             be = self._position_break_even()
             ceiling = self._stuck_exit_ceiling(level.side)
@@ -2102,6 +2126,19 @@ class GridEngine:
             else:
                 quantity *= self._sell_scale
             quantity = self.exchange.exchange.amount_to_precision(self.symbol, quantity)
+            # A level reaches this generic, freshly-capital-sized path whether it is a
+            # brand-new rung or one _release_awaiting_levels just handed back after its
+            # counter-slot freed, its rung re-armed, or a ladder hole was patched. In
+            # any of those cases level.side can be this position's own exit -- but
+            # nothing here asked, so it went out sized off fresh capital instead of the
+            # position it was actually closing, and without reduceOnly. _handle_fill's
+            # replacement (the ordinary, every-fill path) never places without asking
+            # _exit_order_params this same question first; this path never asked it,
+            # so a released rung could silently flip the position's direction and open
+            # brand-new exposure that no position-limit/loss/profit-lock gate above
+            # ever evaluated as an entry, because it never looked like one.
+            exit_params, quantity = self._exit_order_params(level.side, float(quantity))
+            quantity = self.exchange.exchange.amount_to_precision(self.symbol, quantity)
         except Exception as e:
             logger.error("PLACE ORDER PRECHECK FAILED @ {} {} | {}", level.side.upper(), level.price, e)
             return False
@@ -2121,9 +2158,13 @@ class GridEngine:
             )
             return False
         try:
+            # Same tag convention as _handle_fill's replacement: reduceOnly when this
+            # order actually closes known inventory, grid_entry when it doesn't.
+            order_params = dict(exit_params or {})
+            order_params["purpose"] = "grid_exit" if order_params.get("reduceOnly") else "grid_entry"
             order = self.exchange.place_limit_order(
                 self.symbol, level.side, level.price, float(quantity), max_attempts=1,
-                params={"purpose": "grid_entry"},
+                params=order_params,
             )
             if "id" not in order:
                 raise ValueError("Order response missing 'id'")
@@ -2475,6 +2516,21 @@ class GridEngine:
             qty = self.exchange.exchange.amount_to_precision(self.symbol, amt)
             if float(qty) <= 0:
                 continue
+            # Every other placement path in this file checks notional against the
+            # exchange floor before spending an API call on an order that is
+            # guaranteed-rejected (-4164) -- _place_order_for_level since AUDIT #164's
+            # neighbour fix. This one didn't, and reconcile_positions re-runs on every
+            # poll that still sees the position, so a hedge that rounds under the
+            # floor (dust left behind by partial fills, or a tiny position on a low-
+            # price symbol) logged the same ERROR and burned the same rate-limit
+            # budget every single cycle instead of once.
+            if float(qty) * hedge_price < MIN_NOTIONAL_USDT:
+                logger.debug(
+                    "RECONCILE SKIP HEDGE | {} @ {} notional {:.2f} < {:.2f} minimum — "
+                    "would be guaranteed-rejected, not attempting",
+                    hedge_side, hedge_price, float(qty) * hedge_price, MIN_NOTIONAL_USDT,
+                )
+                continue
             try:
                 # Market-closing the whole position on every reconcile realized large
                 # losses whenever the grid restarted or reconnected with an open bag
@@ -2546,6 +2602,13 @@ class GridEngine:
                 continue
             qty = self.exchange.exchange.amount_to_precision(self.symbol, level.quantity)
             if float(qty) <= 0:
+                continue
+            if float(qty) * level.price < MIN_NOTIONAL_USDT:
+                logger.debug(
+                    "RECONCILE SKIP ORPHAN | {} @ {} notional {:.2f} < {:.2f} minimum — "
+                    "would be guaranteed-rejected, not attempting",
+                    level.side, level.price, float(qty) * level.price, MIN_NOTIONAL_USDT,
+                )
                 continue
             try:
                 params = {"reduceOnly": True, "postOnly": False, "purpose": "reconcile"}
@@ -2626,6 +2689,29 @@ class GridEngine:
             # Binance accepted orders until the cumulative reduceOnly quantity reached
             # the position and rejected the rest (-2022), so every recenter logged a
             # burst of guaranteed-fail placements (105 in one session).
+            #
+            # Splitting across EVERY qualifying level up front (the original approach)
+            # could size each slice under the exchange's MIN_NOTIONAL_USDT floor even
+            # when the undivided amount -- or a split across fewer levels -- would clear
+            # it comfortably: every slice then failed the per-level notional check below
+            # and got skipped, leaving the position with NO exit resting on the ladder at
+            # all. 2026-09-01: a 49 ADA long split across 3 levels came out to ~$3.20 a
+            # slice, under the $5 floor, so all 3 were silently skipped (DEBUG-only log)
+            # and the position sat for 15+ minutes until the raw stop-loss -- the backstop
+            # of last resort -- fired and closed it externally, with only an ESTIMATED P&L
+            # to show for it (AUDIT #144). Sort by distance from break-even (nearest first
+            # -- those are the ones most likely to fill as price recovers) and shrink the
+            # level count until each slice clears the floor, rather than dividing thinner
+            # and thinner across levels the position can't actually support.
+            levels.sort(key=lambda l: l.price, reverse=(side == "short"))
+            level_count = len(levels)
+            while level_count > 1:
+                worst_price = min(l.price for l in levels[:level_count])
+                if (amt / level_count) * worst_price >= MIN_NOTIONAL_USDT:
+                    break
+                level_count -= 1
+            levels = levels[:level_count]
+
             remaining = amt
             per_level = amt / len(levels)
             placed = 0
@@ -2692,7 +2778,14 @@ class GridEngine:
         open_ids = {o["id"] for o in open_orders}
         fills = []
 
-        for level in self.levels:
+        # A snapshot, not the live list: _handle_fill ends with self.levels.sort(),
+        # an in-place reorder of this exact list while this loop's iterator is
+        # walking it by index. Iterating the live list let that sort skip an
+        # unvisited level (moved to an index already passed) while revisiting the
+        # just-processed one under its brand-new order_id -- observed live as the
+        # fresh replacement immediately mis-read as "gone" and marked dead inside the
+        # same check_fills() call that had just placed it.
+        for level in list(self.levels):
             if level.order_id is None:
                 continue
             if level.order_id not in open_ids:
@@ -3005,14 +3098,42 @@ class GridEngine:
             # `params is None` means _exit_order_params found nothing to reduce, i.e.
             # this order OPENS exposure. Exits stay unconditional: refusing those would
             # trap inventory, which is the #42 mistake.
+            #
+            # This branch has checked the position cap since #49 above, but
+            # _loss_block_buys/_loss_block_sells and _profit_lock_active -- the other
+            # two guards _place_order_for_level checks before it will ever open
+            # exposure -- were never asked here. All three exist to stop ADDING
+            # exposure, exactly what params is None means this order does, so skipping
+            # the other two let a fill's own replacement re-open exposure the instant
+            # after the open-loss budget or the daily profit lock had just told every
+            # OTHER placement path in the file to stop.
             if params is None:
-                blocked = ((new_side == "buy" and self._block_buys)
-                           or (new_side == "sell" and self._block_sells))
+                blocked, reason = False, ""
+                if new_side == "buy" and self._block_buys:
+                    blocked, reason = True, "position limit reached"
+                elif new_side == "sell" and self._block_sells:
+                    blocked, reason = True, "position limit reached"
+                elif new_side == "buy" and self._loss_block_buys:
+                    blocked, reason = True, "open loss budget exhausted"
+                elif new_side == "sell" and self._loss_block_sells:
+                    blocked, reason = True, "open loss budget exhausted"
+                elif self._profit_lock_active:
+                    # Mirror _place_order_for_level's own adding_side check: a side is
+                    # only ever this position's entry OR its exit, never both, so
+                    # profit lock must not block the side that would only ever reduce
+                    # it.
+                    if self._pos_qty > 0:
+                        adding_side = "buy"
+                    elif self._pos_qty < 0:
+                        adding_side = "sell"
+                    else:
+                        adding_side = None
+                    if adding_side is None or new_side == adding_side:
+                        blocked, reason = True, "daily profit lock active"
                 if blocked:
                     logger.warning(
-                        "REPLACEMENT BLOCKED | {} @ {} would add exposure past the "
-                        "position cap — level left pending (AUDIT #49)",
-                        new_side.upper(), new_price,
+                        "REPLACEMENT BLOCKED | {} @ {} — {} (level left pending, AUDIT #49)",
+                        new_side.upper(), new_price, reason,
                     )
                     level.order_id = None
                     level.status = "pending"
@@ -3356,14 +3477,36 @@ class GridEngine:
         self.initialize(current_price, balance, dynamic_spacing=True)
         self._unwind_position_through_grid(balance)
         self.place_initial_orders(balance)
-        self.active = True
+        # Same check activate() makes (line ~3237): a fresh ladder with nothing
+        # actually resting is not active, it is dormant wearing the active flag.
+        # Setting this unconditionally meant a rebuild that failed to place a single
+        # order -- the exchange down, every level rejected -- still marked the grid
+        # active, so nothing downstream (the watchdog, main.py's own health checks)
+        # could tell the difference between "working ladder" and "empty book,
+        # believed working" until something else noticed no fills were ever coming.
+        total_open = len(self.get_tracked_order_ids())
+        self.active = total_open > 0
+        if not self.active:
+            logger.warning("RECENTER PRODUCED NO ORDERS | grid left inactive rather than reporting active with an empty book")
         self._last_recenter_time = now
         # Only re-anchor the trailing stop when there is no position to protect.
         # Resetting unconditionally handed the ratchet back to the market on every
         # recenter: with recenter firing repeatedly the peak was continuously reset
         # to the current price, so a long's stop tracked price downward instead of
         # holding its high-water mark.
-        if self._net_long_qty <= 0 and self._net_short_qty <= 0:
+        #
+        # _pos_qty is included for the same reason the 'flat' gate a few dozen lines
+        # above (this same function) ORs it in: _net_long_qty/_net_short_qty are the
+        # exchange-position mirror, refreshed by set_position_limit every main-loop
+        # iteration and by _refresh_net_counters on a fill -- but a bad read degrades
+        # that mirror to its last value rather than raising (see its own docstring),
+        # while _pos_qty is this ladder's own locally-updated tracker, current the
+        # instant _apply_to_position runs. Checking only the mirror here reproduced
+        # the exact staleness class the 'flat' gate was already hardened against, in
+        # the same function, a few lines away -- trusting only the read that can go
+        # stale to decide whether to discard the peak/trough high-water mark.
+        if (self._net_long_qty <= 0 and self._net_short_qty <= 0
+                and abs(self._pos_qty) <= 1e-9):
             self._peak_price = current_price
             self._trough_price = current_price
             self._trailing_sl_price = None
