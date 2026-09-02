@@ -15,8 +15,20 @@ bounded by MAX_EXPOSURE_PCT.
 """
 
 import pytest
+from loguru import logger
 
 from grid import GridEngine
+
+
+def capture(fn):
+    """Run fn, return the INFO+ lines it logged."""
+    sink = []
+    handle = logger.add(lambda m: sink.append(str(m)), level="INFO")
+    try:
+        fn()
+    finally:
+        logger.remove(handle)
+    return sink
 
 
 class _Ex:
@@ -122,6 +134,56 @@ def test_the_new_size_is_smaller_than_what_was_running():
     assert configured < percent_path
     assert configured == pytest.approx(500.0)
     assert percent_path == pytest.approx(887.4)
+
+
+# --- exposure-ceiling trim log throttling ------------------------------------
+
+def test_exposure_ceiling_trim_warning_is_not_repeated_every_call():
+    """Live-ops follow-up: this path is reachable from every order placement AND from
+    check_fills' per-poll orphan sweep, so an unthrottled warning here repeated on
+    every single poll for as long as the configured size stayed over the ceiling --
+    one line per level per cycle, for the life of the mismatch, drowning out
+    everything else in the log. Its own sibling log a few lines up
+    (_warned_small_fixed_allocation) already gets this right; this one never did.
+    """
+    g = _engine(usdt=500.0, leverage=10, count=10, max_exposure=0.50)
+
+    sink = capture(lambda: [g._calc_usdt_per_grid(4930.0) for _ in range(5)])
+
+    trims = [l for l in sink if "PER-GRID SIZING" in l and "trimming to" in l]
+    assert len(trims) == 1, (
+        f"expected exactly one trim warning across 5 identical calls, got {len(trims)}"
+    )
+
+
+def test_exposure_ceiling_trim_warning_reports_again_if_the_trim_changes():
+    """Not a blanket one-shot: a materially different trimmed size (balance moved,
+    volatility moved) still deserves a fresh line rather than going silent forever."""
+    g = _engine(usdt=500.0, leverage=10, count=10, max_exposure=0.50)
+
+    sink = capture(lambda: [
+        g._calc_usdt_per_grid(4930.0),
+        g._calc_usdt_per_grid(4930.0),   # identical trim -- must not re-log
+        g._calc_usdt_per_grid(2000.0),   # smaller balance -> smaller trim -- must re-log
+    ])
+
+    trims = [l for l in sink if "PER-GRID SIZING" in l and ("trimming to" in l or "trim changed" in l)]
+    assert len(trims) == 2
+
+
+def test_exposure_ceiling_recovery_is_announced_once():
+    """When the trim clears (balance recovers, config changes), say so once rather
+    than staying silent forever -- and only once, not on every call afterward."""
+    g = _engine(usdt=500.0, leverage=10, count=10, max_exposure=0.50)
+    g._calc_usdt_per_grid(4930.0)  # trips the trim
+
+    sink = capture(lambda: [
+        g._calc_usdt_per_grid(200000.0),  # balance now comfortably clears the ceiling
+        g._calc_usdt_per_grid(200000.0),  # must not repeat the recovery line
+    ])
+
+    recoveries = [l for l in sink if "no longer trimming" in l]
+    assert len(recoveries) == 1
 
 
 # --- config validation ------------------------------------------------------

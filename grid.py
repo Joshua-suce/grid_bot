@@ -330,6 +330,8 @@ class GridEngine:
         self._open_orders_fetch_time: float = 0.0
         self._open_orders_map: dict[tuple[float, str], dict] = {}
         self._warned_small_fixed_allocation = False
+        self._exposure_ceiling_trimming = False
+        self._last_exposure_trim = 0.0
 
     def _round_price_toward(self, value: float, direction: int) -> float:
         """Round to exchange precision WITHOUT crossing `value`.
@@ -1321,10 +1323,35 @@ class GridEngine:
         target_total = balance * self.max_exposure_pct
         if current_total > target_total:
             raw = target_total / self.grid_count
-            logger.warning(
-                "PER-GRID SIZING | {} rungs at the configured size would commit {:.2f} "
-                "USDT, over the {:.0%} exposure ceiling — trimming to {:.2f} per order",
-                self.grid_count, current_total, self.max_exposure_pct, raw,
+            # Log the transition, not every call: this path is reachable from every
+            # order placement AND from check_fills' per-poll orphan sweep, so an
+            # unthrottled warning here repeated on every single 10s poll for as long
+            # as the configured size stayed over the ceiling -- one line per level per
+            # cycle, for the life of the mismatch, drowning out everything else in the
+            # log. _warned_small_fixed_allocation (above) already gets this right for
+            # its own sibling log; this one never did.
+            if not self._exposure_ceiling_trimming:
+                self._exposure_ceiling_trimming = True
+                logger.warning(
+                    "PER-GRID SIZING | {} rungs at the configured size would commit {:.2f} "
+                    "USDT, over the {:.0%} exposure ceiling — trimming to {:.2f} per order "
+                    "(further trims logged only if the trimmed size itself changes)",
+                    self.grid_count, current_total, self.max_exposure_pct, raw,
+                )
+            elif abs(raw - self._last_exposure_trim) > 1e-9:
+                logger.warning(
+                    "PER-GRID SIZING | trim changed: {} rungs would commit {:.2f} USDT, "
+                    "over the {:.0%} exposure ceiling — now trimming to {:.2f} per order "
+                    "(was {:.2f})",
+                    self.grid_count, current_total, self.max_exposure_pct, raw,
+                    self._last_exposure_trim,
+                )
+            self._last_exposure_trim = raw
+        elif self._exposure_ceiling_trimming:
+            self._exposure_ceiling_trimming = False
+            logger.info(
+                "PER-GRID SIZING | back within the {:.0%} exposure ceiling — no longer trimming",
+                self.max_exposure_pct,
             )
         return raw
 
