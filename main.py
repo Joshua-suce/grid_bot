@@ -672,7 +672,17 @@ def daily_reset_check(
             balance = exchange.get_balance()
             notifier.on_daily_summary(
                 completed_daily_pnl,
-                risk.state.trades_today,
+                # AUDIT (live-log follow-up, 2026-09-03): on_daily_summary's own
+                # parameter is named `fills` and the Telegram message labels it
+                # "Fills:" -- but this passed trades_today (completed round-trip
+                # cycles), not fills_today (every individual fill, per
+                # RiskManager.record_fill's own docstring). The very next line
+                # below gets this right, passing both separately to
+                # events.daily_reset -- this call site alone conflated them.
+                # Observed live: "DAILY RESET | trades=0 | fills=3" in the log the
+                # same second the Telegram summary said "Fills: 0", silently
+                # under-reporting every day a cycle didn't fully close.
+                risk.state.fills_today,
                 balance,
             )
             if events:

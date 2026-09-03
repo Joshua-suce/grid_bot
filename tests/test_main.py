@@ -48,6 +48,69 @@ def test_get_net_position_negative_contracts_short():
     assert get_net_position(exchange, "DOGEUSDT") == ("short", 5.0)
 
 
+class _DailyResetState:
+    def __init__(self):
+        self.last_reset_date = "2026-09-02"
+        self.trades_today = 0
+        self.fills_today = 3
+        self.daily_realized_pnl = 0.0
+
+
+class _DailyResetRisk:
+    def __init__(self):
+        self.state = _DailyResetState()
+
+    def reset_daily(self):
+        self.state.last_reset_date = "2026-09-03"
+        self.state.trades_today = 0
+        self.state.fills_today = 0
+        self.state.daily_realized_pnl = 0.0
+
+
+class _DailyResetNotifier:
+    def __init__(self):
+        self.daily_summary_calls = []
+
+    def on_daily_summary(self, pnl, fills, balance):
+        self.daily_summary_calls.append((pnl, fills, balance))
+
+
+class _DailyResetExchange:
+    def get_balance(self):
+        return 4873.76
+
+
+class _DailyResetReconciler:
+    def rollover_daily(self, today):
+        return 0.1913
+
+
+def test_daily_summary_reports_the_actual_fill_count_not_completed_trades():
+    """AUDIT (live-log follow-up, 2026-09-03). on_daily_summary's own parameter is
+    named `fills` and the Telegram message labels it "Fills:", but daily_reset_check
+    passed risk.state.trades_today (completed round-trip cycles) instead of
+    risk.state.fills_today (every individual fill -- see RiskManager.record_fill's
+    own docstring). The very next line already gets this right, passing both
+    separately to events.daily_reset -- only the notifier call conflated them.
+
+    Observed live: "DAILY RESET | trades=0 | fills=3" in the log the same second
+    the Telegram Daily Summary said "Fills: 0" -- a day with 3 real fills silently
+    reported to the user as zero.
+    """
+    risk = _DailyResetRisk()
+    notifier = _DailyResetNotifier()
+    exchange = _DailyResetExchange()
+    reconciler = _DailyResetReconciler()
+
+    main_module.daily_reset_check(risk, notifier, exchange, "ADAUSDT", events=None, pnl_reconciler=reconciler)
+
+    assert len(notifier.daily_summary_calls) == 1
+    pnl, fills, balance = notifier.daily_summary_calls[0]
+    assert fills == 3, (
+        f"Daily Summary must report the real fill count (3), not trades_today (0); got {fills}"
+    )
+
+
 def test_get_net_position_nets_long_and_short():
     exchange = FakeExchange([
         {"side": "long", "contracts": 10},
