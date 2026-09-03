@@ -1434,7 +1434,18 @@ def run_bot() -> None:
                 notifier=notifier,
             )
             grid = _install_strategy(grid, exchange, events, notifier)
-            grid.load_from_dict(saved_state["grid"], current_price=exchange.get_price(settings.symbol))
+            # AUDIT #169: this price used to be fetched and handed straight to
+            # load_from_dict() as a keyword argument without ever being bound to a
+            # local -- current_price IS assigned elsewhere in this function (the
+            # sibling `else:` branch below, taken only when there is no saved
+            # state), which makes Python treat it as local to the whole function.
+            # Referencing it here, on the far more common saved-state restart path,
+            # raised UnboundLocalError every time, silently swallowed by the broad
+            # except around the ladder/cap coherence check further down -- so the
+            # AUDIT #120 safety check it guards never actually ran on a normal
+            # restart.
+            current_price = exchange.get_price(settings.symbol)
+            grid.load_from_dict(saved_state["grid"], current_price=current_price)
 
             if grid.state_corrupted:
                 logger.warning("Deleting corrupt state file so next startup recalculates fresh bounds")
