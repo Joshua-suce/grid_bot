@@ -8,7 +8,7 @@ drifted DOWN with the market. See AUDIT.md issues #11-#16.
 
 import pytest
 
-from grid import GridEngine
+from grid import GridEngine, GridLevel
 
 
 class FakeExchange:
@@ -127,6 +127,104 @@ def test_reduce_only_quantity_is_clamped_to_remaining_position():
     params, qty = grid._exit_order_params("sell", 1500.0)
     assert params == {"reduceOnly": True, "postOnly": False}
     assert qty == 800.0, "must not ask to close more than is open"
+
+
+def test_reduce_only_qty_accounts_for_other_resting_orders_on_the_same_side():
+    """AUDIT (live incident, 2026-09-02). Restart with SHORT 984 open: reconcile_state
+    rebuilt six buy rungs in one pass, each asking _reduce_only_qty the same question
+    and each getting back the SAME un-shared 984 -- so 247+257+255+254+253+250 = 1516
+    of reduceOnly BUY went resting against an actual 984 short (and
+    reconcile_positions's own separate 984-sized hedge stacked another 984 on top of
+    that). Binance accepted them individually, then started rejecting the excess with
+    -2022 once its own aggregate bookkeeping caught up -- and because every rung
+    recomputed against the same unshared figure on every poll, the rejections never
+    resolved: a permanent retry deadlock, one ERROR + Telegram alert per rung per
+    ~10s poll, until the process was killed by hand.
+
+    The position is one finite pool; a level already resting on the closing side has
+    already drawn from it.
+    """
+    ex = FakeExchange()
+    grid = make_engine(ex)
+    grid.set_position_limit(long_position=0.0, short_position=984.0, max_position_qty=8000.0)
+
+    # 400 + 400 + 100 = 900 already resting; only 84 of the 984 short is unclaimed.
+    grid.levels = [
+        GridLevel(price=0.0690, side="buy", order_id="B1", quantity=400.0),
+        GridLevel(price=0.0691, side="buy", order_id="B2", quantity=400.0),
+        GridLevel(price=0.0692, side="buy", order_id="B3", quantity=100.0),
+    ]
+
+    params, qty = grid._exit_order_params("buy", 300.0)
+
+    assert params == {"reduceOnly": True, "postOnly": False}
+    assert qty == pytest.approx(84.0), (
+        "must clamp to what's actually still unclaimed (84), not the raw 984"
+    )
+
+
+def test_sequential_exit_order_params_calls_never_collectively_overcommit_the_short():
+    """Same fix, exercised the way reconcile_state actually drives it: several buy
+    rungs asking _exit_order_params one after another in the same pass, each getting
+    its own resting order attached before the next one asks. The SUM of everything
+    reduceOnly-tagged must never exceed the real 984 short, and once it's fully
+    claimed, later rungs must fall back to plain entries instead of each
+    independently reclaiming the whole 984 for itself.
+    """
+    ex = FakeExchange()
+    grid = make_engine(ex)
+    grid.set_position_limit(long_position=0.0, short_position=984.0, max_position_qty=8000.0)
+    grid.levels = []
+
+    requested = [247.0, 257.0, 255.0, 254.0, 253.0, 250.0]  # sums to 1516, well over 984
+    reduce_only_claimed = 0.0
+    for i, qty in enumerate(requested):
+        params, clamped = grid._exit_order_params("buy", qty)
+        # Simulate this rung now resting, the way _place_order_for_level would leave
+        # it after a successful placement -- before the NEXT rung asks its question.
+        grid.levels.append(GridLevel(
+            price=0.0680 + i * 0.0005, side="buy", order_id=f"o{i}", quantity=clamped,
+        ))
+        if params:
+            reduce_only_claimed += clamped
+
+    assert reduce_only_claimed <= 984.0 + 1e-6, (
+        f"reduceOnly buys collectively claimed {reduce_only_claimed}, over the real 984 short"
+    )
+
+
+def test_reconcile_positions_hedge_respects_already_resting_reduce_only_coverage():
+    """The other contributor to the same 2026-09-02 incident: reconcile_positions's
+    own hedge order was hardcoded to the FULL detected position size, unconditionally,
+    on top of whatever the ladder's own rungs already had resting as reduceOnly
+    coverage. With SHORT 9840 open and 9000 of that already covered by three resting
+    buy rungs, the hedge still asked for the full 9840 -- 18840 total reduceOnly BUY
+    resting against a real 9840 short.
+    """
+    ex = FakeExchange(positions=[{"side": "short", "contracts": 9840.0, "entryPrice": 0.0700}])
+    # Wide enough that the computed hedge price (below entry, for a short) stays
+    # inside the grid regardless of spacing -- make_engine's own default bounds
+    # (0.0710-0.0730) sit entirely ABOVE this test's 0.0700 entry.
+    grid = make_engine(ex, grid_lower=0.0600, grid_upper=0.0800, grid_count=10)
+    grid.levels = [
+        GridLevel(price=0.0700, side="sell", quantity=1.0, entry_price=0.0700),
+        GridLevel(price=0.0670, side="buy", order_id="B1", quantity=4000.0),
+        GridLevel(price=0.0675, side="buy", order_id="B2", quantity=4000.0),
+        GridLevel(price=0.0680, side="buy", order_id="B3", quantity=1000.0),
+    ]
+
+    grid.reconcile_positions()
+
+    new_reduce_only_buy = sum(
+        o["amount"] for o in ex.placed
+        if o.get("side") == "buy" and o.get("params", {}).get("reduceOnly")
+    )
+    already_resting = 4000.0 + 4000.0 + 1000.0
+    assert new_reduce_only_buy + already_resting <= 9840.0 + 1e-6, (
+        f"hedge ({new_reduce_only_buy}) + already-resting ({already_resting}) reduceOnly "
+        f"buys totalled {new_reduce_only_buy + already_resting}, over the real 9840 short"
+    )
+    assert new_reduce_only_buy == pytest.approx(840.0), "must only ask for the remaining uncovered 840"
 
 
 def test_buy_while_net_long_is_not_reduce_only():

@@ -645,12 +645,31 @@ class GridEngine:
 
         Returns 0.0 when no position on the closing side exists, i.e. the order opens
         exposure and must be sent WITHOUT reduceOnly.
+
+        The position is one finite pool, and every reduceOnly order already resting on
+        `side` is already drawing from it -- subtracting _resting_qty(side) is what
+        stops a second, third, and fourth rung from each independently believing it can
+        still claim the WHOLE position for itself.
+
+        2026-09-02, restart with SHORT 984 open: reconcile_state rebuilt six buy rungs
+        in one pass, each asking this method the same question and each getting back
+        the same un-shared 984 -- so 247+257+255+254+253+250 = 1516 of reduceOnly BUY
+        went resting against an actual 984, and reconcile_positions's own separate
+        984-sized hedge stacked another 984 on top of that (2500 total, 2.5x the real
+        short). Binance accepted them individually, then started expiring and
+        rejecting (-2022) the excess once its own aggregate bookkeeping caught up --
+        and because every rung recomputed against the same unshared figure on every
+        poll, the rejections never resolved: the ladder was stuck retrying the same
+        over-commitment forever, one ERROR + Telegram alert per rung per ~10s poll,
+        until the process was killed by hand.
         """
         if side == "sell":
-            return self._net_long_qty
-        if side == "buy":
-            return self._net_short_qty
-        return 0.0
+            raw = self._net_long_qty
+        elif side == "buy":
+            raw = self._net_short_qty
+        else:
+            return 0.0
+        return max(0.0, raw - self._resting_qty(side))
 
     def _refresh_net_counters(self) -> bool:
         """Re-read the exchange's net position into the reduce-only mirror. AUDIT #98.
@@ -2524,6 +2543,22 @@ class GridEngine:
                 )
                 continue
 
+            # The ladder's own rungs may already have reduceOnly coverage resting
+            # against this same position -- this hedge is a SEPARATE order on top of
+            # whatever they already claim, not the only thing standing between the
+            # position and no exit. Computed here, before best_level's own side/
+            # order_id are reassigned below, so it does not count best_level's own
+            # about-to-be-replaced order as already resting.
+            #
+            # 2026-09-02, restart with SHORT 984 open: six ladder rungs, each asking
+            # the (then-unshared) reduce-only ceiling independently, put 1516 of
+            # reduceOnly BUY resting on their own -- and this hedge stacked its own
+            # full 984 on top of that, unconditionally, for 2500 total against a real
+            # 984. Binance started rejecting the excess with -2022, and because
+            # nothing here ever asked what was already covered, every subsequent
+            # reconcile re-tried the same full-size hedge and hit the same rejection.
+            hedge_qty = max(0.0, amt - self._resting_qty(hedge_side))
+
             if best_level.order_id is not None:
                 if not self.exchange.cancel_order(best_level.order_id, self.symbol):
                     logger.warning(
@@ -2540,30 +2575,15 @@ class GridEngine:
             best_level.side = hedge_side
             best_level.price = hedge_price
 
-            qty = self.exchange.exchange.amount_to_precision(self.symbol, amt)
-            if float(qty) <= 0:
-                continue
-            # Every other placement path in this file checks notional against the
-            # exchange floor before spending an API call on an order that is
-            # guaranteed-rejected (-4164) -- _place_order_for_level since AUDIT #164's
-            # neighbour fix. This one didn't, and reconcile_positions re-runs on every
-            # poll that still sees the position, so a hedge that rounds under the
-            # floor (dust left behind by partial fills, or a tiny position on a low-
-            # price symbol) logged the same ERROR and burned the same rate-limit
-            # budget every single cycle instead of once.
-            if float(qty) * hedge_price < MIN_NOTIONAL_USDT:
-                logger.debug(
-                    "RECONCILE SKIP HEDGE | {} @ {} notional {:.2f} < {:.2f} minimum — "
-                    "would be guaranteed-rejected, not attempting",
-                    hedge_side, hedge_price, float(qty) * hedge_price, MIN_NOTIONAL_USDT,
-                )
-                continue
             try:
                 # Market-closing the whole position on every reconcile realized large
                 # losses whenever the grid restarted or reconnected with an open bag
                 # (e.g. 08-01 -12.98, 08-03 -5.92, 08-05 -8.43). Default to a
                 # reduce-only limit hedge instead; opt into the market close only
-                # if explicitly configured.
+                # if explicitly configured. Always closes the FULL position -- it is
+                # an immediate market execution, not a resting order competing with
+                # the ladder's own rungs for the same budget, so ladder coverage does
+                # not reduce what it needs to close.
                 if self.use_market_close_on_replace:
                     try:
                         order = self.exchange.close_position(self.symbol, side, abs(amt))
@@ -2577,6 +2597,38 @@ class GridEngine:
                             continue
                     except Exception as e:
                         logger.warning("RECONCILE | market close failed, falling back to limit: {}", e)
+                if hedge_qty <= 0:
+                    logger.info(
+                        "RECONCILE | {} position already fully covered by {:.2f} resting "
+                        "{} order(s) — no separate hedge needed",
+                        side, self._resting_qty(hedge_side), hedge_side,
+                    )
+                    best_level.order_id = None
+                    best_level.status = "pending"
+                    continue
+                qty = self.exchange.exchange.amount_to_precision(self.symbol, hedge_qty)
+                if float(qty) <= 0:
+                    best_level.order_id = None
+                    best_level.status = "pending"
+                    continue
+                # Every other placement path in this file checks notional against the
+                # exchange floor before spending an API call on an order that is
+                # guaranteed-rejected (-4164) -- _place_order_for_level since AUDIT
+                # #164's neighbour fix. This one didn't, and reconcile_positions
+                # re-runs on every poll that still sees the position, so a hedge that
+                # rounds under the floor (dust left behind by partial fills, or a
+                # tiny position on a low-price symbol) logged the same ERROR and
+                # burned the same rate-limit budget every single cycle instead of
+                # once.
+                if float(qty) * hedge_price < MIN_NOTIONAL_USDT:
+                    logger.debug(
+                        "RECONCILE SKIP HEDGE | {} @ {} notional {:.2f} < {:.2f} minimum "
+                        "— would be guaranteed-rejected, not attempting",
+                        hedge_side, hedge_price, float(qty) * hedge_price, MIN_NOTIONAL_USDT,
+                    )
+                    best_level.order_id = None
+                    best_level.status = "pending"
+                    continue
                 # reduceOnly on BOTH sides. This used to set it only when hedging a
                 # long, so covering a SHORT went out as a plain buy: if the position had
                 # already closed between the read and the order, that opens a fresh
