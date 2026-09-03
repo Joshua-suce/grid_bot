@@ -520,6 +520,30 @@ class TelegramNotifier:
             f"{verified_line}"
         )
 
+    def on_bot_stopped(self, reason: str, holding: bool) -> None:
+        """AUDIT #170. Startup gets "Bot Started" (on_startup_summary). Shutdown --
+        a plain Ctrl+C, a signal, a give-up-and-abort after a failed reconnect, or an
+        unhandled exception -- reaches main.py's `finally:` block either way, but until
+        now nothing there told the chat the bot had gone down. Observed live: a clean
+        Ctrl+C left Telegram silent, so the only way to know the bot had stopped
+        trading was to be watching the terminal.
+
+        Fired from GridEngine.emergency_stop, gated on reason == "shutdown" so it
+        doesn't also fire for the kill switch (which already sends its own
+        on_kill_switch and keeps the process running in recovery) or a failed
+        recovery-grid rebuild (which retries next cycle rather than exiting).
+        """
+        protection = (
+            "Position still open — stops stay armed on the exchange, "
+            "protected while the bot is down"
+            if holding else "Book is flat"
+        )
+        self.send(
+            f"&#x1f6d1; <b>Bot Stopped</b>\n"
+            f"Reason: {self._esc(reason)}\n"
+            f"{protection}"
+        )
+
     def on_daily_summary(self, pnl: float, fills: int, balance: float) -> None:
         emoji = "&#x1f4c8;" if pnl >= 0 else "&#x1f4c9;"
         self.send(

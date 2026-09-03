@@ -3385,6 +3385,16 @@ class GridEngine:
         self.active = False
         if self._event_journal:
             self._event_journal.grid_paused(self.symbol, "emergency_stop", cancelled)
+        # AUDIT #170: "shutdown" is the reason every real process exit funnels through
+        # (main.py's `finally:` covers a clean Ctrl+C, a signal, and an unhandled
+        # exception alike) -- but until now nothing told Telegram the bot had gone
+        # down. Observed live: a plain Ctrl+C left the chat silent, so the only way to
+        # know the bot had stopped trading was to be watching the terminal. Gated on
+        # "shutdown" specifically so this doesn't also fire for the kill-switch
+        # (which already sends its own on_kill_switch) or for a recovery-rebuild
+        # failure (which keeps the process running and retries next cycle).
+        if reason == "shutdown" and self._notifier:
+            self._notifier.on_bot_stopped(reason, holding)
 
     def recenter(self, current_price: float, balance: float, margin_pct: float = 0.01) -> bool:
         now = time.time()

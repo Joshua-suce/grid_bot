@@ -392,23 +392,62 @@ def test_a_deformed_ladder_does_not_trigger_a_recenter_while_holding():
 # --- #35: a clean shutdown must not read as a crash ------------------------
 
 def test_shutdown_and_kill_switch_cancel_identically():
-    """`reason` is presentational only. If it ever changed WHAT gets cancelled, a
-    quiet-looking shutdown would leave orders resting on the exchange."""
-    import inspect
+    """`reason` must never change WHAT gets cancelled. If it ever did, a quiet-looking
+    shutdown would leave orders resting on the exchange.
+
+    Behavioural, not a source-text scan. The original version of this test asserted
+    that the literal word "reason" appears only next to a `logger` call or an
+    if/else/comment -- which caught a real class of bug (AUDIT #35) but also meant
+    `reason` could never legitimately gate anything else, even something purely
+    presentational. AUDIT #170 added exactly that: emergency_stop(reason="shutdown")
+    now also fires a "Bot Stopped" Telegram notification, gated on `reason` precisely
+    so it does NOT also fire for the kill switch (which keeps the process running in
+    recovery) or a failed recovery-grid rebuild (which retries next cycle) -- neither
+    of which is an actual shutdown. That is presentational, exactly like the log
+    level, so drive both strategies through "shutdown" and "emergency" instead and
+    compare what actually reached the exchange.
+    """
+    from unittest.mock import MagicMock
 
     import grid as grid_module
     import trend_follower as tf_module
 
-    for fn in (grid_module.GridEngine.emergency_stop, tf_module.TrendFollower.emergency_stop):
-        src = inspect.getsource(fn)
-        body = src.split('"""')[-1] if '"""' in src else src
-        # the only thing `reason` may gate is a logger call
-        for line in body.splitlines():
-            if "reason" in line and "def " not in line:
-                assert "logger" in line or line.strip().startswith(("if", "else", "#")), (
-                    f"`reason` gates something other than logging in "
-                    f"{fn.__qualname__}: {line.strip()}"
-                )
+    def grid_engine(positions):
+        ex = MagicMock()
+        ex.exchange.amount_to_precision.side_effect = lambda s, a: str(int(float(a)))
+        ex.get_positions.return_value = positions
+        engine = grid_module.GridEngine(
+            ex, "DOGEUSDT", grid_lower=0.068, grid_upper=0.072, grid_count=8,
+            capital_per_grid_pct=0.018, stop_loss_pct=0.005,
+            capital_per_grid_usdt=5.0, leverage=25,
+        )
+        return engine, ex
+
+    def follower(positions):
+        ex = MagicMock()
+        ex.exchange.amount_to_precision.side_effect = lambda s, a: str(int(float(a)))
+        ex.get_positions.return_value = positions
+        ex.get_open_orders.return_value = []
+        return tf_module.TrendFollower(
+            ex, "DOGEUSDT", stop_loss_pct=0.005,
+            trailing_sl_trigger_pct=0.05, atr_stop_multiplier=2.0,
+        ), ex
+
+    for build in (grid_engine, follower):
+        for positions in ([], [{"contracts": 5350.0}]):
+            shutdown_engine, shutdown_ex = build(positions)
+            shutdown_engine.emergency_stop("shutdown")
+
+            kill_engine, kill_ex = build(positions)
+            kill_engine.emergency_stop("emergency")
+
+            assert (shutdown_ex.cancel_all_open_orders.call_count
+                    == kill_ex.cancel_all_open_orders.call_count)
+            assert (shutdown_ex.cancel_everything.call_count
+                    == kill_ex.cancel_everything.call_count)
+            if shutdown_ex.cancel_everything.called:
+                assert (shutdown_ex.cancel_everything.call_args.kwargs.get("keep_stops")
+                        == kill_ex.cancel_everything.call_args.kwargs.get("keep_stops"))
 
 
 def test_main_stops_with_the_shutdown_reason():
