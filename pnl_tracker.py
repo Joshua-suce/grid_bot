@@ -19,6 +19,10 @@ MAX_PAGES_PER_CALL = 50
 # asking further back than that buys nothing — 89 days stays safely inside that
 # window without relying on an exact 90/91/92-day boundary.
 BOOTSTRAP_LOOKBACK_DAYS = 89
+# Below this span since epoch, _looks_implausible() stays quiet even at zero
+# commission — a bot that is only hours old and genuinely hasn't filled anything
+# yet must not have its own true, empty history discarded as corrupt (AUDIT #171).
+IMPLAUSIBLE_STATE_MIN_SPAN_MS = 3 * 86_400_000  # 3 days
 
 
 @dataclass
@@ -335,6 +339,44 @@ class PnLReconciler:
         day = datetime.fromtimestamp(self.epoch_ms / 1000, tz=timezone.utc)
         return f"since {day.strftime('%Y-%m-%d')}"
 
+    def _looks_implausible(self) -> str | None:
+        """A loaded state can claim bootstrapped=True and still be worthless.
+
+        2026-08-25 21:36:48: a restart loaded a pnl_reconciler whose epoch_ms and
+        last_income_time_ms both looked intact, but realized_pnl/commission/
+        funding_fee had been silently hollowed out to near-zero. bootstrapped
+        stayed True, so sync() just resumed on top of the hollow totals — a
+        -74.84 loss that had been correctly reconciled five days earlier (and
+        every other dollar of the account's real history back to epoch) quietly
+        vanished from every number the bot reported from then on. window_label
+        kept reading "since 2026-08-14" for the next ten days; the figure behind
+        it only reflected the ten days since the reset (AUDIT #171).
+
+        commission is the tell, not realized_pnl or funding_fee: it is charged
+        on every single fill, maker or taker, with no legitimate way to sit at
+        exactly zero once the account has been live and bootstrapped across a
+        multi-day span. A quiet, flat, ranging market can genuinely produce zero
+        REALIZED_PNL, and an account that is never holding a position at a
+        funding timestamp can genuinely produce zero FUNDING_FEE — but no order
+        fills for free. Below IMPLAUSIBLE_STATE_MIN_SPAN_MS this stays quiet: a
+        bot that only just bootstrapped and genuinely hasn't filled anything yet
+        must not have its own true, empty history discarded as corrupt.
+
+        Returns a human-readable reason, or None if nothing looks wrong.
+        """
+        if not self.bootstrapped or self.epoch_ms is None or self.last_income_time_ms <= 0:
+            return None
+        span_ms = self.last_income_time_ms - self.epoch_ms
+        if span_ms < IMPLAUSIBLE_STATE_MIN_SPAN_MS:
+            return None
+        if abs(self.commission) > 1e-9:
+            return None
+        span_days = span_ms / 86_400_000
+        return (
+            f"bootstrapped spanning {span_days:.1f} days since epoch but exactly "
+            f"zero commission ever recorded — no account with any fills can do that"
+        )
+
     def reset_for_epoch(self, epoch_ms: int | None) -> bool:
         """Discard accumulated totals if the reporting epoch changed. Returns True if it did.
 
@@ -382,7 +424,21 @@ class PnLReconciler:
 
     def sync(self, exchange, symbol: str) -> bool:
         """Incrementally pull new income entries since the last known timestamp.
-        Bootstraps automatically if this is the first run. Returns True on success."""
+        Bootstraps automatically if this is the first run, and re-bootstraps if the
+        loaded state doesn't look like it can be trusted (AUDIT #171). Returns True
+        on success."""
+        reason = self._looks_implausible()
+        if reason is not None:
+            logger.warning(
+                "PNL RECONCILER STATE IMPLAUSIBLE | {} — discarding and re-bootstrapping",
+                reason,
+            )
+            self.realized_pnl = 0.0
+            self.commission = 0.0
+            self.funding_fee = 0.0
+            self.last_income_time_ms = 0
+            self.last_seen_keys = set()
+            self.bootstrapped = False
         if not self.bootstrapped:
             self.bootstrap(exchange, symbol)
             return self.bootstrapped
