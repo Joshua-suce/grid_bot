@@ -3367,7 +3367,15 @@ class GridEngine:
             logger.error("EMERGENCY STOP | cancelling grid orders ({})", reason)
 
         if holding:
-            cancelled = self.exchange.cancel_all_open_orders(self.symbol)
+            # cancel_all_open_orders takes literally everything on the book, stop leg
+            # included -- the exact strand the comment above says #65 prevents. It
+            # doesn't: keep_stops=True is what cancel_everything has for leaving the
+            # stop alone, and this branch was calling the wrong method entirely. Found
+            # live: a plain Ctrl+C with 208 ADA open cancelled its stop right along with
+            # the grid orders, logged "STOPS LEFT ARMED" regardless, and left the
+            # position naked -- unprotected and unnoticed -- for as long as the bot
+            # stayed down (AUDIT #172).
+            cancelled = self.exchange.cancel_everything(self.symbol, keep_stops=True)
             logger.warning(
                 "STOPS LEFT ARMED | a position is still open, so its stop-loss legs stay "
                 "on the exchange — it remains protected while the bot is down",

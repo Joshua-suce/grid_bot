@@ -108,9 +108,15 @@ def test_an_unreadable_book_keeps_the_stops():
     assert keep_stops_arg(ex) is True
 
 
-# --- and the grid's own behaviour is unchanged --------------------------------------------
+# --- and the grid now reaches the same guarantee the same way -----------------------------
 
 def test_the_grid_still_keeps_stops_over_a_position():
+    """AUDIT #172: this used to assert cancel_all_open_orders here, which only left the
+    stop armed because this account's stop-loss orders live in a separate algo book that
+    cancel_all_open_orders's plain fetch_open_orders never sees -- true today, not a
+    guarantee. cancel_everything(keep_stops=True) is explicit about it, batches with a
+    retry-and-reverify loop cancel_all_open_orders never had, and is the same call
+    pause() already makes for this identical scenario."""
     from grid import GridEngine
 
     ex = MagicMock()
@@ -122,8 +128,8 @@ def test_the_grid_still_keeps_stops_over_a_position():
 
     g.emergency_stop("shutdown")
 
-    ex.cancel_all_open_orders.assert_called_once()
-    ex.cancel_everything.assert_not_called()
+    ex.cancel_all_open_orders.assert_not_called()
+    assert keep_stops_arg(ex) is True
 
 
 def test_no_strategy_cancels_everything_unconditionally():
@@ -135,11 +141,13 @@ def test_no_strategy_cancels_everything_unconditionally():
     catch exactly that -- a guard that does not cover the case it advertises is worse
     than no guard, because it is read as coverage.
 
-    The two existing strategies reach the guarantee differently and both are fine: the
-    grid BRANCHES to cancel_all_open_orders while holding, the follower passes
-    keep_stops. What must hold either way is that the call is gated on a position check
-    -- an earlier version demanded the keyword specifically and failed the grid for
-    being correct in the other style.
+    The two existing strategies used to reach the guarantee two different ways -- the
+    grid branched to cancel_all_open_orders while holding, the follower passed
+    keep_stops -- and an earlier version of this test demanded the keyword specifically,
+    failing the grid for being correct in the other style. AUDIT #172 unified the grid
+    onto keep_stops too, but the scan below still checks the general shape rather than
+    the keyword literally: a future third strategy is free to reach the same guarantee
+    its own way, same as the grid briefly did.
     """
     from pathlib import Path
 
