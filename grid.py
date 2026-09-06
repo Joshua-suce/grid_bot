@@ -305,6 +305,13 @@ class GridEngine:
         # _reduce_only_qty). Refreshed from the exchange every main-loop iteration.
         self._net_long_qty: float = 0.0
         self._net_short_qty: float = 0.0
+        # Exchange-reported average entry for each side, refreshed only by
+        # _refresh_net_counters (set_position_limit only ever gets quantities from
+        # main.py). 0.0 means "no position on that side" or "not read yet" -- either
+        # way, code reading these must treat 0.0 as "unknown", not "entered at zero"
+        # (AUDIT #174).
+        self._net_long_entry: float = 0.0
+        self._net_short_entry: float = 0.0
         self._last_replacement_time: float = 0.0
         # Per-level cooldown tracking (keyed by object id, not persisted): a fill on
         # one level used to reset a single engine-wide timer that gated ALL orphan/
@@ -707,6 +714,7 @@ class GridEngine:
             return False
 
         long_qty = short_qty = 0.0
+        long_entry = short_entry = 0.0
         for pos in positions:
             qty = float(pos.get("contracts", 0) or 0)
             side = str(pos.get("side", "")).lower()
@@ -718,12 +726,24 @@ class GridEngine:
                 side, qty = ("short" if side == "long" else "long"), abs(qty)
             if qty <= 0:
                 continue
+            # AUDIT #174: carried alongside quantity from this same read so
+            # _grow_occupied_exit can reprice against the account's real cost basis
+            # without a second API call.
+            entry = float(pos.get("entryPrice") or 0)
             if side == "short":
                 short_qty += qty
+                if entry > 0:
+                    short_entry = entry
             else:
                 long_qty += qty
+                if entry > 0:
+                    long_entry = entry
 
+        # Written unconditionally, together with the quantity they describe: a side
+        # that just went flat must not leave its last entry price behind for the next
+        # occupied-exit reprice to read as if it still applied to a live position.
         self._net_long_qty, self._net_short_qty = long_qty, short_qty
+        self._net_long_entry, self._net_short_entry = long_entry, short_entry
         return True
 
     def _exit_order_params(self, side: str, quantity: float) -> tuple[dict | None, float]:
@@ -3267,20 +3287,44 @@ class GridEngine:
         return fill_record
 
     def _grow_occupied_exit(self, occ: GridLevel, side: str, added_qty: float) -> None:
-        """Resize an already-resting exit order to also cover a fill that just named it
-        as its exit, instead of leaving it at whatever size it happened to be (AUDIT #173).
+        """Resize -- and, when the position's real cost basis has moved past it,
+        reprice -- an already-resting exit order that a fill just named as its own
+        (AUDIT #173, #174).
 
         REPLACEMENT SLOT TAKEN only ever recorded that a fill was waiting on `occ` -- it
         never touched `occ` itself. Every later fill that pointed at the same occupying
         order added to the position while that order's own size stood still, so an exit
         that started out covering one fill could end up nominally "covering" several
-        times that. This is best-effort and must never block the fill that triggered it:
-        any failure here leaves `occ` exactly as it was, or -- if the cancel already went
+        times that (#173's fix: grow the quantity).
+
+        Quantity was not the whole story. `occ`'s price was set as the correct
+        one-spacing exit for whichever fill FIRST claimed it -- but Binance nets every
+        fill into one blended average entry, and each fill that stacks onto the same
+        occupied slot afterward can move that average to either side of occ's frozen
+        price. Live on 2026-09-06, ADAUSDT: a string of sells kept naming the same
+        BUY @ 0.2188 as their exit while the short's real average entry drifted through
+        it, and the resulting closes came back from Binance's own income ledger at a
+        few cents each -- some negative -- not because the strategy called price wrong,
+        but because occ's frozen price was, by the time it filled, on the wrong side of
+        the position it was meant to exit at a profit. A run of those is indistinguishable
+        from a run of genuine losers to the streak-based kill switch in risk.py, which
+        shut the grid down for 4 hours twice in one session over what was mostly this.
+
+        This only ever moves `occ` to a MORE conservative price -- further from the
+        current market, requiring a better fill before it can execute -- never closer.
+        That can delay a fill in exchange for a real margin; it can never turn a safe
+        exit into a risky one. It is skipped whenever the exchange hasn't reported an
+        entry price for this side (0.0 reads as "unknown", never as "entered at zero")
+        or the repriced target would land outside the grid's own bounds -- either way
+        `occ` is left exactly as it was.
+
+        This is best-effort and must never block the fill that triggered it: any
+        failure here leaves `occ` exactly as it was, or -- if the cancel already went
         through -- marks it pending so the next reconcile pass replaces it.
 
-        Deliberately narrow in scope: this only grows the specific order a fill was told
-        is its exit. It does not touch _release_awaiting_levels's own re-arm choice
-        (AUDIT #61/#62), which has its own tested tradeoffs and stays as-is.
+        Deliberately narrow in scope: this only touches the specific order a fill was
+        told is its exit. It does not touch _release_awaiting_levels's own re-arm
+        choice (AUDIT #61/#62), which has its own tested tradeoffs and stays as-is.
         """
         if added_qty <= 0 or occ.order_id is None:
             return
@@ -3291,46 +3335,66 @@ class GridEngine:
         net_qty = self._net_long_qty if side == "sell" else self._net_short_qty
         other_resting = self._resting_qty(side) - occ.quantity
         closable = max(0.0, net_qty - other_resting)
-        target = min(occ.quantity + added_qty, closable)
+        target_qty = min(occ.quantity + added_qty, closable)
+        grow = target_qty > occ.quantity + 1e-9
 
-        if target <= occ.quantity + 1e-9:
-            # Nothing more is actually closable right now -- other resting exits (or a
-            # stale net-position read) already claim the rest. Leave occ alone rather
-            # than shrink or churn an order that is already sized correctly.
+        # AUDIT #174: reprice toward the exchange's own reported average entry plus one
+        # grid spacing of margin -- but only in the direction that makes occ MORE
+        # conservative than where it already sits.
+        entry = self._net_short_entry if side == "buy" else self._net_long_entry
+        reprice_price = occ.price
+        if entry > 0:
+            ideal = self._round_price(
+                entry - self.grid_spacing if side == "buy" else entry + self.grid_spacing)
+            if self.grid_lower <= ideal <= self.grid_upper:
+                if side == "buy" and ideal < reprice_price:
+                    reprice_price = ideal
+                elif side == "sell" and ideal > reprice_price:
+                    reprice_price = ideal
+        reprice = reprice_price != occ.price
+
+        if not grow and not reprice:
+            # Nothing more is actually closable right now (other resting exits, or a
+            # stale net-position read, already claim the rest), and the current price
+            # already covers the position's real entry by a full spacing. Leave occ
+            # alone rather than churn an order that is already correctly sized/priced.
             return
 
-        old_id, old_qty = occ.order_id, occ.quantity
+        quantity_target = target_qty if grow else occ.quantity
+        old_id, old_qty, old_price = occ.order_id, occ.quantity, occ.price
         try:
-            quantity = float(self.exchange.exchange.amount_to_precision(self.symbol, target))
-            if quantity * occ.price < MIN_NOTIONAL_USDT:
+            quantity = float(self.exchange.exchange.amount_to_precision(self.symbol, quantity_target))
+            if quantity * reprice_price < MIN_NOTIONAL_USDT:
                 return
             if not self.exchange.cancel_order(old_id, self.symbol):
                 logger.warning(
-                    "EXIT GROW SKIPPED | could not cancel {} @ {} (id={}) to resize it "
-                    "for {:.6f} more — leaving it at {}",
-                    side.upper(), occ.price, old_id, added_qty, old_qty,
+                    "EXIT GROW SKIPPED | could not cancel {} @ {} (id={}) to resize/reprice "
+                    "it for {:.6f} more — leaving it at {} @ {}",
+                    side.upper(), old_price, old_id, added_qty, old_qty, old_price,
                 )
                 return
             occ.order_id = None
             params = {"reduceOnly": True, "postOnly": False, "purpose": "grid_exit"}
             order = self.exchange.place_limit_order(
-                self.symbol, side, occ.price, quantity, params=params)
+                self.symbol, side, reprice_price, quantity, params=params)
             if "id" not in order:
                 raise ValueError("Order response missing 'id'")
             occ.order_id = order["id"]
             occ.quantity = quantity
+            occ.price = reprice_price
             occ.status = "replaced"
             self._open_orders_fetch_time = 0.0
             logger.info(
-                "EXIT GROWN | {} @ {} resized {} -> {} to cover this fill's {:.6f} "
-                "(AUDIT #173)",
-                side.upper(), occ.price, old_qty, quantity, added_qty,
+                "EXIT {} | {} {} -> {} @ {} -> {} to cover this fill's {:.6f} "
+                "(AUDIT #173/#174)",
+                "GROWN+REPRICED" if (grow and reprice) else ("REPRICED" if reprice else "GROWN"),
+                side.upper(), old_qty, quantity, old_price, reprice_price, added_qty,
             )
         except Exception as e:
             logger.error(
                 "EXIT GROW FAILED | {} @ {} (was {}): {} — level left pending for the "
                 "next reconcile pass",
-                side.upper(), occ.price, old_qty, e,
+                side.upper(), old_price, old_qty, e,
             )
             occ.order_id = None
             occ.status = "pending"
