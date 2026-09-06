@@ -3109,11 +3109,13 @@ class GridEngine:
             level.status = "pending"
             return fill_record
 
-        occupied = any(
-            l is not level and l.price == new_price and l.order_id is not None and l.status in ("pending", "replaced")
-            for l in self.levels
+        occupying_level = next(
+            (l for l in self.levels
+             if l is not level and l.price == new_price and l.order_id is not None
+             and l.status in ("pending", "replaced")),
+            None,
         )
-        if occupied:
+        if occupying_level is not None:
             # The counter-slot is already live, so THAT order is the exit this fill
             # needs. This rung has no work to do until it fills.
             #
@@ -3142,6 +3144,19 @@ class GridEngine:
             level.status = "awaiting_counter"
             level.awaiting_side = new_side
             level.awaiting_price = new_price
+
+            # "This fill's exit" was a claim, not yet a fact: RUNG RE-ARMED (AUDIT #62)
+            # can send THIS level back out on level.side rather than ever becoming the
+            # counter it just named, and nothing before AUDIT #173 revisited
+            # occupying_level's own size afterward. Live on 2026-09-05: fills #144-148
+            # racked a short from 449 to 1337 ADA, each one naming the same BUY @ 0.2163
+            # as "this fill's exit" while that order sat resting at whatever size it was
+            # first given -- enough to close roughly a quarter of what it was nominally
+            # covering. Growing the occupying order by this fill's own quantity, right
+            # here, keeps the one thing this specific fill actually needs -- an exit
+            # sized for what it just added -- true regardless of what the awaiting-side
+            # machinery does with THIS level next.
+            self._grow_occupied_exit(occupying_level, new_side, qty)
             return fill_record
 
         qty = level.quantity if level.quantity > 0 else (self._calc_usdt_per_grid(balance) / max(new_price, 1e-12))
@@ -3250,6 +3265,75 @@ class GridEngine:
 
         self.levels.sort(key=lambda l: l.price)
         return fill_record
+
+    def _grow_occupied_exit(self, occ: GridLevel, side: str, added_qty: float) -> None:
+        """Resize an already-resting exit order to also cover a fill that just named it
+        as its exit, instead of leaving it at whatever size it happened to be (AUDIT #173).
+
+        REPLACEMENT SLOT TAKEN only ever recorded that a fill was waiting on `occ` -- it
+        never touched `occ` itself. Every later fill that pointed at the same occupying
+        order added to the position while that order's own size stood still, so an exit
+        that started out covering one fill could end up nominally "covering" several
+        times that. This is best-effort and must never block the fill that triggered it:
+        any failure here leaves `occ` exactly as it was, or -- if the cancel already went
+        through -- marks it pending so the next reconcile pass replaces it.
+
+        Deliberately narrow in scope: this only grows the specific order a fill was told
+        is its exit. It does not touch _release_awaiting_levels's own re-arm choice
+        (AUDIT #61/#62), which has its own tested tradeoffs and stays as-is.
+        """
+        if added_qty <= 0 or occ.order_id is None:
+            return
+
+        # Same math _reduce_only_qty uses, adjusted for a resize rather than a fresh
+        # placement: _resting_qty(side) already counts occ's own current quantity, so it
+        # has to come back out before asking how much room the REST of the book leaves.
+        net_qty = self._net_long_qty if side == "sell" else self._net_short_qty
+        other_resting = self._resting_qty(side) - occ.quantity
+        closable = max(0.0, net_qty - other_resting)
+        target = min(occ.quantity + added_qty, closable)
+
+        if target <= occ.quantity + 1e-9:
+            # Nothing more is actually closable right now -- other resting exits (or a
+            # stale net-position read) already claim the rest. Leave occ alone rather
+            # than shrink or churn an order that is already sized correctly.
+            return
+
+        old_id, old_qty = occ.order_id, occ.quantity
+        try:
+            quantity = float(self.exchange.exchange.amount_to_precision(self.symbol, target))
+            if quantity * occ.price < MIN_NOTIONAL_USDT:
+                return
+            if not self.exchange.cancel_order(old_id, self.symbol):
+                logger.warning(
+                    "EXIT GROW SKIPPED | could not cancel {} @ {} (id={}) to resize it "
+                    "for {:.6f} more — leaving it at {}",
+                    side.upper(), occ.price, old_id, added_qty, old_qty,
+                )
+                return
+            occ.order_id = None
+            params = {"reduceOnly": True, "postOnly": False, "purpose": "grid_exit"}
+            order = self.exchange.place_limit_order(
+                self.symbol, side, occ.price, quantity, params=params)
+            if "id" not in order:
+                raise ValueError("Order response missing 'id'")
+            occ.order_id = order["id"]
+            occ.quantity = quantity
+            occ.status = "replaced"
+            self._open_orders_fetch_time = 0.0
+            logger.info(
+                "EXIT GROWN | {} @ {} resized {} -> {} to cover this fill's {:.6f} "
+                "(AUDIT #173)",
+                side.upper(), occ.price, old_qty, quantity, added_qty,
+            )
+        except Exception as e:
+            logger.error(
+                "EXIT GROW FAILED | {} @ {} (was {}): {} — level left pending for the "
+                "next reconcile pass",
+                side.upper(), occ.price, old_qty, e,
+            )
+            occ.order_id = None
+            occ.status = "pending"
 
     def pause(self) -> None:
         if not self.active:
