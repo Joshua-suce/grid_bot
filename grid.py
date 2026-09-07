@@ -1785,6 +1785,95 @@ class GridEngine:
             self._notifier.on_order_placed(self.symbol, side, level.price, float(quantity), order["id"])
         return True
 
+    def _refresh_break_even_exits(self, balance: float) -> None:
+        """Re-check every resting exit against a FRESH break-even, and pull back any
+        that have drifted onto the wrong side of it (AUDIT #175).
+
+        _place_order_for_level's break-even guard (AUDIT #32/#42) only runs at the
+        moment a level is (re)placed -- every one of its call sites requires
+        order_id is None. Once a level is repriced to break-even by that guard and
+        its order is resting, nothing ever revisits it. _would_realise_a_loss and
+        _nearest_legal_exit are otherwise called from exactly one other place,
+        accelerate_handoff_exit -- and that path only fires during a strategy-router
+        handoff (AUDIT #145), which never runs while STRATEGY_MODE=grid trades alone.
+
+        So in ordinary grid operation, a level quoted at break-even sits there
+        unwatched. If a further fill lands on the SAME side afterward -- the common
+        case, since a level usually gets stuck at break-even exactly because price
+        kept moving against that side -- the position's real average entry moves
+        past the frozen quote, and the resting order ends up on the losing side of
+        the NEW break-even. If it fills, it books a real loss: the precise outcome
+        #32 ("never voluntarily book a loss") and #42 ("quote at break-even instead
+        of leaving the level dead") exist to prevent.
+
+        Fixed the same way accelerate_handoff_exit already fixes the analogous
+        handoff-only case: reuses its exact cancel/ambiguous-fill/reprice machinery
+        (AUDIT #145/#149/#150), just gated on "this resting price now loses" rather
+        than "this level is far from market during a handoff". Only ever pulls a
+        resting exit BACK toward break-even -- _nearest_legal_exit cannot return
+        worse than break-even -- so this can only prevent a loss the level was never
+        supposed to take, never manufacture one.
+        """
+        for level in list(self.levels):
+            if level.order_id is None:
+                continue
+            if not self._would_realise_a_loss(level.side, level.price):
+                continue
+            target = self._nearest_legal_exit(level)
+            if target is None or target == level.price:
+                # No legal price to move to (the #32/#122 "genuinely nowhere to
+                # sit" state has its own handling elsewhere) or it's already
+                # there -- leave it rather than churn.
+                continue
+
+            side, old_price, old_id = level.side, level.price, level.order_id
+            try:
+                still_open = self.exchange.get_open_order_ids(self.symbol)
+            except Exception as e:
+                logger.error("BREAK-EVEN REFRESH | could not fetch open orders: {}", e)
+                continue
+            if old_id in still_open:
+                try:
+                    confirmed = self.exchange.cancel_order(old_id, self.symbol)
+                except Exception as e:
+                    logger.error(
+                        "BREAK-EVEN REFRESH | failed to cancel {} @ {}: {}",
+                        side, old_price, e,
+                    )
+                    continue
+                if not confirmed:
+                    continue  # order_id kept; retried next poll
+            else:
+                # Missing from the open-orders snapshot is ambiguous: filled, or
+                # cancelled by something else -- disambiguate before deciding,
+                # exactly as accelerate_handoff_exit does (AUDIT #150).
+                order = self.exchange.fetch_order(old_id, self.symbol)
+                if order is not None and order_was_filled(order):
+                    logger.warning(
+                        "BREAK-EVEN REFRESH | {} @ {} filled instead of waiting to "
+                        "be repriced -- processing as a fill, not a cancel "
+                        "(AUDIT #150)",
+                        side, old_price,
+                    )
+                    self._handle_fill(level, balance)
+                    continue
+
+            level.order_id = None
+            level.status = "pending"
+            level.price = target
+            logger.warning(
+                "BREAK-EVEN DRIFTED | {} {} -> {} | the position's real break-even "
+                "moved past this resting exit while it waited -- repricing before "
+                "it fills at a loss (AUDIT #175)",
+                side.upper(), old_price, target,
+            )
+            if not self._place_exit_reprice(level, side, balance):
+                logger.warning(
+                    "BREAK-EVEN REFRESH | could not re-place {} @ {} after "
+                    "cancelling {} — left pending for the next reconcile pass",
+                    side, target, old_price,
+                )
+
     def _existing_open_order(self, price: float, side: str) -> dict | None:
         """Return an open exchange order already resting at the same price+side, if any.
 
@@ -3004,6 +3093,7 @@ class GridEngine:
                     placed_slots.add(slot)
                     logger.info("Replaced orphaned level @ {} {}", level.price, level.side)
 
+        self._refresh_break_even_exits(balance)
         return fills
 
     def _handle_fill(self, level: GridLevel, balance: float, is_taker: bool = False) -> dict:

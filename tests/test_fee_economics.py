@@ -376,7 +376,17 @@ def test_buying_is_never_blocked_by_the_guard_so_it_unsticks_itself():
 def test_the_stop_loss_path_is_untouched_by_the_guard():
     """Refusing to sell below cost must not also refuse to protect the position. Stops
     are placed by main.py straight through the exchange, never as grid levels, so the
-    backstop survives however long the grid waits."""
+    backstop survives however long the grid waits.
+
+    _place_order_for_level was the only caller until AUDIT #175 added
+    _refresh_break_even_exits, which re-checks an ALREADY-RESTING grid exit against a
+    freshly-read break-even and pulls it back if the position's real average entry has
+    since drifted past it (accelerate_handoff_exit does the analogous thing for the
+    router-handoff case, via _nearest_legal_exit rather than this guard directly, which
+    is why it is not in this allowlist). Both callers only ever touch the grid's own
+    voluntary reduce-only orders -- the actual guarantee this test protects, that the
+    hard stop-loss path never consults the guard at all, is the assertion below and is
+    untouched by that addition."""
     import inspect
 
     import grid as grid_module
@@ -385,8 +395,8 @@ def test_the_stop_loss_path_is_untouched_by_the_guard():
         name for name, fn in inspect.getmembers(grid_module.GridEngine, inspect.isfunction)
         if "_would_realise_a_loss(" in inspect.getsource(fn) and name != "_would_realise_a_loss"
     ]
-    assert sorted(callers) == ["_place_order_for_level"], (
-        f"the break-even guard reached beyond order placement into {callers}"
+    assert sorted(callers) == ["_place_order_for_level", "_refresh_break_even_exits"], (
+        f"the break-even guard reached beyond the grid's own order placement/refresh into {callers}"
     )
 
     # And the stop prices themselves never consult it.
