@@ -635,6 +635,7 @@ def _position_unrealized_pnl(pos: dict, current_price: float) -> float:
 
 def _notify_status(
     notifier: TelegramNotifier, exchange: Exchange, symbol: str, price: float,
+    balance_info: dict[str, float] | None = None, equity: float | None = None,
 ) -> None:
     """Send position + balance to Telegram. Call only on significant events.
 
@@ -643,13 +644,25 @@ def _notify_status(
     itself being negative -- see the docstring on on_balance_update. The fill and
     startup-summary notifications still carry that figure, correctly labelled, under
     headers that are already about PnL.
+
+    balance_info/equity: pass already-fetched fresh values when the caller has just
+    taken one (e.g. right after processing a fill) so this doesn't spend a second
+    API round-trip fetching the same thing again, and so the number sent here is
+    exactly the number the caller goes on to use itself -- see the fill call site
+    (AUDIT #176: this used to always fetch its own fresh reading here while the
+    caller's console log line, a few statements later, printed a DIFFERENT number
+    -- an iteration-start cache taken before the fill that triggered this call had
+    even been processed. Same account, same moment, two disagreeing figures on the
+    two channels a user actually watches.). Omit to fetch fresh, as before.
     """
     pos_details = get_position_details(exchange, symbol) or []
     for pos in pos_details:
         unrealized = _position_unrealized_pnl(pos, price)
         notifier.on_position_update(symbol, pos["side"], pos["entry_price"], pos["qty"], price, unrealized)
-    balance_info = exchange.get_balance_info()
-    equity = exchange.get_total_equity()
+    if balance_info is None:
+        balance_info = exchange.get_balance_info()
+    if equity is None:
+        equity = exchange.get_total_equity()
     exposure_pct = 0.0
     if equity > 0:
         exposure_usdt = sum(p["qty"] * price for p in pos_details)
@@ -2493,7 +2506,21 @@ def run_bot() -> None:
                             unrealized_pnl=unrealized,
                         )
                     if fills:
-                        _notify_status(notifier, exchange, settings.symbol, price)
+                        # Refresh, don't reuse: `balance`/`equity` above are this
+                        # iteration's pre-fill cache (line ~2241/2314), and the fills
+                        # just processed changed the account for real -- new orders
+                        # placed, a stop repriced, margin used shifting. Fetching once
+                        # here and folding it back into `balance`/`equity` means the
+                        # console log line below and the Telegram BALANCE message
+                        # `_notify_status` sends now show the SAME number instead of
+                        # disagreeing by one fill's worth of movement (AUDIT #176).
+                        fresh_balance_info = exchange.get_balance_info()
+                        equity = exchange.get_total_equity()
+                        balance = fresh_balance_info["free"]
+                        _notify_status(
+                            notifier, exchange, settings.symbol, price,
+                            fresh_balance_info, equity,
+                        )
 
                     risk.update_unrealized(unrealized)
 

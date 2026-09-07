@@ -8,6 +8,7 @@ from main import (
     get_position_details,
     get_short_position,
     get_total_position,
+    _notify_status,
     _position_unrealized_pnl,
 )
 
@@ -917,3 +918,84 @@ def test_a_paused_external_close_does_not_add_a_second_record_fill_call_site():
     branch's own close must not add a second one."""
     src = _main_source()
     assert src.count("risk.record_fill()") == 1
+
+
+class _NotifyStatusExchange:
+    """get_balance_info/get_total_equity raise unless a test explicitly wants them
+    reachable -- the whole point of AUDIT #176 is that _notify_status should NOT
+    call these when the caller already fetched fresh values itself."""
+
+    def __init__(self, balance_info=None, equity=None):
+        self._balance_info = balance_info
+        self._equity = equity
+
+    def get_positions(self, symbol):
+        return []
+
+    def get_balance_info(self):
+        if self._balance_info is None:
+            raise AssertionError("get_balance_info() should not have been called")
+        return self._balance_info
+
+    def get_total_equity(self):
+        if self._equity is None:
+            raise AssertionError("get_total_equity() should not have been called")
+        return self._equity
+
+
+class _NotifyStatusNotifier:
+    def __init__(self):
+        self.balance_updates = []
+
+    def on_position_update(self, *args, **kwargs):
+        raise AssertionError("no positions were given -- should not be called")
+
+    def on_balance_update(self, free, used, total_equity, exposure_pct):
+        self.balance_updates.append((free, used, total_equity, exposure_pct))
+
+
+def test_notify_status_reuses_prefetched_balance_and_equity_instead_of_refetching():
+    """AUDIT #176. The fill call site now fetches balance/equity itself (once,
+    post-fill) and hands them to _notify_status so the Telegram BALANCE message and
+    the console log line it feeds agree -- that only holds if _notify_status
+    actually uses what it's given instead of fetching its own, independently-timed
+    reading over it."""
+    exchange = _NotifyStatusExchange()  # raises if either getter is called
+    notifier = _NotifyStatusNotifier()
+
+    _notify_status(
+        notifier, exchange, "ADAUSDT", 0.22,
+        balance_info={"free": 100.0, "used": 5.0, "total": 105.0}, equity=105.0,
+    )
+
+    assert notifier.balance_updates == [(100.0, 5.0, 105.0, 0.0)]
+
+
+def test_notify_status_still_fetches_fresh_when_not_given_prefetched_values():
+    """The other six _notify_status call sites (startup, recovery, pause/resume,
+    external-close) don't pass balance_info/equity -- omitting them must still fetch
+    fresh, exactly as before AUDIT #176."""
+    exchange = _NotifyStatusExchange(balance_info={"free": 50.0, "used": 1.0}, equity=51.0)
+    notifier = _NotifyStatusNotifier()
+
+    _notify_status(notifier, exchange, "ADAUSDT", 0.22)
+
+    assert notifier.balance_updates == [(50.0, 1.0, 51.0, 0.0)]
+
+
+def test_the_fill_path_refreshes_balance_and_equity_before_the_console_log_line():
+    """AUDIT #176. Before the fix, `balance`/`equity` used by the "PRICE={} |
+    fills={}..." console log line were this iteration's pre-fill cache (fetched
+    before check_fills), while the Telegram BALANCE message _notify_status sent a
+    few lines above fetched fresh, post-fill -- same account, same moment, two
+    disagreeing numbers on the two channels a user actually watches. The fix
+    refetches once inside `if fills:` and reassigns `balance`/`equity` from it, so
+    the console line downstream inherits the same post-fill numbers."""
+    src = _main_source()
+    fills_notify_at = src.index("if fills:\n                        # Refresh, don't reuse")
+    log_line_at = src.index('"PRICE={} | fills={}', fills_notify_at)
+    block = src[fills_notify_at:log_line_at]
+    assert "exchange.get_balance_info()" in block
+    assert "equity = exchange.get_total_equity()" in block
+    assert 'balance = fresh_balance_info["free"]' in block
+    assert "_notify_status(" in block
