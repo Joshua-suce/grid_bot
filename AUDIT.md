@@ -3074,3 +3074,52 @@ needs walk-forward evaluation and more than one instrument.
 Known limits of the harness, all of which make results **optimistic**: no slippage
 or depth model, no partial fills, no funding, one candle per loop iteration, and
 main.py's kill switches are not simulated.
+
+## The grid's own trend gate was defeated by its own threshold (2026-09-07)
+
+Six kill-switch trips in three days (2026-09-04 -> 09-07): `recovery_count` reached
+its cap of 5, needing a manual reset, then tripped again the same night. Cumulative
+PnL over the week went from +4.34 to -2.68 USDT. AUDIT #173-175 (grow/reprice an
+occupied exit as fills stack on it, and re-check a resting exit against a *fresh*
+break-even) fixed real, verified mechanical defects in how exits track the position's
+moving cost basis -- but they only shrink the size of a loss once a trend has already
+run the position over. They do not explain why the trend kept running unopposed.
+
+**Root cause:** `main.py`'s trend gate (`trend.is_trending() and grid.active ->
+grid.pause()`, already live in `STRATEGY_MODE=grid` -- this is not the disabled
+router) exists specifically to stop the grid dip-buying through a real trend. It
+never fired. `.env` had `ADX_TREND_THRESHOLD=40.0` and `ADX_RANGE_THRESHOLD=30.0` --
+both pinned at or past the values `config.py`'s own `Field(...)` bounds treat as
+sane maxima (`le=40`, `le=30`), versus the class's own coded defaults of 30.0/20.0.
+`regime_study.py`'s docstring had already flagged the symptom, in the context of a
+different question (whether `STRATEGY_MODE=router` does anything): "Five days of the
+live signals observer recorded FOUR regime changes, all between ranging and
+uncertain, and not one trend." At 40, ADX reaching 49.5 (2026-09-04, the day of the
+first of this week's kill switches) still read as `ranging`.
+
+**Verified before changing anything:** ran `regime_study.py`'s own backtest --real
+ADAUSDT klines, the bot's real ADX/EMA/merge logic, not a reimplementation-- against
+the configured thresholds and several alternatives, 62 days:
+
+| trend threshold | worst trend-episode move | time paused |
+|---|---|---|
+| 40 (as configured) | **-8.45%** | 4.4% |
+| 30 (config.py's own default) | -1.13% | 9.6% |
+| 25 | -1.38% | 14.6% |
+
+`range_threshold` turned out not to matter for this -- `is_ranging()` treats both
+`RANGING` and `UNCERTAIN` as safe to trade; only a confirmed `UPTREND`/`DOWNTREND`
+pauses the grid, and only `trend_threshold` gates that classification.
+
+**Fix:** `ADX_TREND_THRESHOLD` 40.0 -> 30.0, `ADX_RANGE_THRESHOLD` 30.0 -> 20.0 in
+`.env` -- reverting both to `config.py`'s own coded defaults. No leverage, exposure,
+or capital-sizing change, and the disabled router/trend-follower stays disabled;
+this only lets the grid's existing pause-on-trend gate actually gate. `.env` is
+gitignored, so this change has no commit -- this section is its record.
+
+**Result so far:** the session after the fix (2026-09-07, 03:51 restart through
+11:30) ran net **+2.10 USDT** over ~7.5h on real fills (19 completed cycles, $0.22
+total fees, zero kill-switch trips), verified against `trades_demo.csv`'s own
+running total rather than the log. ADX stayed 13-18 the entire session, so the
+widened gate was never actually tested against a real trend in this window --
+early positive signal, not proof against the next one.
