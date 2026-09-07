@@ -120,6 +120,43 @@ def test_seeding_flat_clears_the_entry():
     assert (g._pos_qty, g._pos_entry) == (0.0, 0.0)
 
 
+def test_seeding_resyncs_the_reduce_only_mirror():
+    """AUDIT #177. _reduce_only_qty sizes reduceOnly orders from _net_long_qty /
+    _net_short_qty, a SEPARATE mirror from _pos_qty. seed_position is not a fill --
+    nothing else refreshes that mirror when it runs -- so the position it adopts
+    here must land there immediately too, or the next order sized against it is
+    wrong."""
+    g = ledger()
+    g.seed_position(-5348, 0.07011)
+    assert g._net_short_qty == 5348
+    assert g._net_long_qty == 0.0
+    assert g._net_short_entry == 0.07011
+    assert g._net_long_entry == 0.0
+
+
+def test_seeding_flat_clears_the_reduce_only_mirror_too():
+    """AUDIT #177, 2026-09-07: detect_external_close calls seed_position(0, 0) to
+    clear a phantom position after a stop leg fires on the exchange and the ladder
+    was never told (AUDIT #143). Before this fix, _net_short_qty stayed at the
+    pre-close size -- so the next resting order the caller tried to replace was
+    still sized reduceOnly against a position that no longer existed, and Binance
+    rejected it (-2022). Real incident: restart with SHORT 724 open, stop fired,
+    detect_external_close caught it 28 seconds later, and in between every one of
+    11 replacement BUY placements across two full ladder passes failed the same
+    way -- because nothing zeroed this mirror until this fix."""
+    g = ledger(-724, 0.2186424)
+    g._net_short_qty, g._net_long_qty = 724.0, 0.0
+    g._net_short_entry, g._net_long_entry = 0.2186424, 0.0
+
+    g.seed_position(0.0, 0.0)
+
+    assert g._net_short_qty == 0.0, \
+        "reduceOnly BUY orders would still be sized against the phantom short"
+    assert g._net_long_qty == 0.0
+    assert g._net_short_entry == 0.0
+    assert g._net_long_entry == 0.0
+
+
 # --- the run that exposed it -----------------------------------------------------
 
 MAKER = 0.0002

@@ -3123,3 +3123,71 @@ total fees, zero kill-switch trips), verified against `trades_demo.csv`'s own
 running total rather than the log. ADX stayed 13-18 the entire session, so the
 widened gate was never actually tested against a real trend in this window --
 early positive signal, not proof against the next one.
+
+## A stale reduce-only mirror after an external close jammed the ladder, then fed a kill switch (2026-09-07, AUDIT #177)
+
+The bot was closed at 11:30 with `SHORT 724 ADAUSDT` open (entry 0.2186424); by
+design the stop-loss leg stays armed on the exchange while the process is down, so
+the position stayed protected. Restarted at 11:57, it correctly re-seeded `SHORT
+724` from saved state and traded normally for the next 32 minutes.
+
+**What the log shows, 12:28:59-12:35:17:**
+
+1. **12:28:59-12:29:27** -- the exchange-side stop fired (price crossed the
+   0.22134 trigger between polls), flattening the short. Binance's own bookkeeping
+   then began rejecting the ladder's resting reduceOnly BUY legs as their combined
+   size now exceeded the (already-zero) remaining position. Over the next 28
+   seconds, across two full replacement passes, **11 separate BUY placements**
+   (0.2141 through 0.2201) failed identically: `binanceusdm {"code":-2022,"msg":
+   "ReduceOnly Order is rejected."}`. `detect_external_close` (AUDIT #143) finally
+   corroborated flat via its double-read and booked the loss (-1.63 estimated) at
+   12:29:27.
+2. **12:30:52-12:35:17** -- the grid recentered and resumed trading, but every
+   fresh position it opened closed again within 10-90 seconds via the *same*
+   `detect_external_close` path rather than a normal ladder fill, each logged
+   `EXTERNAL CLOSE ... the ladder was never told`. Six of these in under 5 minutes
+   pushed `consec_losses` from 5 to 10 and tripped the kill switch at 12:35:17,
+   forcing a 2-hour cooldown (`RECOVERY COOLDOWN` logged every ~90s) with the bot
+   flat and idle from 12:35 until the user stopped it by hand at 13:56 -- over an
+   hour of the session spent doing nothing.
+
+**Root cause, verified against the code (`grid.py`):** `_reduce_only_qty` sizes
+every reduceOnly order from `_net_long_qty`/`_net_short_qty` -- a *separate* pair of
+counters from `_pos_qty`, kept fresh only by `_refresh_net_counters`, which is
+called from the two places a normal fill moves the position (`_handle_fill`,
+`_grow_occupied_exit`; AUDIT #98). `detect_external_close` clears a phantom
+position through `seed_position(0.0, 0.0)` -- but `seed_position` never touched
+`_net_long_qty`/`_net_short_qty` at all. So the instant the stop fired, `_pos_qty`
+was still momentarily right (nothing had told it otherwise) and then correctly went
+to 0 at 12:29:27 -- but `_net_short_qty` kept sitting at 724 the entire 28-second
+gap, because nothing in that path ever wrote to it. Every reduceOnly BUY computed
+in between was sized against a short that no longer existed, and Binance rejected
+each one on contact. The same gap exists, less visibly, for the fast repeated
+closes afterward: each `seed_position(0, 0)` left the mirror stale until the next
+unrelated fill or `set_position_limit` call happened to refresh it.
+
+**Fix:** `seed_position` now derives `_net_long_qty`/`_net_short_qty` and their
+entry counterparts directly from the `qty`/`entry` it is adopting, in the same
+call -- no extra API round-trip, since the call itself already carries the
+corroborated truth (AUDIT #143/#134's double-read, or the startup position read).
+Covers all three callers: `detect_external_close`, and both branches of
+`_seed_position_from_exchange` (startup adoption of a held position, and startup
+adoption of a corroborated-flat account).
+
+**Verified with stash-verify:** two new tests in `tests/test_position_ledger.py`
+(`test_seeding_resyncs_the_reduce_only_mirror`,
+`test_seeding_flat_clears_the_reduce_only_mirror_too` -- the second reproduces this
+incident's exact numbers, `SHORT 724 @ 0.2186424`) failed against the unfixed code
+with the predicted symptom (`_net_short_qty` staying at `724.0` instead of going to
+`0.0`), and passed once the fix was restored. Full `tests/test_position_ledger.py`
++ `tests/test_grid.py` regression (102 tests) passed clean.
+
+**What this does and does not explain:** the fix closes the specific mechanism
+behind the 11 `-2022` rejections and the stale-mirror class of bug generally. It
+does *not* establish that the 4-minute burst of quick re-opened-and-closed
+positions from 12:30-12:35 was itself caused by this bug rather than genuinely
+choppy price right after the stop-triggering spike -- `check_fills` runs before
+`detect_external_close` every iteration, so a position closing via the ladder's own
+resting exit should be caught there first, and multiple back-to-back
+`EXTERNAL CLOSE` events for freshly-opened positions is not fully accounted for by
+the mirror bug alone. Worth watching the next time this pattern recurs.

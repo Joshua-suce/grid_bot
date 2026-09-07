@@ -1205,9 +1205,34 @@ class GridEngine:
 
         Without this a restart books the eventual close of a pre-existing position as
         pure profit, because the ledger believes it opened flat.
+
+        Also resyncs the reduce-only mirror (_net_long_qty/_net_short_qty and their
+        entry counterparts), which _reduce_only_qty reads to decide whether a new
+        order is legal reduceOnly. That mirror is normally kept fresh by
+        _refresh_net_counters, called from _handle_fill and _grow_occupied_exit right
+        after a normal fill moves the position (AUDIT #98) -- but seed_position is not
+        a fill going through either of those, it is a truth hint handed straight in
+        (startup adoption, or detect_external_close clearing a phantom position after
+        a stop leg fires on the exchange, AUDIT #143). Left untouched here, the mirror
+        keeps whatever it held before this call: a detect_external_close that flattens
+        the ledger left _net_short_qty sitting at the pre-close size, so the very next
+        resting order this method's caller tries to replace was still computed
+        reduceOnly against a position that no longer existed. Binance rejected it
+        (-2022), and every retry rejected again the same way until an unrelated
+        set_position_limit/_refresh_net_counters call next happened to run --
+        2026-09-07, restart with SHORT 724 open: the stop fired, detect_external_close
+        caught it 28 seconds later, and in between every one of 11 replacement BUY
+        placements across two full ladder passes failed with the identical -2022
+        (AUDIT #177). Derived straight from qty/entry rather than a fresh API read:
+        this call IS the adopted truth (or the AUDIT #143/#134-corroborated flat), so
+        a second round-trip could only risk disagreeing with it.
         """
         self._pos_qty = float(qty)
         self._pos_entry = float(entry) if qty else 0.0
+        self._net_long_qty = max(0.0, self._pos_qty)
+        self._net_short_qty = max(0.0, -self._pos_qty)
+        self._net_long_entry = self._pos_entry if self._pos_qty > 0 else 0.0
+        self._net_short_entry = self._pos_entry if self._pos_qty < 0 else 0.0
 
     def initialize(self, current_price: float, balance: float, dynamic_spacing: bool = True) -> None:
         if dynamic_spacing:
