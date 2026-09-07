@@ -3191,3 +3191,75 @@ choppy price right after the stop-triggering spike -- `check_fills` runs before
 resting exit should be caught there first, and multiple back-to-back
 `EXTERNAL CLOSE` events for freshly-opened positions is not fully accounted for by
 the mirror bug alone. Worth watching the next time this pattern recurs.
+
+## `_grow_occupied_exit` reclaimed a filled exit as a clean cancel (2026-09-07, AUDIT #178)
+
+The very next session after AUDIT #177 shipped, the exact pattern the previous
+section flagged as unexplained recurred on its own: repeated `EXTERNAL CLOSE`
+events for positions that had just opened, no `-2022` storm this time (confirming
+#177 fixed what it targeted), and a **second** kill-switch trip nine hours later
+(12:35 -> 16:18, `recovery_count=3`, this time a 3-hour cooldown) from the same
+10-consecutive-losing-fills pattern, most of them tiny estimated losses/gains
+within a few cents of zero.
+
+**Root cause, found by tracing the code this time rather than the log:**
+`exchange.py`'s `cancel_order` maps Binance's `-2011 "Unknown order sent"` to
+ccxt's `OrderNotFound` and returns `True` for it -- "already gone" -- because the
+common case is an order cancelled by something else. But Binance returns that
+*identical* error whether the order was cancelled elsewhere or has simply
+**already filled**; `cancel_order` cannot and does not tell the two apart, and
+says so nowhere in its own contract.
+
+`_grow_occupied_exit` (the AUDIT #173/#174 machinery that resizes/reprices an
+occupied exit when another fill stacks onto it) calls `cancel_order` on the
+resting exit and, before this fix, trusted a bare `True` as "safe to reprice."
+When the exit had actually filled in the instant before the cancel reached the
+exchange, this reclaimed it as if nothing had traded: no `_apply_to_position`, no
+fee, no journal row, and the ledger kept a position the exchange no longer had --
+invisible until `detect_external_close` noticed on the *next* poll and booked an
+ESTIMATE priced off the current ticker (AUDIT #143), rather than this fill's real
+price. A run of those is indistinguishable from a run of genuine losers to
+`risk.py`'s consecutive-loss counter -- exactly `_grow_occupied_exit`'s own #173
+docstring already warned about for a different mechanism ("a run of those is
+indistinguishable from a run of genuine losers to the streak-based kill switch").
+
+This was not a new class of bug: `accelerate_handoff_exit` hit the identical
+hazard and was fixed by checking whether the order was still genuinely open
+*before* calling `cancel_order`, rather than trusting its return *after*
+(AUDIT #150) -- and by falling back to `fetch_order`/`order_was_filled` to
+process a vanished-but-filled order as a real fill instead of a cancel.
+`_grow_occupied_exit` was the one call site that never got the same treatment.
+
+**Fix:** `_grow_occupied_exit` now confirms via `get_open_order_ids` that the exit
+is still resting before attempting to cancel it. If it is not, `fetch_order` +
+`order_was_filled` (the same allowlist `check_fills` and `accelerate_handoff_exit`
+already use) decide what actually happened: a genuine fill is routed through
+`_handle_fill` for that level -- so it is priced, feed, journaled, and booked
+exactly like any other fill -- instead of silently discarded; anything else
+(cancelled, expired) is left pending for `check_fills`'s own orphan-replacement
+sweep rather than racing a second cancel against whatever already took it off the
+book.
+
+**Verified with stash-verify:** a new test in `tests/test_exit_grows_with_position.py`
+(`test_exit_that_already_filled_is_processed_as_a_fill_not_reclaimed_as_a_cancel`)
+simulates the exact race -- the occupying exit's order vanishes from the mock
+exchange's open-orders book before `_grow_occupied_exit` runs -- and asserts
+`cancel_order` is never called against it, the fill is booked (`total_fills`
+increments for both the triggering fill and the recovered one), and the position
+ledger reflects both fills' real effect. It failed against the unfixed code with
+the exact predicted symptom (`cancel_order` called against an order already
+confirmed gone) and passed once the fix was restored. `_grow_occupied_exit`'s
+signature gained a `balance` parameter (needed to route a recovered fill through
+`_handle_fill`, which requires it) -- its one call site was updated to match.
+Full regression: `test_exit_grows_with_position.py` + `test_grid.py` +
+`test_position_ledger.py` + `test_handoff_accel.py` (125 tests) passed clean.
+
+**What this does and does not explain:** this closes a second, distinct
+mechanism by which a real fill can go unaccounted and get mislabeled an
+"external close" with a wrong estimated PnL -- and it is the more frequent of
+the two, since `_grow_occupied_exit` runs on every fill that lands on an already-occupied
+counter-slot, which the log shows happening often. It is not proven to be the
+*only* remaining source of the fast open-close cycles seen in this session's
+second kill-switch trip; some of that burst may still be genuinely choppy price
+interacting normally with a tight grid. If a third kill switch trips from the same
+signature after this fix, that would be the evidence needed to say so.

@@ -3291,7 +3291,7 @@ class GridEngine:
             # here, keeps the one thing this specific fill actually needs -- an exit
             # sized for what it just added -- true regardless of what the awaiting-side
             # machinery does with THIS level next.
-            self._grow_occupied_exit(occupying_level, new_side, qty)
+            self._grow_occupied_exit(occupying_level, new_side, qty, balance)
             return fill_record
 
         qty = level.quantity if level.quantity > 0 else (self._calc_usdt_per_grid(balance) / max(new_price, 1e-12))
@@ -3401,7 +3401,7 @@ class GridEngine:
         self.levels.sort(key=lambda l: l.price)
         return fill_record
 
-    def _grow_occupied_exit(self, occ: GridLevel, side: str, added_qty: float) -> None:
+    def _grow_occupied_exit(self, occ: GridLevel, side: str, added_qty: float, balance: float) -> None:
         """Resize -- and, when the position's real cost basis has moved past it,
         reprice -- an already-resting exit order that a fill just named as its own
         (AUDIT #173, #174).
@@ -3481,6 +3481,55 @@ class GridEngine:
             quantity = float(self.exchange.exchange.amount_to_precision(self.symbol, quantity_target))
             if quantity * reprice_price < MIN_NOTIONAL_USDT:
                 return
+
+            # AUDIT #150 hazard, at a third call site. cancel_order (exchange.py) maps
+            # Binance's -2011 "Unknown order sent" to ccxt's OrderNotFound and returns
+            # True for it -- "already gone" -- without asking WHY it is gone. Binance
+            # returns that identical error whether the order was cancelled by something
+            # else OR has just been FILLED; cancel_order cannot and does not tell the
+            # two apart. Trusting its bare True here, as this code did before this fix,
+            # means an exit that fills in the instant before this reprice reaches the
+            # exchange is silently reclaimed as though nothing had traded: no
+            # _apply_to_position, no fee, no journal row, and the ledger keeps a
+            # position the exchange no longer has -- until detect_external_close
+            # notices next poll and books an ESTIMATE against the current ticker price
+            # instead of this fill's real one (AUDIT #143), often misreporting a small
+            # gain as a loss or vice versa and feeding risk.py's consecutive-loss
+            # counter with noise instead of a verified outcome.
+            #
+            # accelerate_handoff_exit hit this identical hazard already and was fixed
+            # by checking BEFORE cancelling rather than trusting cancel_order's return
+            # after (AUDIT #150); this call site never got the same treatment. Same
+            # fix here: confirm the order is still genuinely open first, so a "gone"
+            # from cancel_order's own call further down is unambiguous.
+            try:
+                still_open = self.exchange.get_open_order_ids(self.symbol)
+            except Exception as e:
+                logger.error(
+                    "EXIT GROW SKIPPED | could not confirm {} @ {} (id={}) is still open: "
+                    "{} — leaving it at {} @ {}",
+                    side.upper(), old_price, old_id, e, old_qty, old_price,
+                )
+                return
+            if old_id not in still_open:
+                order = self.exchange.fetch_order(old_id, self.symbol)
+                if order is not None and order_was_filled(order):
+                    logger.warning(
+                        "EXIT GROW | {} @ {} (id={}) filled instead of waiting to be "
+                        "resized/repriced -- processing as a fill, not a cancel "
+                        "(AUDIT #150/#178)",
+                        side.upper(), old_price, old_id,
+                    )
+                    self._handle_fill(occ, balance)
+                    return
+                # Gone for some other, ordinary reason (cancelled, expired) -- nothing
+                # to resize. Leave it pending for check_fills's own orphan-replacement
+                # sweep rather than racing a second cancel against whatever already
+                # took it off the book.
+                occ.order_id = None
+                occ.status = "pending"
+                return
+
             if not self.exchange.cancel_order(old_id, self.symbol):
                 logger.warning(
                     "EXIT GROW SKIPPED | could not cancel {} @ {} (id={}) to resize/reprice "

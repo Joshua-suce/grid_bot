@@ -216,6 +216,43 @@ def test_resize_failure_after_cancel_leaves_the_level_pending_for_reconcile():
     assert occ.status == "pending"
 
 
+def test_exit_that_already_filled_is_processed_as_a_fill_not_reclaimed_as_a_cancel():
+    """AUDIT #150/#178. cancel_order (exchange.py) maps Binance's -2011 "Unknown order
+    sent" to ccxt's OrderNotFound and returns True for it -- "already gone" -- whether
+    the order was cancelled by something else or has just been FILLED; it cannot tell
+    the two apart. Before this fix, _grow_occupied_exit trusted that bare True and
+    reclaimed occ as though nothing had traded: no _apply_to_position, no fee, no
+    journal row, and the ledger kept a position the exchange no longer had, until
+    detect_external_close booked an ESTIMATE against the current ticker price instead
+    of this fill's real one a poll later (AUDIT #143). accelerate_handoff_exit hit the
+    identical hazard and was fixed by checking BEFORE cancelling (AUDIT #150); this
+    call site never got the same treatment until now.
+    """
+    g = _engine(position_qty=451.0, position_side="short")
+    occ, filling = _rig_occupied_fill(g, occ_qty=229.0, fill_qty=222.0)
+
+    # Simulate the race: occ's order has ALREADY filled on the exchange (so it is
+    # gone from the open-orders book) by the time this fill tries to resize it.
+    del g.exchange.orders["occ-live"]
+
+    g._handle_fill(filling, balance=5000.0)
+
+    assert "occ-live" not in g.exchange.cancelled, (
+        "cancel_order should never be called against an order already confirmed gone"
+    )
+    assert g.total_fills == 2, (
+        "occ's own fill must be booked alongside the triggering fill, not silently "
+        "dropped"
+    )
+    # sell 222 opens/grows a short (0 -> -222), then occ's buy 229 covers past it
+    # (-222 -> +7): both fills' real effect on the position, not one lost fill and a
+    # stale ledger.
+    assert g._pos_qty == 7.0, (
+        f"expected both fills applied to the position (0 -sell 222-> -222 -buy 229-> "
+        f"+7), got {g._pos_qty} -- occ's fill was not booked against the ledger"
+    )
+
+
 def test_repeated_fills_against_the_same_exit_keep_it_sized_to_the_whole_position():
     """The live incident, end to end: several fills in a row all naming the same
     occupied slot as their exit. Its size must track the running total, not just the
